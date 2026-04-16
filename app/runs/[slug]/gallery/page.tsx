@@ -341,12 +341,32 @@ export default function GalleryPage({
               key={file.filename}
               src={file.url}
               alt={file.label}
-              className="mx-auto max-h-[70vh] object-contain rounded"
+              className="mx-auto max-h-[70vh] max-w-full object-contain rounded"
             />
           </div>
         );
       case "slides":
-        return <PDFViewer key={file.filename} mediaUrl={file.url} />;
+        return (
+          <>
+            {/* Desktop: inline PDF viewer */}
+            <div className="hidden sm:block">
+              <PDFViewer key={file.filename} mediaUrl={file.url} />
+            </div>
+            {/* Mobile: download button instead of unreadable scaled PDF */}
+            <div className="block sm:hidden rounded-lg border border-zinc-800 bg-zinc-900 p-8 text-center">
+              <Presentation className="mx-auto h-12 w-12 text-zinc-500 mb-4" />
+              <p className="text-sm text-zinc-400 mb-4">Slide deck preview is available on larger screens.</p>
+              <a
+                href={file.url}
+                download={file.filename}
+                className="inline-flex items-center gap-2 rounded-lg bg-[#c8a951] px-5 py-2.5 text-sm font-medium text-[#1a2744] hover:bg-[#d4b85e] transition"
+              >
+                <Download className="h-4 w-4" />
+                Download Slides
+              </a>
+            </div>
+          </>
+        );
       case "markdown":
         return <MarkdownViewer key={file.filename} mediaUrl={file.url} />;
     }
@@ -356,7 +376,7 @@ export default function GalleryPage({
   return (
     <div className="mx-auto max-w-5xl px-6 py-8">
       {/* ── Header ───────────────────────────────────────── */}
-      <div className="flex items-start justify-between">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <Link
             href={`/runs/${slug}`}
@@ -396,7 +416,7 @@ export default function GalleryPage({
       {/* ── Selected File Viewer (single-view isolation) ── */}
       {resolvedFile && (
         <div className="mt-6">
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setSelectedFile(null)}
