@@ -73,23 +73,22 @@ const fetcher = async (url: string): Promise<RunState> => {
 // ── Hook ────────────────────────────────────────────────────────────
 
 /**
- * SWR-powered hook that polls `/api/state` for the current run state.
+ * SWR-powered hook that polls `/api/state` for run state.
  *
- * - `revalidateOnFocus` re-fetches when the browser tab regains focus.
- * - `refreshInterval` polls every 5 s while the run is active.
- * - Transient fetch errors (e.g., CLI locking state.json mid-write) are
- *   silently suppressed for the first two retries to avoid console spam.
+ * @param slug - Optional project slug. When provided, fetches state for
+ *               that specific project via `/api/state?slug=<slug>`.
+ *               When omitted, fetches the most recent state across all projects.
  */
-export function useRunState() {
+export function useRunState(slug?: string) {
+  const url = slug ? `/api/state?slug=${encodeURIComponent(slug)}` : "/api/state";
+
   const { data, error, isLoading, mutate } = useSWR<RunState>(
-    "/api/state",
+    url,
     fetcher,
     {
       revalidateOnFocus: true,
       refreshInterval: 5_000,
-      onErrorRetry(err, _key, _config, revalidate, { retryCount }) {
-        // Suppress transient errors (CLI momentarily locks the file).
-        // Silently retry up to 3 times, then let SWR surface the error.
+      onErrorRetry(_err, _key, _config, revalidate, { retryCount }) {
         if (retryCount >= 3) return;
         setTimeout(() => revalidate({ retryCount }), 2_000);
       },

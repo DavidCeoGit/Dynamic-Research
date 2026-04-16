@@ -158,7 +158,7 @@ export default function GalleryPage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = use(params);
-  const { state, isLoading: stateLoading, isError: stateError } = useRunState();
+  const { state, isLoading: stateLoading, isError: stateError } = useRunState(slug);
 
   // Fetch full file inventory from backend
   const { data: inventory } = useSWR<FileEntry[]>(

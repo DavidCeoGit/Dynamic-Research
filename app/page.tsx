@@ -1,20 +1,42 @@
 "use client";
 
-import { useRunState } from "@/hooks/useRunState";
+import Link from "next/link";
+import useSWR from "swr";
 import {
   Loader2,
-  RefreshCw,
-  Globe,
-  BookOpen,
-  Brain,
+  AlertCircle,
   CheckCircle2,
   Clock,
-  AlertCircle,
+  ChevronRight,
+  Music,
+  Video,
+  Image as ImageIcon,
+  Presentation,
+  FileText,
 } from "lucide-react";
+
+// ── Types ──────────────────────────────────────────────────────────
+
+interface RunSummary {
+  slug: string;
+  topic: string;
+  timestamp: string;
+  phase: string;
+  phase_status: string;
+  version: number;
+  selectedProducts: Record<string, boolean>;
+  vendorEvaluationEnabled: boolean;
+  fileCount: number;
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/** Map a phase string to a human-readable label. */
+const fetcher = async (url: string) => {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+  return res.json();
+};
+
 function phaseLabel(phase: string): string {
   const map: Record<string, string> = {
     "0.5": "Discussion",
@@ -31,228 +53,137 @@ function phaseLabel(phase: string): string {
   return map[phase] ?? `Phase ${phase}`;
 }
 
-/** Derive a colour class from phase_status. */
-function statusColor(status: string): string {
-  if (status === "complete") return "text-emerald-400";
-  if (status === "aborted_by_user") return "text-red-400";
-  return "text-[#c8a951]"; // gold = in-progress
+function formatTimestamp(ts: string): string {
+  if (ts.length < 8) return ts;
+  return `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}`;
 }
 
-/** Check whether a source file pattern appears in files_written. */
-function hasFile(files: string[], pattern: string): boolean {
-  return files.some((f) => f.includes(pattern));
-}
-
-type SourceStatus = "complete" | "pending" | "error";
-
-function deriveSourceStatus(
-  files: string[],
-  pattern: string,
-): SourceStatus {
-  if (hasFile(files, pattern)) return "complete";
-  return "pending";
-}
-
-const STATUS_ICON = {
-  complete: CheckCircle2,
-  pending: Clock,
-  error: AlertCircle,
-} as const;
-
-const STATUS_STYLE = {
-  complete:
-    "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
-  pending:
-    "border-[#c8a951]/30 bg-[#c8a951]/10 text-[#c8a951]",
-  error:
-    "border-red-500/30 bg-red-500/10 text-red-400",
-} as const;
+const PRODUCT_ICONS: Record<string, typeof Music> = {
+  audio: Music,
+  video: Video,
+  infographic: ImageIcon,
+  slides: Presentation,
+  report: FileText,
+};
 
 // ── Component ───────────────────────────────────────────────────────
 
-export default function Dashboard() {
-  const { state, isLoading, isError, mutate } = useRunState();
+export default function HomePage() {
+  const { data: runs, error, isLoading } = useSWR<RunSummary[]>(
+    "/api/runs",
+    fetcher,
+    { revalidateOnFocus: true },
+  );
 
-  // ── Loading state ──────────────────────────────────────────────
   if (isLoading) {
     return (
       <div className="flex flex-1 items-center justify-center py-32">
         <Loader2 className="h-8 w-8 animate-spin text-[#3b82f6]" />
         <span className="ml-3 text-sm text-zinc-400">
-          Loading run state…
+          Loading research runs...
         </span>
       </div>
     );
   }
 
-  // ── Error / no data state ──────────────────────────────────────
-  if (isError || !state) {
+  if (error) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-4 py-32 text-zinc-400">
         <AlertCircle className="h-10 w-10 text-zinc-600" />
-        <p className="text-sm">
-          {isError
-            ? "Could not reach /api/state — is the API route running?"
-            : "No run state available."}
-        </p>
-        <button
-          onClick={() => mutate()}
-          className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-300 transition hover:bg-zinc-700"
-        >
-          <RefreshCw className="h-4 w-4" />
-          Retry
-        </button>
+        <p className="text-sm">Could not load research runs.</p>
       </div>
     );
   }
 
-  // ── Derive source statuses ─────────────────────────────────────
-  const sources: {
-    name: string;
-    icon: typeof Globe;
-    status: SourceStatus;
-  }[] = [
-    {
-      name: "Perplexity",
-      icon: Globe,
-      status: deriveSourceStatus(state.files_written, "perplexity"),
-    },
-    {
-      name: "NotebookLM",
-      icon: BookOpen,
-      status: deriveSourceStatus(state.files_written, "notebooklm"),
-    },
-    {
-      name: "Claude Baseline",
-      icon: Brain,
-      status: deriveSourceStatus(state.files_written, "comparison"),
-    },
-  ];
-
-  // ── Dashboard ──────────────────────────────────────────────────
   return (
     <div className="mx-auto max-w-5xl px-6 py-8">
-      {/* ── Header row ─────────────────────────────────────── */}
       <div className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-zinc-100">
-            Dashboard
+            Research Runs
           </h1>
           <p className="mt-1 text-sm text-zinc-500">
-            Run state for the active /research-compare session
+            {runs?.length ?? 0} project{(runs?.length ?? 0) !== 1 ? "s" : ""}
           </p>
         </div>
-
-        <button
-          onClick={() => mutate()}
-          className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-300 transition hover:bg-zinc-700 active:scale-95"
-        >
-          <RefreshCw className="h-4 w-4" />
-          Refresh State
-        </button>
       </div>
 
-      {/* ── Global status card ─────────────────────────────── */}
-      <div className="mt-8 rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-        <div className="flex items-center gap-3">
-          <span
-            className={`text-xs font-medium uppercase tracking-widest ${statusColor(state.phase_status)}`}
-          >
-            {state.phase_status.replace(/_/g, " ")}
-          </span>
-          <span className="rounded-full bg-zinc-800 px-2.5 py-0.5 text-xs font-mono text-zinc-400">
-            {phaseLabel(state.phase)}
-          </span>
-          <span className="rounded-full bg-zinc-800 px-2.5 py-0.5 text-xs font-mono text-zinc-400">
-            v{state.version}
-          </span>
+      {(!runs || runs.length === 0) && (
+        <div className="mt-16 flex flex-col items-center gap-4 text-zinc-400">
+          <AlertCircle className="h-10 w-10 text-zinc-600" />
+          <p className="text-sm">No research runs yet.</p>
+          <p className="text-xs text-zinc-500">
+            Run /research-compare in Claude Code to create your first project.
+          </p>
         </div>
+      )}
 
-        <h2 className="mt-3 text-xl font-semibold text-zinc-100">
-          {state.topic}
-        </h2>
+      <div className="mt-8 space-y-4">
+        {runs?.map((run) => {
+          const isComplete = run.phase_status === "complete";
+          const products = Object.entries(run.selectedProducts).filter(
+            ([, v]) => v,
+          );
 
-        <div className="mt-4 flex flex-wrap gap-x-6 gap-y-2 text-xs text-zinc-500">
-          <span>
-            Timestamp:{" "}
-            <span className="font-mono text-zinc-400">
-              {state.timestamp}
-            </span>
-          </span>
-          <span>
-            Slug:{" "}
-            <span className="font-mono text-zinc-400">
-              {state.topic_slug}
-            </span>
-          </span>
-          {state.topic_half_life && (
-            <span>
-              Half-life:{" "}
-              <span className="text-zinc-400">
-                {state.topic_half_life}
-              </span>
-            </span>
-          )}
-        </div>
-      </div>
-
-      {/* ── Research source status grid ────────────────────── */}
-      <h3 className="mt-10 text-sm font-medium uppercase tracking-widest text-zinc-500">
-        Research Sources
-      </h3>
-
-      <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-3">
-        {sources.map(({ name, icon: Icon, status }) => {
-          const StatusIcon = STATUS_ICON[status];
           return (
-            <div
-              key={name}
-              className={`flex items-center gap-4 rounded-lg border p-4 ${STATUS_STYLE[status]}`}
+            <Link
+              key={run.slug}
+              href={`/runs/${run.slug}`}
+              className="group flex items-center gap-4 rounded-lg border border-zinc-800 bg-zinc-900 p-5 transition hover:border-zinc-700 hover:bg-zinc-800"
             >
-              <Icon className="h-6 w-6 shrink-0" />
-              <div className="min-w-0">
-                <p className="text-sm font-medium">{name}</p>
-                <div className="mt-0.5 flex items-center gap-1.5 text-xs opacity-80">
-                  <StatusIcon className="h-3.5 w-3.5" />
-                  <span className="capitalize">{status}</span>
+              {/* Status indicator */}
+              <div className="shrink-0">
+                {isComplete ? (
+                  <CheckCircle2 className="h-6 w-6 text-emerald-400" />
+                ) : (
+                  <Clock className="h-6 w-6 text-[#c8a951]" />
+                )}
+              </div>
+
+              {/* Content */}
+              <div className="min-w-0 flex-1">
+                <h2 className="text-base font-semibold text-zinc-100 group-hover:text-white">
+                  {run.topic}
+                </h2>
+
+                <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-500">
+                  <span className="font-mono">{formatTimestamp(run.timestamp)}</span>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                      isComplete
+                        ? "bg-emerald-500/10 text-emerald-400"
+                        : "bg-[#c8a951]/10 text-[#c8a951]"
+                    }`}
+                  >
+                    {phaseLabel(run.phase)}
+                  </span>
+                  <span className="font-mono">v{run.version}</span>
+                  <span>{run.fileCount} files</span>
+                  {run.vendorEvaluationEnabled && (
+                    <span className="rounded-full bg-blue-500/10 px-2 py-0.5 text-blue-400">
+                      Vendors
+                    </span>
+                  )}
+                </div>
+
+                {/* Product icons */}
+                <div className="mt-2 flex items-center gap-2">
+                  {products.map(([key]) => {
+                    const Icon = PRODUCT_ICONS[key];
+                    return Icon ? (
+                      <span key={key} title={key}>
+                        <Icon className="h-4 w-4 text-zinc-500" />
+                      </span>
+                    ) : null;
+                  })}
                 </div>
               </div>
-            </div>
+
+              {/* Arrow */}
+              <ChevronRight className="h-5 w-5 shrink-0 text-zinc-600 transition group-hover:text-zinc-400" />
+            </Link>
           );
         })}
-      </div>
-
-      {/* ── Quick stats ────────────────────────────────────── */}
-      <div className="mt-8 grid grid-cols-2 gap-4 sm:grid-cols-4">
-        {[
-          {
-            label: "Tier 1 Passed",
-            value: state.perplexity_source_urls_passed.length,
-          },
-          {
-            label: "Tier 1 Rejected",
-            value: state.perplexity_source_urls_rejected.length,
-          },
-          {
-            label: "Files Written",
-            value: state.files_written.length,
-          },
-          {
-            label: "Products",
-            value: Object.values(state.selectedProducts).filter(Boolean)
-              .length,
-          },
-        ].map(({ label, value }) => (
-          <div
-            key={label}
-            className="rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-3"
-          >
-            <p className="text-xs text-zinc-500">{label}</p>
-            <p className="mt-1 text-2xl font-semibold text-zinc-100">
-              {value}
-            </p>
-          </div>
-        ))}
       </div>
     </div>
   );

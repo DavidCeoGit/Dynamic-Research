@@ -21,7 +21,7 @@ export default function RunDetailPage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = use(params);
-  const { state, isLoading, isError, mutate } = useRunState();
+  const { state, isLoading, isError, mutate } = useRunState(slug);
 
   // ── Loading ────────────────────────────────────────────────────
   if (isLoading) {
