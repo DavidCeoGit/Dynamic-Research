@@ -1,7 +1,7 @@
 /**
- * POST /api/queue
+ * POST /api/queue — Creates a new research job in the queue.
+ * GET  /api/queue — Lists active jobs (pending, running, failed).
  *
- * Creates a new research job in the queue.
  * Validates inputs via Zod, generates a unique slug, calculates
  * estimated completion time, and inserts into research_queue.
  */
@@ -64,4 +64,23 @@ export async function POST(request: Request) {
     { id: row.id, slug: row.topic_slug, estimatedMinutes: row.estimated_minutes },
     { status: 201 },
   );
+}
+
+export async function GET() {
+  const supabase = getSupabase();
+
+  const { data, error } = await supabase
+    .from("research_queue")
+    .select("id, topic, topic_slug, status, current_phase, phase_status, progress_pct, estimated_minutes, created_at, result_slug")
+    .in("status", ["pending", "running", "failed"])
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return Response.json(
+      { error: "Failed to fetch queue", detail: error.message },
+      { status: 500 },
+    );
+  }
+
+  return Response.json(data);
 }

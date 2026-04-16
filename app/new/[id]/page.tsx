@@ -28,6 +28,7 @@ import {
   Image as ImageIcon,
 } from "lucide-react";
 import type { ResearchJob, SelectedProducts } from "@/lib/types/queue";
+import { useToast } from "@/components/ToastProvider";
 
 // ── Phase timeline definition ──────────────────────────────────────
 
@@ -104,11 +105,16 @@ function useElapsed(startIso: string | null, stop: boolean): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+// ── Session storage key (must match useNewResearchForm hook) ───────
+
+const FORM_STORAGE_KEY = "new-research-draft";
+
 // ── Main component ─────────────────────────────────────────────────
 
 export default function ProgressPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const router = useRouter();
+  const { toast } = useToast();
   const [retrying, setRetrying] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
   const redirectStarted = useRef(false);
@@ -170,7 +176,7 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
     return () => clearTimeout(t);
   }, [countdown, router, job]);
 
-  // Retry handler
+  // Retry handler (with toast feedback)
   async function handleRetry() {
     if (!job) return;
     setRetrying(true);
@@ -187,12 +193,36 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
           customizations: job.customizations,
         }),
       });
-      if (!res.ok) throw new Error("Retry failed");
+      if (!res.ok) throw new Error("Failed to create retry job");
       const { id: newId } = await res.json();
+      toast("Job restarted successfully", "success");
       router.push(`/new/${newId}`);
-    } catch {
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Retry failed";
+      toast(msg, "error");
       setRetrying(false);
     }
+  }
+
+  // Edit Configuration handler (state recovery)
+  function handleEditConfig() {
+    if (!job) return;
+
+    // Map snake_case DB fields → camelCase form schema
+    const draft = {
+      topic: job.topic,
+      generatedQuestions: [],
+      dynamicAnswers: {},
+      vendorEvaluation: job.vendor_evaluation,
+      ajiDnaEnabled: job.aji_dna_enabled,
+      selectedProducts: job.selected_products,
+      customizations: job.customizations,
+      notifyEmail: job.notify_email ?? "",
+    };
+
+    sessionStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(draft));
+    toast("Configuration loaded. Ready to edit.", "info");
+    router.push("/new");
   }
 
   // ── Error state (no job found) ──────────────────────────────────
@@ -472,12 +502,12 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
                       )}
                       Retry Research
                     </button>
-                    <Link
-                      href="/new"
+                    <button
+                      onClick={handleEditConfig}
                       className="flex items-center gap-2 rounded-lg border border-zinc-700 px-5 py-2.5 text-sm text-zinc-300 hover:bg-zinc-800 transition"
                     >
                       Edit Configuration
-                    </Link>
+                    </button>
                   </div>
                 </div>
               </div>
