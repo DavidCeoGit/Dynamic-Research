@@ -107,3 +107,40 @@ export const agentUpdateSchema = z.object({
   result_slug: z.string().optional(),
   error_message: z.string().optional(),
 });
+
+// ── Form-level schema (extends API payload with transient form fields) ──
+
+/** Products schema without .refine() — for react-hook-form field registration */
+export const selectedProductsBaseSchema = z.object({
+  audio: z.boolean().default(false),
+  video: z.boolean().default(false),
+  slides: z.boolean().default(false),
+  report: z.boolean().default(false),
+  infographic: z.boolean().default(false),
+});
+
+export const formDataSchema = z.object({
+  topic: z.string().min(10, "Topic must be at least 10 characters").max(500),
+  userContext: userContextSchema.default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
+  vendorEvaluation: vendorEvaluationSchema.default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
+  ajiDnaEnabled: z.boolean().default(false),
+  selectedProducts: selectedProductsBaseSchema,
+  customizations: customizationsSchema.default({ perplexity: { queryFraming: "", emphasis: [], outputStructure: "" }, notebookLM: { persona: "", researchMode: "deep" as const, priorities: [] }, studio: {} }),
+  notifyEmail: z.string().email().optional().or(z.literal("")),
+  generatedQuestions: z.array(generatedQuestionSchema).default([]),
+  dynamicAnswers: z.record(z.string(), z.union([z.string(), z.boolean(), z.array(z.string())])).default({}),
+});
+
+export type FormData = z.infer<typeof formDataSchema>;
+
+export const FORM_DEFAULT_VALUES: FormData = {
+  topic: "",
+  userContext: { domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] },
+  vendorEvaluation: { enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 },
+  ajiDnaEnabled: false,
+  selectedProducts: { audio: false, video: false, slides: false, report: false, infographic: false },
+  customizations: { perplexity: { queryFraming: "", emphasis: [], outputStructure: "" }, notebookLM: { persona: "", researchMode: "deep", priorities: [] }, studio: {} },
+  notifyEmail: "",
+  generatedQuestions: [],
+  dynamicAnswers: {},
+};

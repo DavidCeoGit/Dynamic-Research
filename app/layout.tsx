@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import Link from "next/link";
-import { Activity } from "lucide-react";
+import { Activity, Plus } from "lucide-react";
 import "./globals.css";
 
 const inter = Inter({
@@ -29,6 +29,9 @@ export default function RootLayout({
             <span className="text-lg font-semibold tracking-tight">
               Dynamic AI Research
             </span>
+          </Link>
+          <Link href="/new" className="flex items-center gap-2 rounded-md bg-[#c8a951] px-4 py-2 text-sm font-medium text-[#1a2744] hover:bg-[#d4b85e] transition">
+            <Plus className="h-4 w-4" /> New Research
           </Link>
         </header>
 

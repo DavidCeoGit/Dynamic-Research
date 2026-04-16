@@ -113,7 +113,7 @@ export default function HomePage() {
           <AlertCircle className="h-10 w-10 text-zinc-600" />
           <p className="text-sm">No research runs yet.</p>
           <p className="text-xs text-zinc-500">
-            Run /research-compare in Claude Code to create your first project.
+            <Link href="/new" className="text-[#c8a951] hover:underline">Start your first research project</Link>
           </p>
         </div>
       )}

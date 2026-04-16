@@ -108,3 +108,27 @@ export interface ResearchJob {
   estimated_minutes: number | null;
   result_slug: string | null;
 }
+
+// ── Form step constants & component interfaces ─────────────────────
+
+export const FORM_STEPS: FormStep[] = ["topic", "questions", "products", "customize", "review"];
+
+export interface StepProps {
+  onNext: () => void;
+  onPrev: () => void;
+}
+
+export interface StepQuestionsProps extends StepProps {
+  isGenerating: boolean;
+}
+
+export interface StepProductsProps extends StepProps {
+  estMins: number;
+}
+
+export interface StepReviewProps {
+  onPrev: () => void;
+  isSubmitting: boolean;
+  submitError: string | null;
+  estMins: number;
+}
