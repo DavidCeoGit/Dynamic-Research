@@ -26,18 +26,18 @@ export function generateSlug(topic: string): string {
 // ── Zod schemas ─────────────────────────────────────────────────────
 
 export const userContextSchema = z.object({
-  domainKnowledge: z.array(z.string().max(500)).default([]),
-  constraints: z.array(z.string().max(500)).default([]),
+  domainKnowledge: z.array(z.string().max(10000)).default([]),
+  constraints: z.array(z.string().max(5000)).default([]),
   additionalUrls: z.array(z.string().url().max(2000)).default([]),
-  claimsToVerify: z.array(z.string().max(500)).default([]),
+  claimsToVerify: z.array(z.string().max(5000)).default([]),
 });
 
 export const vendorEvaluationSchema = z.object({
   enabled: z.boolean().default(false),
-  vendorType: z.string().max(100).default(""),
-  serviceArea: z.string().max(200).default(""),
-  serviceAddress: z.string().max(300).default(""),
-  jobDescription: z.string().max(1000).default(""),
+  vendorType: z.string().max(500).default(""),
+  serviceArea: z.string().max(1000).default(""),
+  serviceAddress: z.string().max(500).default(""),
+  jobDescription: z.string().max(10000).default(""),
   maxVendorsDiscovered: z.number().int().min(1).max(20).default(10),
   maxVendorsEnriched: z.number().int().min(1).max(10).default(5),
 });
@@ -54,15 +54,15 @@ export const selectedProductsSchema = z.object({
 );
 
 export const perplexitySchema = z.object({
-  queryFraming: z.string().max(500).default(""),
-  emphasis: z.array(z.string().max(200)).default([]),
-  outputStructure: z.string().max(500).default(""),
+  queryFraming: z.string().max(25000).default(""),
+  emphasis: z.array(z.string().max(2000)).default([]),
+  outputStructure: z.string().max(10000).default(""),
 });
 
 export const notebookLMSchema = z.object({
-  persona: z.string().max(1000).default(""),
+  persona: z.string().max(25000).default(""),
   researchMode: z.enum(["deep", "standard"]).default("deep"),
-  priorities: z.array(z.string().max(200)).default([]),
+  priorities: z.array(z.string().max(2000)).default([]),
 });
 
 export const customizationsSchema = z.object({
@@ -72,7 +72,7 @@ export const customizationsSchema = z.object({
 });
 
 export const researchJobPayloadSchema = z.object({
-  topic: z.string().min(10, "Topic must be at least 10 characters").max(500),
+  topic: z.string().min(10, "Topic must be at least 10 characters").max(1000),
   userContext: userContextSchema.optional().default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
   vendorEvaluation: vendorEvaluationSchema.optional().default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
   ajiDnaEnabled: z.boolean().default(false),
@@ -82,7 +82,7 @@ export const researchJobPayloadSchema = z.object({
 });
 
 export const generateQuestionsSchema = z.object({
-  topic: z.string().min(10).max(500),
+  topic: z.string().min(10).max(1000),
 });
 
 /** Schema for the AI-generated questions response. */
@@ -120,7 +120,7 @@ export const selectedProductsBaseSchema = z.object({
 });
 
 export const formDataSchema = z.object({
-  topic: z.string().min(10, "Topic must be at least 10 characters").max(500),
+  topic: z.string().min(10, "Topic must be at least 10 characters").max(1000),
   userContext: userContextSchema.default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
   vendorEvaluation: vendorEvaluationSchema.default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
   ajiDnaEnabled: z.boolean().default(false),

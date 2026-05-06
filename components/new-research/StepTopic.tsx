@@ -32,7 +32,7 @@ export function StepTopic({ onNext }: StepProps) {
             <p className="text-xs text-zinc-600">Minimum 10 characters</p>
           )}
           <span className={`text-xs ${topic.length >= 10 ? "text-zinc-500" : "text-zinc-600"}`}>
-            {topic.length}/500
+            {topic.length}/1000
           </span>
         </div>
       </div>

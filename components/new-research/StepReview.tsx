@@ -15,7 +15,7 @@ const PRODUCT_META: Record<string, { label: string; icon: typeof Music }> = {
 };
 
 export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepReviewProps) {
-  const { watch } = useFormContext<FormData>();
+  const { watch, formState: { errors } } = useFormContext<FormData>();
   const topic = watch("topic");
   const products = watch("selectedProducts");
   const vendor = watch("vendorEvaluation");
@@ -82,6 +82,17 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepR
 
       <TimeEstimate minutes={estMins} />
 
+      {Object.keys(errors).length > 0 && (
+        <div className="text-sm text-red-400 bg-red-400/10 rounded-lg px-4 py-3 space-y-1">
+          <p className="font-medium">Please fix these issues before submitting:</p>
+          <ul className="list-disc list-inside space-y-0.5 text-red-300">
+            {flattenFieldErrors(errors).map((e, i) => (
+              <li key={i}><span className="font-mono text-xs">{e.path}</span>: {e.message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {submitError && (
         <p className="text-sm text-red-400 bg-red-400/10 rounded-lg px-4 py-2">{submitError}</p>
       )}
@@ -108,4 +119,21 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepR
       </div>
     </div>
   );
+}
+
+function flattenFieldErrors(
+  errs: Record<string, unknown>,
+  prefix = "",
+): Array<{ path: string; message: string }> {
+  const out: Array<{ path: string; message: string }> = [];
+  for (const [key, val] of Object.entries(errs)) {
+    if (!val || typeof val !== "object") continue;
+    const v = val as Record<string, unknown>;
+    if (typeof v.message === "string") {
+      out.push({ path: prefix ? prefix + "." + key : key, message: v.message });
+    } else {
+      out.push(...flattenFieldErrors(v as Record<string, unknown>, prefix ? prefix + "." + key : key));
+    }
+  }
+  return out;
 }
