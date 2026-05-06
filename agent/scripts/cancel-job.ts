@@ -55,3 +55,5 @@ console.log(text);
 if (!res.ok) {
   process.exit(1);
 }
+
+export {};
