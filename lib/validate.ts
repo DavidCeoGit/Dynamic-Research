@@ -28,7 +28,28 @@ export function generateSlug(topic: string): string {
 export const userContextSchema = z.object({
   domainKnowledge: z.array(z.string().max(10000)).default([]),
   constraints: z.array(z.string().max(5000)).default([]),
-  additionalUrls: z.array(z.string().url().max(2000)).default([]),
+  additionalUrls: z.preprocess(
+    (val) => {
+      // Auto-clean URL list: drop empty strings and obvious non-URLs,
+      // prepend https:// to bare domains. Lets dynamic-question free-text
+      // answers (which get split by whitespace into per-token entries) work
+      // even when some tokens are plain prose rather than URLs.
+      if (!Array.isArray(val)) return val;
+      return val
+        .map((u) => (typeof u === "string" ? u.trim() : ""))
+        .filter((u) => u.length > 0)
+        .map((u) => {
+          if (/^https?:\/\//i.test(u)) return u;
+          // Bare-domain heuristic: at least one dot, and chars are URL-ish
+          if (/^[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)+(\/[^\s]*)?$/i.test(u)) {
+            return `https://${u}`;
+          }
+          return null;
+        })
+        .filter((u): u is string => u !== null);
+    },
+    z.array(z.string().url().max(2000)),
+  ).default([]),
   claimsToVerify: z.array(z.string().max(5000)).default([]),
 });
 
