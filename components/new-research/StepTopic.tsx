@@ -22,17 +22,17 @@ export function StepTopic({ onNext }: StepProps) {
         <textarea
           {...register("topic")}
           rows={4}
-          placeholder="e.g., Compare the top 5 AI code assistants for enterprise TypeScript development, focusing on security, cost, and developer experience..."
+          placeholder="Describe your research topic. Detailed topics (full briefs, requirements, context) work best — paste up to 10,000 characters of context if you have it. The clarifying questions adapt to what you provide."
           className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-[#c8a951] focus:outline-none focus:ring-1 focus:ring-[#c8a951] resize-none"
         />
         <div className="mt-1.5 flex items-center justify-between">
           {errors.topic ? (
             <p className="text-xs text-red-400">{errors.topic.message}</p>
           ) : (
-            <p className="text-xs text-zinc-600">Minimum 10 characters</p>
+            <p className="text-xs text-zinc-600">Minimum 10 characters. Detailed topics get smarter clarifying questions.</p>
           )}
           <span className={`text-xs ${topic.length >= 10 ? "text-zinc-500" : "text-zinc-600"}`}>
-            {topic.length}/1000
+            {topic.length}/10000
           </span>
         </div>
       </div>

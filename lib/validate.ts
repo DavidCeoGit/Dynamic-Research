@@ -93,7 +93,7 @@ export const customizationsSchema = z.object({
 });
 
 export const researchJobPayloadSchema = z.object({
-  topic: z.string().min(10, "Topic must be at least 10 characters").max(1000),
+  topic: z.string().min(10, "Topic must be at least 10 characters").max(10000),
   userContext: userContextSchema.optional().default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
   vendorEvaluation: vendorEvaluationSchema.optional().default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
   ajiDnaEnabled: z.boolean().default(false),
@@ -103,7 +103,7 @@ export const researchJobPayloadSchema = z.object({
 });
 
 export const generateQuestionsSchema = z.object({
-  topic: z.string().min(10).max(1000),
+  topic: z.string().min(10).max(10000),
 });
 
 /** Schema for the AI-generated questions response. */
@@ -116,7 +116,7 @@ export const generatedQuestionSchema = z.object({
 });
 
 export const questionsResponseSchema = z.object({
-  questions: z.array(generatedQuestionSchema).min(5).max(7),
+  questions: z.array(generatedQuestionSchema).min(2).max(7),
 });
 
 /** Schema for agent progress updates. */
@@ -141,7 +141,7 @@ export const selectedProductsBaseSchema = z.object({
 });
 
 export const formDataSchema = z.object({
-  topic: z.string().min(10, "Topic must be at least 10 characters").max(1000),
+  topic: z.string().min(10, "Topic must be at least 10 characters").max(10000),
   userContext: userContextSchema.default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
   vendorEvaluation: vendorEvaluationSchema.default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
   ajiDnaEnabled: z.boolean().default(false),
