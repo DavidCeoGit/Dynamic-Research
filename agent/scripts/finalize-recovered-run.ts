@@ -6,9 +6,17 @@
  *
  * Usage:
  *   node --env-file=.env --import=tsx scripts/finalize-recovered-run.ts \
- *     <job-id> <workdir> <slug> <status> [error_message]
+ *     <job-id> <workdir> <slug> <status> [error_message] [--force]
  *
- * Status: 'failed' or 'completed'
+ * Status: 'failed' | 'completed' | 'cancelled'
+ *
+ * Lint gate (S30, hard): runs `lint-deliverables.ts <workdir> --strict` before
+ * any upload. Refuses to proceed if lint fails. Pass --force to override (will
+ * still print the violations and tag the upload with a warning). The gate
+ * exists because S29 cam AI + Gunderson recovery surfaced repeated naming-
+ * drift incidents (5 noise files + 32 wrongly-named files needed manual
+ * cleanup) that the conventions module catches but only if a code path runs
+ * it. See feedback_workflow_drift_layer_3_gap.md.
  *
  * One-shot operator script for cases where the executor's auto-upload
  * never ran (e.g. timeout-killed run + post-wake fetch-failed). Does NOT
@@ -19,15 +27,21 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import { BUCKET, isSkipFile } from "../lib/conventions.js";
 
-const [, , jobId, workDir, slug, status, ...errorParts] = process.argv;
+// Parse argv: pull --force out, leave the rest as positional
+const rawArgs = process.argv.slice(2);
+const force = rawArgs.includes("--force");
+const positional = rawArgs.filter((a) => a !== "--force");
+const [jobId, workDir, slug, status, ...errorParts] = positional;
 const errorMessage = errorParts.join(" ") || null;
 
 if (!jobId || !workDir || !slug || !status) {
   console.error(
-    "usage: finalize-recovered-run.ts <job-id> <workdir> <slug> <status> [error_message]",
+    "usage: finalize-recovered-run.ts <job-id> <workdir> <slug> <status> [error_message] [--force]",
   );
   process.exit(2);
 }
@@ -48,6 +62,43 @@ if (!url || !key) {
   console.error("missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   process.exit(2);
 }
+
+// ── Lint gate (S30) ─────────────────────────────────────────────────
+// Run lint-deliverables.ts --strict against the workdir. Refuse to upload if
+// it reports errors, unless --force is passed.
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const lintScript = path.join(__dirname, "lint-deliverables.ts");
+
+console.log(`\nLint gate: running ${path.basename(lintScript)} --strict on ${workDir}`);
+const lint = spawnSync(
+  process.execPath,
+  ["--import=tsx", lintScript, workDir, "--strict"],
+  { stdio: "inherit" },
+);
+
+if (lint.status !== 0) {
+  if (!force) {
+    console.error(
+      "\n✗ LINT FAILED (exit " +
+        lint.status +
+        "). Refusing to upload.\n" +
+        "  Fix the violations above (or rename files via agent/scripts/rename-and-finalize.ts), then retry.\n" +
+        "  To override after a deliberate review, pass --force.",
+    );
+    process.exit(1);
+  } else {
+    console.warn(
+      "\n⚠  Lint failed (exit " +
+        lint.status +
+        ") but --force passed — proceeding with upload. Operator-owned override.",
+    );
+  }
+} else {
+  console.log("✓ Lint clean — proceeding with upload.");
+}
+
+// ── Upload + DB patch ────────────────────────────────────────────────
 
 const sb = createClient(url, key, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -75,7 +126,7 @@ function guessContentType(name: string): string {
   return CONTENT_TYPES[path.extname(name).toLowerCase()] ?? "application/octet-stream";
 }
 
-console.log(`Finalizing job ${jobId}`);
+console.log(`\nFinalizing job ${jobId}`);
 console.log(`  workdir: ${workDir}`);
 console.log(`  slug: ${slug}`);
 console.log(`  status: ${status}`);
@@ -124,7 +175,10 @@ const patchBody: Record<string, unknown> = {
   status,
   completed_at: new Date().toISOString(),
 };
-if (errorMessage) patchBody.error_message = errorMessage;
+const finalErrorMessage = force && lint.status !== 0
+  ? `${errorMessage ?? ""}${errorMessage ? " | " : ""}lint=fail (forced)`.trim()
+  : errorMessage;
+if (finalErrorMessage) patchBody.error_message = finalErrorMessage;
 if (status === "completed") patchBody.result_slug = slug;
 
 const res = await fetch(`${url}/rest/v1/research_queue?id=eq.${jobId}`, {
