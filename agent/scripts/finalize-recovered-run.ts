@@ -20,6 +20,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createClient } from "@supabase/supabase-js";
+import { BUCKET, isSkipFile } from "../lib/conventions.js";
 
 const [, , jobId, workDir, slug, status, ...errorParts] = process.argv;
 const errorMessage = errorParts.join(" ") || null;
@@ -51,23 +52,6 @@ if (!url || !key) {
 const sb = createClient(url, key, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
-const BUCKET = "research-projects";
-
-// Files to skip (internal pipeline state, not user-facing artifacts)
-const SKIP = new Set([
-  "claude-prompt.md",
-  "job-manifest.json",
-]);
-
-const SKIP_PREFIX = ["instr-", "nlm_", "."];
-
-function shouldSkip(name: string): boolean {
-  if (SKIP.has(name)) return true;
-  for (const p of SKIP_PREFIX) {
-    if (name.startsWith(p)) return true;
-  }
-  return false;
-}
 
 const CONTENT_TYPES: Record<string, string> = {
   ".json": "application/json",
@@ -103,7 +87,7 @@ let skipped = 0;
 let failed = 0;
 
 for (const name of entries) {
-  if (shouldSkip(name)) {
+  if (isSkipFile(name)) {
     skipped++;
     continue;
   }

@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { updateJob, completeJob, failJob } from "./api-client.js";
+import { BUCKET, isSkipFile } from "./lib/conventions.js";
 import type { ResearchJob, PipelineState } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -22,7 +23,6 @@ const PROJECTS_DIR = process.env.PROJECTS_DIR ??
   "/c/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/Projects";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
-const BUCKET = "research-projects";
 const DRY_RUN = process.env.DRY_RUN === "true";
 
 // Phase number → { name, progressPct } mapping from /research-compare
@@ -502,10 +502,10 @@ async function uploadOutputs(
     try {
       const files = await fs.readdir(source);
       for (const file of files) {
-        // Skip manifests, node_modules, etc.
-        if (file === "job-manifest.json" || file === "node_modules" || file.startsWith(".")) {
-          continue;
-        }
+        // Skip pipeline-internal files per agent/lib/conventions.json (single source of truth).
+        // Conventions covers: claude-prompt.md, job-manifest.json, studio-task-ids.json,
+        // nlm_discovered_sources.json, plus prefixes instr-*, nlm_*, write_*, test_*, .*
+        if (isSkipFile(file)) continue;
         const localPath = path.join(source, file);
         const stat = await fs.stat(localPath);
         if (!stat.isFile()) continue;
