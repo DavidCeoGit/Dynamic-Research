@@ -308,23 +308,57 @@ function spawnClaude(prompt: string, cwd: string): ChildProcess {
 
 // ── Process completion waiter ───────────────────────────────────────
 
+/**
+ * Wait for the Claude child process to exit, with a max-active-duration kill.
+ *
+ * Bug 38 fix (S29): tracks ACTIVE elapsed via setInterval ticks instead of a
+ * single setTimeout. setTimeout pauses during Windows S3/S4 sleep and fires
+ * hours late on wake (Gunderson run, 2026-05-07: 90-min timer fired ~4hr late
+ * post-suspend, killing claude after 9/10 deliverables completed). setInterval
+ * also pauses, but on wake fires once with a large gap — we detect gaps over
+ * SLEEP_THRESHOLD_MS and don't count them toward active time. A healthy job
+ * suspended along with the OS therefore survives wake-up; a wedged job that
+ * runs past MAX_JOB_DURATION of *active* time is still killed.
+ *
+ * See feedback_node_settimeout_during_windows_sleep.md +
+ *     feedback_in_memory_timer_must_persist.md.
+ */
 function waitForProcess(child: ChildProcess, job: ResearchJob): Promise<number> {
   const maxDuration = Number(process.env.MAX_JOB_DURATION_MS) || 5_400_000; // 90 min
+  const SLEEP_THRESHOLD_MS = 5 * 60 * 1000; // gap > 5min between ticks = system slept
+  const TICK_MS = 30_000;
 
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      log(job.id, `Job exceeded max duration (${maxDuration}ms) — killing`);
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 10_000);
-    }, maxDuration);
+    let lastTick = Date.now();
+    let activeMs = 0;
+    let killAttempted = false;
+
+    const deadlineCheck = setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastTick;
+      lastTick = now;
+
+      if (gap < SLEEP_THRESHOLD_MS) {
+        activeMs += gap;
+      } else {
+        log(job.id, `Detected ${Math.round(gap / 60000)}min gap (system sleep?) — not counting toward MAX_JOB_DURATION`);
+      }
+
+      if (activeMs > maxDuration && !killAttempted) {
+        killAttempted = true;
+        log(job.id, `Job exceeded max active duration (${maxDuration}ms; active ${Math.round(activeMs / 60000)}min) — killing`);
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 10_000);
+      }
+    }, TICK_MS);
 
     child.on("exit", (code) => {
-      clearTimeout(timeout);
+      clearInterval(deadlineCheck);
       resolve(code ?? 1);
     });
 
     child.on("error", (err) => {
-      clearTimeout(timeout);
+      clearInterval(deadlineCheck);
       reject(err);
     });
   });
