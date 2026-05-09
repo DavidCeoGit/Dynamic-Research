@@ -1,14 +1,23 @@
 /**
  * POST /api/queue/generate-questions
  *
- * Uses the Vercel AI SDK with Claude Sonnet to generate 5-7 refinement
+ * Uses the Vercel AI SDK with Claude Sonnet to generate refinement
  * questions based on a research topic. Returns structured JSON via
  * generateObject with a strict Zod schema.
+ *
+ * Path A (S28): topic-length tiers BRIEF/DETAILED/COMPREHENSIVE adapt question density.
+ * Path B (S29): when extractedContext is provided, mechanically post-filter to
+ *   drop any question whose mappedField has already-extracted content. Guarantees
+ *   no redundant questions even if the LLM ignores the prompt-level skip instruction.
  */
 
 import { generateObject } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
-import { generateQuestionsSchema, questionsResponseSchema } from "@/lib/validate";
+import {
+  generateQuestionsSchema,
+  questionsResponseSchema,
+  type ExtractedContext,
+} from "@/lib/validate";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +37,8 @@ Path A (S28): Before drafting questions, scan the topic for already-stated conte
   - ajiDnaEnabled - executive/exec-summary tone signaling
 If a dimension is already well-covered in the topic, DO NOT generate a question for it. Confirmation questions for clearly-stated info waste the user time.
 
+Path B (S29): If the user-message includes "ALREADY EXTRACTED" dimensions, do NOT generate questions whose mappedField is in that list. The extraction step has already captured those values; asking again is pure waste. Focus exclusively on dimensions that are NOT in the extracted list.
+
 Question generation rules:
 - Questions progressively narrow the scope (broad context to specific constraints)
 - Each question MUST specify a mappedField indicating where the answer belongs:
@@ -37,6 +48,27 @@ Question generation rules:
 - Use "multiselect" type when offering predefined choices (provide options array)
 - Make questions specific to the topic, not generic templates
 - For DETAILED/COMPREHENSIVE topics: lead with the highest-leverage gap, not the most obvious dimension`;
+
+/** Returns dimension names that are already populated in the extracted context. */
+function coveredDimensions(ec: ExtractedContext | null | undefined): string[] {
+  if (!ec) return [];
+  const covered: string[] = [];
+  if (ec.domainKnowledge && ec.domainKnowledge.length > 0) covered.push("domainKnowledge");
+  if (ec.constraints && ec.constraints.length > 0) covered.push("constraints");
+  if (ec.additionalUrls && ec.additionalUrls.length > 0) covered.push("additionalUrls");
+  if (ec.claimsToVerify && ec.claimsToVerify.length > 0) covered.push("claimsToVerify");
+  if (ec.vendorEvaluation && (
+    ec.vendorEvaluation.enabled !== null ||
+    ec.vendorEvaluation.vendorType !== null ||
+    ec.vendorEvaluation.serviceArea !== null
+  )) {
+    covered.push("vendorEvaluation");
+  }
+  if (ec.ajiDnaEnabled !== null && ec.ajiDnaEnabled !== undefined) {
+    covered.push("ajiDnaEnabled");
+  }
+  return covered;
+}
 
 export async function POST(request: Request) {
   let body: unknown;
@@ -54,6 +86,11 @@ export async function POST(request: Request) {
     );
   }
 
+  const covered = coveredDimensions(parsed.data.extractedContext);
+  const coveredHint = covered.length > 0
+    ? `\n\nALREADY EXTRACTED — DO NOT ASK ABOUT: ${covered.join(", ")}.\nThe topic-extraction step has already captured these dimensions. Generate questions ONLY for dimensions NOT in this list.`
+    : "";
+
   try {
     const result = await generateObject({
       model: anthropic("claude-sonnet-4-20250514"),
@@ -64,10 +101,16 @@ export async function POST(request: Request) {
 ${parsed.data.topic}
 """
 
-Apply the topic-length tier (BRIEF/DETAILED/COMPREHENSIVE) and generate the appropriate number of questions per the system prompt rules. Skip any dimension the topic already covers. Lead with the highest-leverage gap.`,
+Apply the topic-length tier (BRIEF/DETAILED/COMPREHENSIVE) and generate the appropriate number of questions per the system prompt rules. Skip any dimension the topic already covers. Lead with the highest-leverage gap.${coveredHint}`,
     });
 
-    return Response.json(result.object);
+    // Path B mechanical guarantee: drop any question whose mappedField is already extracted.
+    // The LLM may still slip up despite the prompt; this enforces the contract.
+    const filtered = covered.length > 0
+      ? result.object.questions.filter((q) => !covered.includes(q.mappedField))
+      : result.object.questions;
+
+    return Response.json({ questions: filtered });
   } catch (err) {
     return Response.json(
       { error: "Question generation failed", detail: String(err) },

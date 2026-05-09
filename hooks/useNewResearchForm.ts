@@ -5,7 +5,12 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import type { Resolver } from "react-hook-form";
 import { useRouter } from "next/navigation";
-import { formDataSchema, FORM_DEFAULT_VALUES, type FormData } from "@/lib/validate";
+import {
+  formDataSchema,
+  FORM_DEFAULT_VALUES,
+  type FormData,
+  type ExtractedContext,
+} from "@/lib/validate";
 import { estimateMinutes } from "@/lib/estimates";
 import type { FormStep, GeneratedQuestion } from "@/lib/types/queue";
 import { FORM_STEPS } from "@/lib/types/queue";
@@ -64,18 +69,82 @@ export function useNewResearchForm() {
     vendorEnabled ?? false,
   );
 
-  // ── AI question generation ─────────────────────────────────────────
+  // ── Apply extracted context to userContext / vendorEvaluation ──────
+  // Path B: silently merge LLM-extracted dimensions into the form state so
+  // (a) they reach userContext at submit time without the user re-typing,
+  // (b) downstream steps (Customize/Review) show the merged values.
+  // Path C will add UI affordances for the user to see + edit pre-fills.
+
+  const applyExtractedContext = useCallback((ec: ExtractedContext) => {
+    if (ec.domainKnowledge && ec.domainKnowledge.length > 0) {
+      const current = form.getValues("userContext.domainKnowledge") ?? [];
+      const merged = Array.from(new Set([...current, ...ec.domainKnowledge]));
+      form.setValue("userContext.domainKnowledge", merged);
+    }
+    if (ec.constraints && ec.constraints.length > 0) {
+      const current = form.getValues("userContext.constraints") ?? [];
+      const merged = Array.from(new Set([...current, ...ec.constraints]));
+      form.setValue("userContext.constraints", merged);
+    }
+    if (ec.additionalUrls && ec.additionalUrls.length > 0) {
+      const current = form.getValues("userContext.additionalUrls") ?? [];
+      const merged = Array.from(new Set([...current, ...ec.additionalUrls]));
+      form.setValue("userContext.additionalUrls", merged);
+    }
+    if (ec.claimsToVerify && ec.claimsToVerify.length > 0) {
+      const current = form.getValues("userContext.claimsToVerify") ?? [];
+      const merged = Array.from(new Set([...current, ...ec.claimsToVerify]));
+      form.setValue("userContext.claimsToVerify", merged);
+    }
+    if (ec.vendorEvaluation) {
+      if (ec.vendorEvaluation.enabled !== null) {
+        form.setValue("vendorEvaluation.enabled", ec.vendorEvaluation.enabled);
+      }
+      if (ec.vendorEvaluation.vendorType !== null) {
+        form.setValue("vendorEvaluation.vendorType", ec.vendorEvaluation.vendorType);
+      }
+      if (ec.vendorEvaluation.serviceArea !== null) {
+        form.setValue("vendorEvaluation.serviceArea", ec.vendorEvaluation.serviceArea);
+      }
+    }
+    if (ec.ajiDnaEnabled !== null) {
+      form.setValue("ajiDnaEnabled", ec.ajiDnaEnabled);
+    }
+  }, [form]);
+
+  // ── AI extract + question generation (chained) ─────────────────────
 
   const generateQuestions = useCallback(async () => {
     const topic = form.getValues("topic");
     if (!topic || topic.length < 10) return;
 
     setIsGenerating(true);
+    let extracted: ExtractedContext | null = null;
+
+    // Stage 1: extract structured context. Failure here is non-fatal —
+    // we fall back to Path A behavior (generate questions without context).
+    try {
+      const res = await fetch("/api/queue/extract-context", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        extracted = data.extractedContext as ExtractedContext;
+        form.setValue("extractedContext", extracted);
+        applyExtractedContext(extracted);
+      }
+    } catch (err) {
+      console.error("Context extraction failed (continuing without):", err);
+    }
+
+    // Stage 2: generate gap-only questions, passing extracted context.
     try {
       const res = await fetch("/api/queue/generate-questions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic }),
+        body: JSON.stringify({ topic, extractedContext: extracted }),
       });
       if (!res.ok) throw new Error(`Failed: ${res.status}`);
       const data = await res.json();
@@ -85,7 +154,7 @@ export function useNewResearchForm() {
     } finally {
       setIsGenerating(false);
     }
-  }, [form]);
+  }, [form, applyExtractedContext]);
 
   // ── Apply dynamic answers to userContext / vendorEvaluation ────────
 
@@ -180,7 +249,7 @@ export function useNewResearchForm() {
       form.clearErrors("selectedProducts");
     }
 
-    // On leaving topic step, trigger question generation
+    // On leaving topic step, trigger extract + question generation
     if (step === "topic") {
       generateQuestions();
     }
@@ -210,7 +279,12 @@ export function useNewResearchForm() {
     setSubmitError(null);
 
     // Strip transient fields before sending to API
-    const { generatedQuestions: _gq, dynamicAnswers: _da, ...payload } = data;
+    const {
+      generatedQuestions: _gq,
+      dynamicAnswers: _da,
+      extractedContext: _ec,
+      ...payload
+    } = data;
 
     try {
       const res = await fetch("/api/queue", {

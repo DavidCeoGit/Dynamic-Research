@@ -102,8 +102,31 @@ export const researchJobPayloadSchema = z.object({
   notifyEmail: z.string().email().optional().or(z.literal("")),
 });
 
+// Path B (S29): structured extraction of dimensions the topic already covers.
+// `null` for any dimension the topic does not address. The /api/queue/generate-questions
+// endpoint uses non-null fields to mechanically skip questions for already-covered ground.
+export const extractedContextSchema = z.object({
+  domainKnowledge: z.array(z.string().max(10000)).nullable(),
+  constraints: z.array(z.string().max(5000)).nullable(),
+  additionalUrls: z.array(z.string().max(2000)).nullable(),
+  claimsToVerify: z.array(z.string().max(5000)).nullable(),
+  vendorEvaluation: z.object({
+    enabled: z.boolean().nullable(),
+    vendorType: z.string().max(500).nullable(),
+    serviceArea: z.string().max(1000).nullable(),
+  }).nullable(),
+  ajiDnaEnabled: z.boolean().nullable(),
+});
+
+export type ExtractedContext = z.infer<typeof extractedContextSchema>;
+
+export const extractContextRequestSchema = z.object({
+  topic: z.string().min(10).max(10000),
+});
+
 export const generateQuestionsSchema = z.object({
   topic: z.string().min(10).max(10000),
+  extractedContext: extractedContextSchema.nullable().optional(),
 });
 
 /** Schema for the AI-generated questions response. */
@@ -150,6 +173,7 @@ export const formDataSchema = z.object({
   notifyEmail: z.string().email().optional().or(z.literal("")),
   generatedQuestions: z.array(generatedQuestionSchema).default([]),
   dynamicAnswers: z.record(z.string(), z.union([z.string(), z.boolean(), z.array(z.string())])).default({}),
+  extractedContext: extractedContextSchema.nullable().default(null),
 });
 
 export type FormData = z.infer<typeof formDataSchema>;
@@ -164,4 +188,5 @@ export const FORM_DEFAULT_VALUES: FormData = {
   notifyEmail: "",
   generatedQuestions: [],
   dynamicAnswers: {},
+  extractedContext: null,
 };
