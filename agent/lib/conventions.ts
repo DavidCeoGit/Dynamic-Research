@@ -39,6 +39,7 @@ interface FilenamePatterns {
 interface SkipFiles {
   exact: string[];
   prefixes: string[];
+  extensions?: string[];
 }
 
 interface Conventions {
@@ -61,6 +62,7 @@ export const BUCKET = data.supabase_storage.bucket;
 
 export const SKIP_FILES = new Set(data.skip_files.exact);
 export const SKIP_PREFIXES = data.skip_files.prefixes;
+export const SKIP_EXTENSIONS = data.skip_files.extensions ?? [];
 
 export const RESEARCH_ROLES = new Set(data.filename_patterns.research.roles);
 export const RESEARCH_DOCX_ROLES = new Set(data.filename_patterns.research_docx_companion.roles);
@@ -101,6 +103,9 @@ export function isSkipFile(filename: string): boolean {
   if (SKIP_FILES.has(filename)) return true;
   for (const p of SKIP_PREFIXES) {
     if (filename.startsWith(p)) return true;
+  }
+  for (const ext of SKIP_EXTENSIONS) {
+    if (filename.endsWith(ext)) return true;
   }
   return false;
 }

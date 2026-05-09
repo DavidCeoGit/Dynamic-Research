@@ -34,6 +34,7 @@ BUCKET: str = _data["supabase_storage"]["bucket"]
 
 SKIP_FILES: set[str] = set(_data["skip_files"]["exact"])
 SKIP_PREFIXES: list[str] = list(_data["skip_files"]["prefixes"])
+SKIP_EXTENSIONS: list[str] = list(_data["skip_files"].get("extensions", []))
 
 RESEARCH_ROLES: set[str] = set(_data["filename_patterns"]["research"]["roles"])
 RESEARCH_DOCX_ROLES: set[str] = set(_data["filename_patterns"]["research_docx_companion"]["roles"])
@@ -84,6 +85,9 @@ def is_skip_file(filename: str) -> bool:
     for p in SKIP_PREFIXES:
         if filename.startswith(p):
             return True
+    for ext in SKIP_EXTENSIONS:
+        if filename.endswith(ext):
+            return True
     return False
 
 
@@ -128,6 +132,9 @@ if __name__ == "__main__":
     print(f"research_filename('cam-ai-quickbase-platform', 'brief', 'md'):")
     print(f"  -> {research_filename('cam-ai-quickbase-platform', 'brief', 'md')}")
     print(f"is_skip_file('job-manifest.json'): {is_skip_file('job-manifest.json')}")
+    print(f"is_skip_file('helper.py'): {is_skip_file('helper.py')}")
+    print(f"is_skip_file('nlm-discovered.json'): {is_skip_file('nlm-discovered.json')}")
     print(f"classify_file('the-foo-20260507-125556-video.mp4'): {classify_file('the-foo-20260507-125556-video.mp4')}")
     print(f"classify_file('cam-ai-brief.md'): {classify_file('cam-ai-brief.md')}")
+    print(f"classify_file('cam-ai-context.md'): {classify_file('cam-ai-context.md')}")
     print(f"classify_file('random.txt'): {classify_file('random.txt')}")
