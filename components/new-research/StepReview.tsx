@@ -14,6 +14,16 @@ const PRODUCT_META: Record<string, { label: string; icon: typeof Music }> = {
   infographic: { label: "Infographic", icon: ImageIcon },
 };
 
+// S29 hotfix: bare-domain href like "cloud.google.com/x" gets resolved as a
+// RELATIVE URL by the browser, navigating to /new/cloud.google.com/x and
+// triggering the [id] catch-all (which fails the UUID lookup and surfaces
+// the error boundary). Always prepend https:// when no scheme is present.
+function normalizeUrl(url: string): string {
+  if (/^https?:\/\//i.test(url)) return url;
+  if (/^\/\//.test(url)) return `https:${url}`;
+  return `https://${url}`;
+}
+
 // Path C (S29): "from topic" pill marks items that the LLM extracted from
 // the topic field, distinguishing them from items the user typed via dynamic
 // question answers. Helps the user spot misextractions before submission.
@@ -120,7 +130,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepR
                 {userContext!.additionalUrls.map((item, i) => (
                   <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
                     <span className="text-zinc-500 mt-0.5">•</span>
-                    <a href={item} target="_blank" rel="noopener noreferrer" className="flex-1 text-zinc-300 hover:text-[#c8a951] hover:underline truncate">
+                    <a href={normalizeUrl(item)} target="_blank" rel="noopener noreferrer" className="flex-1 text-zinc-300 hover:text-[#c8a951] hover:underline truncate">
                       {item}
                     </a>
                     {fromTopic.additionalUrls.has(item) && <FromTopicBadge />}

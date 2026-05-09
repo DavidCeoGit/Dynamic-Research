@@ -22,7 +22,7 @@ For each dimension below, return EITHER the values the topic already states OR n
 Dimensions:
   - domainKnowledge: facts, prior research, or explicit background context about the subject. Each fact = one array item. null if topic is purely a request without supporting context.
   - constraints: geographic, temporal, budget, regulatory, scope-exclusion, or any other limits the user states. Each constraint = one array item.
-  - additionalUrls: any URLs cited within the topic text. Bare strings; do NOT add https:// here. null if no URLs.
+  - additionalUrls: any URLs cited within the topic text. ALWAYS include the https:// scheme — if the topic mentions "cloud.google.com/x", emit "https://cloud.google.com/x". Bare-domain output causes broken relative-URL navigation in the form. null if no URLs.
   - claimsToVerify: specific factual or numerical claims worth fact-checking against external sources. Each claim = one array item. null if topic contains no concrete claims.
   - vendorEvaluation: { enabled, vendorType, serviceArea }
       enabled = true ONLY if the topic explicitly frames this as a vendor / service-provider comparison. null if the topic gives no clear vendor signal.
