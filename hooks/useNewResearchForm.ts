@@ -69,11 +69,34 @@ export function useNewResearchForm() {
     vendorEnabled ?? false,
   );
 
-  // ── Apply extracted context to userContext / vendorEvaluation ──────
-  // Path B: silently merge LLM-extracted dimensions into the form state so
+  // ── Apply / prune extracted context ────────────────────────────────
+  // Path B (S29): silently merge LLM-extracted dimensions into form state so
   // (a) they reach userContext at submit time without the user re-typing,
   // (b) downstream steps (Customize/Review) show the merged values.
-  // Path C will add UI affordances for the user to see + edit pre-fills.
+  // Path C (S29): when user re-edits the topic and triggers re-extraction,
+  // prune previously-extracted items from userContext so they don't linger
+  // as stale data. Items the user typed via dynamic-question answers are
+  // preserved (we only remove what matches the OLD extractedContext exactly).
+
+  const pruneStaleExtraction = useCallback((oldEC: ExtractedContext | null) => {
+    if (!oldEC) return;
+    const pruneArray = (
+      field: "domainKnowledge" | "constraints" | "additionalUrls" | "claimsToVerify",
+      items: string[] | null,
+    ) => {
+      if (!items || items.length === 0) return;
+      const toRemove = new Set(items);
+      const current = form.getValues(`userContext.${field}`) ?? [];
+      form.setValue(`userContext.${field}`, current.filter((x) => !toRemove.has(x)));
+    };
+    pruneArray("domainKnowledge", oldEC.domainKnowledge);
+    pruneArray("constraints", oldEC.constraints);
+    pruneArray("additionalUrls", oldEC.additionalUrls);
+    pruneArray("claimsToVerify", oldEC.claimsToVerify);
+    // Scalar fields (vendor*, ajiDnaEnabled) aren't pruned — once user has
+    // potentially edited them, reverting on re-extraction is more disruptive
+    // than leaving them. The new extraction will overwrite via applyExtractedContext.
+  }, [form]);
 
   const applyExtractedContext = useCallback((ec: ExtractedContext) => {
     if (ec.domainKnowledge && ec.domainKnowledge.length > 0) {
@@ -118,6 +141,13 @@ export function useNewResearchForm() {
     const topic = form.getValues("topic");
     if (!topic || topic.length < 10) return;
 
+    // If user is re-extracting (came back to topic step, edited, advanced),
+    // remove items that came from the previous extraction before applying
+    // the new one. Avoids stale "Houston Texas" lingering after the user
+    // pivoted the topic to Dallas.
+    const previousEC = form.getValues("extractedContext");
+    pruneStaleExtraction(previousEC);
+
     setIsGenerating(true);
     let extracted: ExtractedContext | null = null;
 
@@ -154,7 +184,7 @@ export function useNewResearchForm() {
     } finally {
       setIsGenerating(false);
     }
-  }, [form, applyExtractedContext]);
+  }, [form, applyExtractedContext, pruneStaleExtraction]);
 
   // ── Apply dynamic answers to userContext / vendorEvaluation ────────
 

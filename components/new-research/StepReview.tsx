@@ -3,7 +3,7 @@
 import { useFormContext } from "react-hook-form";
 import type { FormData } from "@/lib/validate";
 import type { StepReviewProps } from "@/lib/types/queue";
-import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon } from "lucide-react";
+import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon, Sparkles } from "lucide-react";
 import { TimeEstimate } from "./Shared";
 
 const PRODUCT_META: Record<string, { label: string; icon: typeof Music }> = {
@@ -14,6 +14,20 @@ const PRODUCT_META: Record<string, { label: string; icon: typeof Music }> = {
   infographic: { label: "Infographic", icon: ImageIcon },
 };
 
+// Path C (S29): "from topic" pill marks items that the LLM extracted from
+// the topic field, distinguishing them from items the user typed via dynamic
+// question answers. Helps the user spot misextractions before submission.
+function FromTopicBadge() {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full bg-[#c8a951]/10 border border-[#c8a951]/30 px-1.5 py-0.5 text-[10px] font-medium text-[#c8a951]"
+      title="Inferred from your topic. Edit your topic to change this."
+    >
+      <Sparkles className="h-2.5 w-2.5" /> from topic
+    </span>
+  );
+}
+
 export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepReviewProps) {
   const { watch, formState: { errors } } = useFormContext<FormData>();
   const topic = watch("topic");
@@ -22,8 +36,24 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepR
   const ajiDna = watch("ajiDnaEnabled");
   const customizations = watch("customizations");
   const notifyEmail = watch("notifyEmail");
+  const userContext = watch("userContext");
+  const extractedContext = watch("extractedContext");
 
   const selectedProducts = Object.entries(products ?? {}).filter(([, v]) => v);
+
+  // Sets of items that came from extraction (for badge rendering).
+  const fromTopic = {
+    domainKnowledge: new Set(extractedContext?.domainKnowledge ?? []),
+    constraints: new Set(extractedContext?.constraints ?? []),
+    additionalUrls: new Set(extractedContext?.additionalUrls ?? []),
+    claimsToVerify: new Set(extractedContext?.claimsToVerify ?? []),
+  };
+
+  const hasContext =
+    (userContext?.domainKnowledge?.length ?? 0) > 0 ||
+    (userContext?.constraints?.length ?? 0) > 0 ||
+    (userContext?.additionalUrls?.length ?? 0) > 0 ||
+    (userContext?.claimsToVerify?.length ?? 0) > 0;
 
   return (
     <div className="space-y-6">
@@ -37,8 +67,85 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepR
       {/* Topic */}
       <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">
         <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-500 mb-2">Topic</h3>
-        <p className="text-sm text-zinc-200">{topic}</p>
+        <p className="text-sm text-zinc-200 whitespace-pre-wrap">{topic}</p>
       </div>
+
+      {/* Research Context — extracted from topic + answers to dynamic questions */}
+      {hasContext && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-500">Research Context</h3>
+            {extractedContext && (
+              <span className="text-[10px] text-zinc-500" title="Items marked 'from topic' were inferred from your topic field.">
+                <Sparkles className="inline h-2.5 w-2.5 text-[#c8a951] mr-1" />
+                Auto-extracted items shown
+              </span>
+            )}
+          </div>
+
+          {(userContext?.domainKnowledge?.length ?? 0) > 0 && (
+            <div>
+              <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Domain Knowledge</p>
+              <ul className="space-y-1">
+                {userContext!.domainKnowledge.map((item, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                    <span className="text-zinc-500 mt-0.5">•</span>
+                    <span className="flex-1">{item}</span>
+                    {fromTopic.domainKnowledge.has(item) && <FromTopicBadge />}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {(userContext?.constraints?.length ?? 0) > 0 && (
+            <div>
+              <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Constraints</p>
+              <ul className="space-y-1">
+                {userContext!.constraints.map((item, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                    <span className="text-zinc-500 mt-0.5">•</span>
+                    <span className="flex-1">{item}</span>
+                    {fromTopic.constraints.has(item) && <FromTopicBadge />}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {(userContext?.additionalUrls?.length ?? 0) > 0 && (
+            <div>
+              <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Reference URLs</p>
+              <ul className="space-y-1">
+                {userContext!.additionalUrls.map((item, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                    <span className="text-zinc-500 mt-0.5">•</span>
+                    <a href={item} target="_blank" rel="noopener noreferrer" className="flex-1 text-zinc-300 hover:text-[#c8a951] hover:underline truncate">
+                      {item}
+                    </a>
+                    {fromTopic.additionalUrls.has(item) && <FromTopicBadge />}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {(userContext?.claimsToVerify?.length ?? 0) > 0 && (
+            <div>
+              <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Claims to Verify</p>
+              <ul className="space-y-1">
+                {userContext!.claimsToVerify.map((item, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                    <span className="text-zinc-500 mt-0.5">•</span>
+                    <span className="flex-1">{item}</span>
+                    {fromTopic.claimsToVerify.has(item) && <FromTopicBadge />}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Products */}
       <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">

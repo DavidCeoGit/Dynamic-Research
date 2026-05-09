@@ -3,12 +3,30 @@
 import { useFormContext, Controller } from "react-hook-form";
 import type { FormData } from "@/lib/validate";
 import type { StepProps } from "@/lib/types/queue";
-import { ArrowLeft, ArrowRight } from "lucide-react";
+import { ArrowLeft, ArrowRight, Sparkles } from "lucide-react";
 import { TagInput } from "./Shared";
+
+// Path C (S29): subtle hint above pre-filled fields. Sparkles icon matches
+// the FromTopicBadge in StepReview for visual consistency.
+function PreFilledHint({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="flex items-center gap-1 text-[10px] text-[#c8a951] mb-1">
+      <Sparkles className="h-2.5 w-2.5" />
+      <span>{children}</span>
+    </p>
+  );
+}
 
 export function StepCustomize({ onNext, onPrev }: StepProps) {
   const { register, control, watch, formState: { errors } } = useFormContext<FormData>();
   const vendorEnabled = watch("vendorEvaluation.enabled");
+  const extractedContext = watch("extractedContext");
+
+  const ec = extractedContext;
+  const vendorTypeFromTopic = ec?.vendorEvaluation?.vendorType !== null && ec?.vendorEvaluation?.vendorType !== undefined;
+  const serviceAreaFromTopic = ec?.vendorEvaluation?.serviceArea !== null && ec?.vendorEvaluation?.serviceArea !== undefined;
+  const vendorEnabledFromTopic = ec?.vendorEvaluation?.enabled !== null && ec?.vendorEvaluation?.enabled !== undefined;
+  const ajiDnaFromTopic = ec?.ajiDnaEnabled !== null && ec?.ajiDnaEnabled !== undefined;
 
   return (
     <div className="space-y-6">
@@ -94,6 +112,9 @@ export function StepCustomize({ onNext, onPrev }: StepProps) {
       {/* Vendor Evaluation */}
       <fieldset className="rounded-lg border border-zinc-800 p-4 space-y-3">
         <legend className="px-2 text-sm font-medium text-zinc-300">Vendor Evaluation</legend>
+        {vendorEnabledFromTopic && (
+          <PreFilledHint>Pre-filled from your topic — uncheck to disable</PreFilledHint>
+        )}
         <label className="flex items-center gap-2">
           <input
             type="checkbox"
@@ -106,10 +127,12 @@ export function StepCustomize({ onNext, onPrev }: StepProps) {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
             <div>
               <label className="block text-xs text-zinc-500 mb-1">Vendor Type</label>
+              {vendorTypeFromTopic && <PreFilledHint>Inferred from topic — edit if not what you meant</PreFilledHint>}
               <input {...register("vendorEvaluation.vendorType")} placeholder="e.g., SaaS" className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 focus:border-[#c8a951] focus:outline-none" />
             </div>
             <div>
               <label className="block text-xs text-zinc-500 mb-1">Service Area</label>
+              {serviceAreaFromTopic && <PreFilledHint>Inferred from topic — edit if not what you meant</PreFilledHint>}
               <input {...register("vendorEvaluation.serviceArea")} placeholder="e.g., DevOps tooling" className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 focus:border-[#c8a951] focus:outline-none" />
             </div>
             <div className="sm:col-span-2">
@@ -130,6 +153,9 @@ export function StepCustomize({ onNext, onPrev }: StepProps) {
 
       {/* AJI DNA */}
       <div className="rounded-lg border border-zinc-800 p-4">
+        {ajiDnaFromTopic && (
+          <PreFilledHint>Pre-filled from your topic — uncheck to disable</PreFilledHint>
+        )}
         <label className="flex items-center gap-2">
           <input
             type="checkbox"
