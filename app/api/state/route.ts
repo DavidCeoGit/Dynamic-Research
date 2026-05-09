@@ -4,6 +4,15 @@
  *
  * Without slug: returns the most recent state.json across all projects.
  * With slug: returns state.json for the specified project.
+ *
+ * S29 hotfix: normalize the state so missing nested fields don't throw
+ * "Cannot convert undefined or null to object" downstream. Recovered /
+ * legacy runs (e.g., cam AI run u9el closed by finalize-recovered-run.ts
+ * in S28) write state.json without selectedProducts / artifacts /
+ * customizations / userContext top-level keys. The TypeScript RunState
+ * type declares those as required but runtime payloads don't always match.
+ * Filling defaults at the API boundary keeps every downstream consumer
+ * (VendorTabs, /runs/[slug], etc.) safe without scattering null guards.
  */
 
 import {
@@ -14,6 +23,69 @@ import {
 } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
+
+type StateLike = Record<string, unknown>;
+
+function obj(v: unknown): StateLike {
+  return v && typeof v === "object" ? (v as StateLike) : {};
+}
+
+function arr<T = unknown>(v: unknown): T[] {
+  return Array.isArray(v) ? (v as T[]) : [];
+}
+
+function normalizeState(raw: StateLike): StateLike {
+  const userContext = obj(raw.userContext);
+  const customizations = obj(raw.customizations);
+  const perplexity = obj(customizations.perplexity);
+  const notebookLM = obj(customizations.notebookLM);
+  const vendorEvaluation = obj(raw.vendorEvaluation);
+
+  return {
+    ...raw,
+    userContext: {
+      contextFilePath: userContext.contextFilePath ?? null,
+      additionalUrls: arr<string>(userContext.additionalUrls),
+      claimsToVerify: arr<string>(userContext.claimsToVerify),
+      domainKnowledge: arr<string>(userContext.domainKnowledge),
+      constraints: arr<string>(userContext.constraints),
+      localSourcePath: userContext.localSourcePath ?? null,
+    },
+    selectedProducts: obj(raw.selectedProducts),
+    customizations: {
+      perplexity: {
+        queryFraming: (perplexity.queryFraming as string) ?? "",
+        emphasis: arr<string>(perplexity.emphasis),
+        outputStructure: (perplexity.outputStructure as string) ?? "",
+      },
+      notebookLM: {
+        persona: (notebookLM.persona as string) ?? "",
+        researchMode: (notebookLM.researchMode as string) ?? "deep",
+        priorities: arr<string>(notebookLM.priorities),
+      },
+      studio: obj(customizations.studio),
+    },
+    vendorEvaluation: {
+      enabled: vendorEvaluation.enabled ?? false,
+      vendorType: (vendorEvaluation.vendorType as string) ?? "",
+      serviceArea: (vendorEvaluation.serviceArea as string) ?? "",
+      serviceAddress: (vendorEvaluation.serviceAddress as string) ?? "",
+      jobDescription: (vendorEvaluation.jobDescription as string) ?? "",
+      maxVendorsDiscovered: (vendorEvaluation.maxVendorsDiscovered as number) ?? 10,
+      maxVendorsEnriched: (vendorEvaluation.maxVendorsEnriched as number) ?? 5,
+      vendorsDiscovered: arr<string>(vendorEvaluation.vendorsDiscovered),
+      vendorsShortlisted: arr<string>(vendorEvaluation.vendorsShortlisted),
+      vendorsExcluded: arr<string>(vendorEvaluation.vendorsExcluded),
+      preScreeningComplete: vendorEvaluation.preScreeningComplete ?? false,
+    },
+    artifacts: obj(raw.artifacts),
+    files_written: arr<string>(raw.files_written),
+    perplexity_source_urls_passed: arr<string>(raw.perplexity_source_urls_passed),
+    perplexity_source_urls_rejected: arr<string>(raw.perplexity_source_urls_rejected),
+    tier1_scores: obj(raw.tier1_scores),
+    queued_urls_for_notebooklm: arr<string>(raw.queued_urls_for_notebooklm),
+  };
+}
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -30,7 +102,7 @@ export async function GET(request: Request) {
     }
     try {
       const state = await readStateJson(slugParam, stateFilename);
-      return Response.json(state);
+      return Response.json(normalizeState(state as StateLike));
     } catch (err) {
       return Response.json(
         { error: "Failed to read state.json", detail: String(err) },
@@ -85,7 +157,7 @@ export async function GET(request: Request) {
 
   try {
     const state = await readStateJson(newestSlug, newestFilename);
-    return Response.json(state);
+    return Response.json(normalizeState(state as StateLike));
   } catch (err) {
     return Response.json(
       { error: "Failed to read state.json", detail: String(err) },

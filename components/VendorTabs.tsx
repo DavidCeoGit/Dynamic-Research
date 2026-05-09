@@ -90,8 +90,13 @@ function TagList({ label, items }: { label: string; items: string[] }) {
 function SynthesisPanel({ state }: { state: RunState }) {
   const hasComparison = hasFile(state.files_written, "comparison");
   const hasVendorEval = hasFile(state.files_written, "vendor-evaluation");
-  const productCount = Object.values(state.selectedProducts).filter(Boolean).length;
-  const completedArtifacts = Object.values(state.artifacts).filter(
+  // S29 hotfix: state.selectedProducts and state.artifacts can be missing on
+  // recovered/legacy runs (cam AI run u9el — finalize-recovered-run closed the
+  // row without populating either). Object.values(undefined) throws
+  // "Cannot convert undefined or null to object" and crashes the whole page
+  // via the global error boundary.
+  const productCount = Object.values(state.selectedProducts ?? {}).filter(Boolean).length;
+  const completedArtifacts = Object.values(state.artifacts ?? {}).filter(
     (a) => a.status === "completed",
   ).length;
 
