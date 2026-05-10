@@ -119,7 +119,7 @@ async function main() {
   console.log(`  slug:     ${slug}`);
   console.log(`  strict:   ${strict}\n`);
 
-  const galleryByProduct = await listGallery(slug);
+  const galleryByProduct = await listGallery(slug!);
   console.log(
     `Gallery: ${countTotal(galleryByProduct)} studio file(s) across ${Object.keys(galleryByProduct).length} type(s)\n`,
   );
