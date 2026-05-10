@@ -8,7 +8,20 @@ import { z } from "zod";
 
 /**
  * Generate a URL-safe slug from a topic string.
- * Appends a 4-character random hash to prevent collisions.
+ *
+ * Appends an 8-character cryptographically-random hex hash. Pre-S34 used
+ * Math.random().toString(36).slice(2, 6) — 4 base36 chars, ~21 bits, ~1.68M
+ * combinations and a non-crypto PRNG. That entropy was enumerable in seconds
+ * via slug-guess probing, leaking the existence of every research run across
+ * the (currently single-tenant) deployment to anyone who could brute-force
+ * the URL space. Adversarial finding #6 from the S33 audit.
+ *
+ * 8 hex chars = ~32 bits = ~4.29 billion combinations = effectively unguess-
+ * able under any practical online-enumeration budget. Per-org gating remains
+ * Phase A multi-tenancy work; this fix closes only the entropy half of #6.
+ *
+ * Uses globalThis.crypto.randomUUID() — available in Node 18.17+ (Next 16
+ * requires Node 18.18+) and all modern browsers + Vercel Edge runtime.
  */
 export function generateSlug(topic: string): string {
   const base = topic
@@ -19,7 +32,7 @@ export function generateSlug(topic: string): string {
     .slice(0, 40)
     .replace(/-$/, "");
 
-  const hash = Math.random().toString(36).slice(2, 6);
+  const hash = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
   return `${base}-${hash}`;
 }
 
