@@ -137,11 +137,31 @@ export async function executeJob(job: ResearchJob): Promise<string> {
 
   // 8. Upload outputs to Supabase Storage
   log(job.id, "Pipeline complete — uploading outputs to Supabase Storage");
-  await uploadOutputs(job, workDir, projectsDir);
+  const uploadResult = await uploadOutputs(job, workDir, projectsDir);
+
+  // 8a. Bug-35 + adversarial #4: a partial upload is a FAILED run, not a
+  //     completed one. Pre-S34 the worker called `completeJob` regardless of
+  //     how many files failed, so a 1-of-16-deliverables run landed as
+  //     `status: completed`. Now fail loud with the file list.
+  if (uploadResult.failed.length > 0) {
+    const preview = uploadResult.failed
+      .slice(0, 5)
+      .map((f) => `${f.remoteName} (${f.reason})`)
+      .join("; ");
+    const more = uploadResult.failed.length > 5
+      ? ` and ${uploadResult.failed.length - 5} more`
+      : "";
+    const reason =
+      `Uploaded ${uploadResult.uploaded} of ${uploadResult.uploaded + uploadResult.failed.length} deliverables; ` +
+      `${uploadResult.failed.length} failed: ${preview}${more}`;
+    log(job.id, reason);
+    await failJob(job.id, reason);
+    throw new Error(reason);
+  }
 
   // 9. Mark complete
   await completeJob(job.id, slug);
-  log(job.id, "Job completed successfully");
+  log(job.id, `Job completed successfully (${uploadResult.uploaded} files uploaded)`);
 
   return slug;
 }
@@ -522,15 +542,35 @@ async function verifyPipelineCompletion(workDir: string): Promise<CompletionVerd
 
 // ── Output uploader ─────────────────────────────────────────────────
 
+export interface UploadResult {
+  uploaded: number;
+  failed: Array<{ remoteName: string; reason: string }>;
+}
+
 /**
  * Upload all output files from the projects directory to Supabase Storage.
  * Skips state.json and manifest files.
+ *
+ * Pre-S34 swallowed every per-file error and returned void; the caller then
+ * called `completeJob` regardless of how many files failed, so a run that
+ * uploaded 1 of 16 deliverables still landed in the DB as `status: completed`
+ * (adversarial #4 from S33 audit). Now returns a structured result so the
+ * caller can demote to `failJob()` when any file failed.
+ *
+ * Also closes adversarial #7: pre-S34 used `upsert: true` which silently
+ * overwrote existing deliverables when two jobs happened to produce the same
+ * topic_slug. Post-S34 (combined with #6 raising slug entropy to ~32 bits)
+ * `upsert: false` is the correct posture for fresh runs — collisions are
+ * effectively impossible by entropy alone, and the rare collision now fails
+ * loud rather than destroying the earlier customer's work. The legitimate
+ * re-run path (`agent/scripts/finalize-recovered-run.ts`) keeps
+ * `upsert: true` because recovery DOES intend to overwrite.
  */
 async function uploadOutputs(
   job: ResearchJob,
   workDir: string,
   projectsDir: string,
-): Promise<void> {
+): Promise<UploadResult> {
   const sb = getSupabase();
   const slug = job.topic_slug;
 
@@ -567,6 +607,9 @@ async function uploadOutputs(
 
   log(job.id, `Uploading ${deduped.length} files to Supabase Storage`);
 
+  const failed: Array<{ remoteName: string; reason: string }> = [];
+  let uploaded = 0;
+
   for (const { localPath, remoteName } of deduped) {
     try {
       const content = await fs.readFile(localPath);
@@ -576,18 +619,24 @@ async function uploadOutputs(
         .from(BUCKET)
         .upload(`${slug}/${remoteName}`, content, {
           contentType,
-          upsert: true,
+          upsert: false,
         });
 
       if (error) {
         log(job.id, `Upload failed for ${remoteName}: ${error.message}`);
+        failed.push({ remoteName, reason: error.message });
       } else {
         log(job.id, `Uploaded: ${remoteName} (${content.length} bytes)`);
+        uploaded++;
       }
     } catch (err) {
-      log(job.id, `Upload error for ${remoteName}: ${err}`);
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      log(job.id, `Upload error for ${remoteName}: ${msg}`);
+      failed.push({ remoteName, reason: msg });
     }
   }
+
+  return { uploaded, failed };
 }
 
 function guessContentType(filename: string): string {
