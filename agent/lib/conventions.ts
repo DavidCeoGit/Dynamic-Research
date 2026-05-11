@@ -138,3 +138,34 @@ export function parseResearchFilename(
   if (!m) return null;
   return { topicPrefix: m[1], role: m[2], ext: m[3] };
 }
+
+// ── Content-type map (Supabase Storage uploads) ─────────────────────
+
+/**
+ * File extension → MIME content-type for Supabase Storage uploads.
+ * Consolidated from agent/executor.ts + agent/scripts/finalize-recovered-run.ts
+ * (S34 conciseness #1). TS-only — Python pipeline doesn't upload. If a Python
+ * upload path is added later, mirror this into conventions.json + conventions.py.
+ */
+export const CONTENT_TYPES: Record<string, string> = {
+  ".json": "application/json",
+  ".md": "text/markdown",
+  ".txt": "text/plain",
+  ".html": "text/html",
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+};
+
+/** Look up MIME content-type for a filename; falls back to application/octet-stream. */
+export function getContentType(filename: string): string {
+  return CONTENT_TYPES[path.extname(filename).toLowerCase()] ?? "application/octet-stream";
+}

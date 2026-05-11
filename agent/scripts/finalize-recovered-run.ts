@@ -30,7 +30,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
-import { BUCKET, isSkipFile } from "../lib/conventions.js";
+import { BUCKET, isSkipFile, getContentType } from "../lib/conventions.js";
 
 // Parse argv: pull --force out, leave the rest as positional
 const rawArgs = process.argv.slice(2);
@@ -83,7 +83,7 @@ if (lint.status !== 0) {
       "\n✗ LINT FAILED (exit " +
         lint.status +
         "). Refusing to upload.\n" +
-        "  Fix the violations above (or rename files via agent/scripts/rename-and-finalize.ts), then retry.\n" +
+        "  Fix the violations above (rename files in-place per conventions.json), then retry.\n" +
         "  To override after a deliberate review, pass --force.",
     );
     process.exit(1);
@@ -103,28 +103,6 @@ if (lint.status !== 0) {
 const sb = createClient(url, key, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
-
-const CONTENT_TYPES: Record<string, string> = {
-  ".json": "application/json",
-  ".md": "text/markdown",
-  ".txt": "text/plain",
-  ".html": "text/html",
-  ".pdf": "application/pdf",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  ".mp3": "audio/mpeg",
-  ".wav": "audio/wav",
-  ".mp4": "video/mp4",
-  ".webm": "video/webm",
-  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-};
-
-function guessContentType(name: string): string {
-  return CONTENT_TYPES[path.extname(name).toLowerCase()] ?? "application/octet-stream";
-}
 
 console.log(`\nFinalizing job ${jobId}`);
 console.log(`  workdir: ${workDir}`);
@@ -150,7 +128,7 @@ for (const name of entries) {
   }
 
   const buf = await fs.readFile(local);
-  const contentType = guessContentType(name);
+  const contentType = getContentType(name);
 
   const { error } = await sb.storage
     .from(BUCKET)

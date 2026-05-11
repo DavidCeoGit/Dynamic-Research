@@ -13,7 +13,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { updateJob, completeJob, failJob } from "./api-client.js";
-import { BUCKET, isSkipFile } from "./lib/conventions.js";
+import { BUCKET, isSkipFile, getContentType } from "./lib/conventions.js";
 import type { ResearchJob, PipelineState } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -613,7 +613,7 @@ async function uploadOutputs(
   for (const { localPath, remoteName } of deduped) {
     try {
       const content = await fs.readFile(localPath);
-      const contentType = guessContentType(remoteName);
+      const contentType = getContentType(remoteName);
 
       const { error } = await sb.storage
         .from(BUCKET)
@@ -637,28 +637,6 @@ async function uploadOutputs(
   }
 
   return { uploaded, failed };
-}
-
-function guessContentType(filename: string): string {
-  const ext = path.extname(filename).toLowerCase();
-  const map: Record<string, string> = {
-    ".json": "application/json",
-    ".md": "text/markdown",
-    ".txt": "text/plain",
-    ".html": "text/html",
-    ".pdf": "application/pdf",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".mp3": "audio/mpeg",
-    ".wav": "audio/wav",
-    ".mp4": "video/mp4",
-    ".webm": "video/webm",
-    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  };
-  return map[ext] ?? "application/octet-stream";
 }
 
 // ── Dry run simulator ───────────────────────────────────────────────
