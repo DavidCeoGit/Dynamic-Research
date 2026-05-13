@@ -4,7 +4,6 @@ import { use, useState, useMemo } from "react";
 import dynamic from "next/dynamic";
 import useSWR from "swr";
 import { useRunState } from "@/hooks/useRunState";
-import AudioPlayer from "@/components/AudioPlayer";
 import MarkdownViewer from "@/components/MarkdownViewer";
 import {
   ArrowLeft,
@@ -25,6 +24,17 @@ const PDFViewer = dynamic(() => import("@/components/PDFViewer"), {
   loading: () => (
     <div className="flex items-center justify-center py-16 text-sm text-zinc-500">
       Loading PDF Viewer...
+    </div>
+  ),
+});
+
+// Dynamic import — wavesurfer.js touches window/AudioContext at module load,
+// crashes the SSR prerender pass even though this is a "use client" page.
+const AudioPlayer = dynamic(() => import("@/components/AudioPlayer"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex items-center justify-center py-8 text-sm text-zinc-500">
+      Loading audio player...
     </div>
   ),
 });
