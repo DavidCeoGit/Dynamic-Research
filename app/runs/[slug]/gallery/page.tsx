@@ -4,7 +4,6 @@ import { use, useState, useMemo } from "react";
 import dynamic from "next/dynamic";
 import useSWR from "swr";
 import { useRunState } from "@/hooks/useRunState";
-import MarkdownViewer from "@/components/MarkdownViewer";
 import {
   ArrowLeft,
   Download,
@@ -35,6 +34,17 @@ const AudioPlayer = dynamic(() => import("@/components/AudioPlayer"), {
   loading: () => (
     <div className="flex items-center justify-center py-8 text-sm text-zinc-500">
       Loading audio player...
+    </div>
+  ),
+});
+
+// Dynamic import — isomorphic-dompurify's JSDOM fallback breaks SSR prerender
+// under Next 16 / React 19 / Node 22. Same pattern as AudioPlayer / PDFViewer.
+const MarkdownViewer = dynamic(() => import("@/components/MarkdownViewer"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex items-center justify-center py-8 text-sm text-zinc-500">
+      Loading markdown viewer...
     </div>
   ),
 });
