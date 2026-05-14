@@ -60,6 +60,8 @@ interface FileEntry {
   type: string;
   product: string | null;
   version: number;
+  /** S35 — letter suffix for batched A/B/C/D variants of same version. NULL when absent. */
+  variant: string | null;
   titlePrefixed: boolean;
   title: string | null;
   timestamp: string | null;
@@ -72,7 +74,34 @@ interface MediaFile {
   url: string;
   product: string | null;
   version: number;
+  variant: string | null;
   size: number;
+}
+
+// S35 — Composite version+variant helpers for the gallery's version dropdown.
+//
+// versionKey: "5" if no variant, "5a"/"5b"/"5c"/"5d" when variant present. This
+// is the Map key for productGroups.versions. Compatible with the legacy "5"
+// shape so files without variants keep working unchanged.
+//
+// versionLabel: human-facing label rendered in the dropdown + badges.
+function versionKey(file: { version: number; variant: string | null }): string {
+  return `${file.version}${file.variant ?? ""}`;
+}
+function versionLabel(file: { version: number; variant: string | null }): string {
+  return `v${file.version}${file.variant ?? ""}`;
+}
+
+// Sort comparator for productGroups.versions keys.
+// Highest version first; within a version, latest letter first ("d" > "c" > "b" > "a" > "").
+function compareVersionKeys(a: string, b: string): number {
+  const parseKey = (k: string): { v: number; vr: string } => {
+    const m = k.match(/^(\d+)([a-z])?$/);
+    return m ? { v: parseInt(m[1], 10), vr: m[2] ?? "" } : { v: 0, vr: "" };
+  };
+  const pa = parseKey(a); const pb = parseKey(b);
+  if (pa.v !== pb.v) return pb.v - pa.v;
+  return pb.vr.localeCompare(pa.vr);
 }
 
 function formatFileSize(bytes: number): string {
@@ -187,8 +216,9 @@ export default function GalleryPage({
   );
 
   const [selectedFile, setSelectedFile] = useState<MediaFile | null>(null);
+  // S35: value is composite versionKey ("5" / "5a" / "5b") instead of plain number.
   const [versionOverrides, setVersionOverrides] = useState<
-    Record<string, number>
+    Record<string, string>
   >({});
 
   // ── Track which .docx files actually exist (for download buttons) ──
@@ -214,6 +244,7 @@ export default function GalleryPage({
             url: mediaUrl(slug, entry.filename),
             product: entry.product,
             version: entry.version,
+            variant: entry.variant,
             size: entry.size,
           });
         }
@@ -233,6 +264,7 @@ export default function GalleryPage({
           url: mediaUrl(slug, filename),
           product: null,
           version: 1,
+          variant: null,
           size: 0,
         });
       }
@@ -240,22 +272,27 @@ export default function GalleryPage({
     }, []);
   }, [inventory, state, slug]);
 
-  // ── Group files by product, then by version ─────────────────
+  // ── Group files by product, then by version+variant key ─────
+  //
+  // S35: Map key is the composite versionKey ("5" or "5a" / "5b" / etc) instead
+  // of plain version number. Pre-S35 files (no variant) use just the digits and
+  // remain backward-compatible.
   const productGroups = useMemo(() => {
     const groups = new Map<
       string,
-      { type: MediaType; versions: Map<number, MediaFile> }
+      { type: MediaType; versions: Map<string, MediaFile> }
     >();
 
     for (const f of files) {
       const key = f.product ?? f.filename;
       const existing = groups.get(key);
+      const vkey = versionKey(f);
       if (existing) {
-        existing.versions.set(f.version, f);
+        existing.versions.set(vkey, f);
       } else {
         groups.set(key, {
           type: f.type,
-          versions: new Map([[f.version, f]]),
+          versions: new Map([[vkey, f]]),
         });
       }
     }
@@ -263,19 +300,20 @@ export default function GalleryPage({
     return groups;
   }, [files]);
 
-  // ── Derive available versions for the currently selected product ──
+  // ── Derive available version keys for the currently selected product ──
   const selectedProduct = selectedFile?.product ?? null;
   const versionsForSelected = useMemo(() => {
-    if (!selectedProduct) return [];
+    if (!selectedProduct) return [] as string[];
     const group = productGroups.get(selectedProduct);
-    if (!group) return [];
-    return Array.from(group.versions.keys()).sort((a, b) => b - a);
+    if (!group) return [] as string[];
+    return Array.from(group.versions.keys()).sort(compareVersionKeys);
   }, [selectedProduct, productGroups]);
 
-  const activeVersion =
+  const activeVersion: string =
     selectedProduct != null
-      ? versionOverrides[selectedProduct] ?? selectedFile?.version ?? 1
-      : 1;
+      ? versionOverrides[selectedProduct] ??
+        (selectedFile ? versionKey(selectedFile) : "1")
+      : "1";
 
   // ── Resolve the actual file to render (respecting version override) ──
   const resolvedFile = useMemo((): MediaFile | null => {
@@ -290,11 +328,13 @@ export default function GalleryPage({
   }, [selectedFile, selectedProduct, productGroups, activeVersion]);
 
   // ── Group by media type for the listing view ────────────────
+  // S35: newest = sort versions DESC by compareVersionKeys; take head.
   const groupedByType = useMemo(() => {
     const latest: MediaFile[] = [];
     for (const [, group] of productGroups) {
-      const maxVersion = Math.max(...group.versions.keys());
-      const file = group.versions.get(maxVersion);
+      const sortedKeys = Array.from(group.versions.keys()).sort(compareVersionKeys);
+      const newestKey = sortedKeys[0];
+      const file = newestKey ? group.versions.get(newestKey) : undefined;
       if (file) latest.push(file);
     }
 
@@ -326,10 +366,10 @@ export default function GalleryPage({
     );
   }
 
-  // ── Version change handler ──────────────────────────────────
-  function onVersionChange(version: number) {
+  // ── Version change handler (S35: now string-keyed for variants) ─
+  function onVersionChange(versionKeyValue: string) {
     if (!selectedProduct) return;
-    setVersionOverrides((prev) => ({ ...prev, [selectedProduct]: version }));
+    setVersionOverrides((prev) => ({ ...prev, [selectedProduct]: versionKeyValue }));
   }
 
   // ── Check if a matching .docx exists for a markdown file ────
@@ -420,12 +460,12 @@ export default function GalleryPage({
             <select
               id="version-select"
               value={activeVersion}
-              onChange={(e) => onVersionChange(Number(e.target.value))}
+              onChange={(e) => onVersionChange(e.target.value)}
               className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-300 transition hover:bg-zinc-700 focus:outline-none focus:ring-1 focus:ring-[#3b82f6]"
             >
-              {versionsForSelected.map((v) => (
-                <option key={v} value={v}>
-                  v{v}
+              {versionsForSelected.map((vk) => (
+                <option key={vk} value={vk}>
+                  v{vk}
                 </option>
               ))}
             </select>
@@ -448,7 +488,7 @@ export default function GalleryPage({
                 {resolvedFile.label}
               </span>
               <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-500">
-                v{resolvedFile.version}
+                {versionLabel(resolvedFile)}
               </span>
             </div>
             <div className="flex items-center gap-2">
@@ -525,7 +565,7 @@ export default function GalleryPage({
                             </span>
                           )}
                           <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-500">
-                            v{file.version}
+                            {versionLabel(file)}
                           </span>
                           <span className="font-mono text-xs text-zinc-500">
                             {formatFileSize(file.size)}

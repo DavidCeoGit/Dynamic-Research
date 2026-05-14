@@ -37,6 +37,21 @@ export async function POST(request: Request) {
   );
 
   const supabase = getSupabase();
+
+  // S35 Clone & Edit — if parentSlug present, resolve to UUID for the
+  // parent_run_id FK. Unknown slug = fresh submission (don't fail loud; the
+  // user's brief is still valid). .maybeSingle() avoids the .single()
+  // zero-rows throw (S33 adversarial #11).
+  let parentRunId: string | null = null;
+  if (data.parentSlug) {
+    const { data: parentRow } = await supabase
+      .from("research_queue")
+      .select("id")
+      .eq("topic_slug", data.parentSlug)
+      .maybeSingle();
+    parentRunId = parentRow?.id ?? null;
+  }
+
   const { data: row, error } = await supabase
     .from("research_queue")
     .insert({
@@ -49,6 +64,7 @@ export async function POST(request: Request) {
       customizations: data.customizations,
       notify_email: data.notifyEmail || null,
       estimated_minutes: estimate,
+      parent_run_id: parentRunId,
     })
     .select("id, topic_slug, estimated_minutes")
     .single();

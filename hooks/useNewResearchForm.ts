@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import type { Resolver } from "react-hook-form";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   formDataSchema,
   FORM_DEFAULT_VALUES,
@@ -19,10 +19,18 @@ const STORAGE_KEY = "new-research-draft";
 
 export function useNewResearchForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [step, setStep] = useState<FormStep>("topic");
   const [isGenerating, setIsGenerating] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // S35 Clone & Edit — when the form is opened via /new?clone=<slug>, pre-fill
+  // from /api/runs/<slug>/manifest and stamp parentSlug on submit so the new
+  // row's parent_run_id FK points back to the source run.
+  const [cloneSlug, setCloneSlug] = useState<string | null>(null);
+  const [cloneTopic, setCloneTopic] = useState<string | null>(null);
+  const [isLoadingClone, setIsLoadingClone] = useState(false);
+  const [cloneError, setCloneError] = useState<string | null>(null);
   const isMounted = useRef(false);
 
   const form = useForm<FormData>({
@@ -31,10 +39,68 @@ export function useNewResearchForm() {
     mode: "onTouched",
   });
 
-  // ── Session storage restore ────────────────────────────────────────
+  // ── Initial form population: ?clone=<slug> OR sessionStorage restore ───
+  //
+  // S35 Clone & Edit precedence: a `?clone=<slug>` URL param wins over any
+  // sessionStorage draft. The cloned manifest replaces the form state and
+  // clears the prior draft so a stale auto-save can't poison the clone.
+  // If clone fetch fails, we fall back to sessionStorage so the user
+  // doesn't lose unsaved work.
 
   useEffect(() => {
     isMounted.current = true;
+    const clone = searchParams?.get("clone");
+
+    if (clone) {
+      setCloneSlug(clone);
+      setIsLoadingClone(true);
+      setCloneError(null);
+      void (async () => {
+        try {
+          const res = await fetch(`/api/runs/${encodeURIComponent(clone)}/manifest`);
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+            throw new Error(err.error || `HTTP ${res.status}`);
+          }
+          const manifest = await res.json();
+          setCloneTopic(manifest.parentTopic ?? null);
+          // Drop manifest fields that aren't part of formDataSchema (parentSlug,
+          // parentTopic) and merge with form defaults to satisfy transient
+          // fields (generatedQuestions, dynamicAnswers, extractedContext).
+          form.reset({
+            ...FORM_DEFAULT_VALUES,
+            topic: manifest.topic ?? "",
+            userContext: manifest.userContext ?? FORM_DEFAULT_VALUES.userContext,
+            vendorEvaluation:
+              manifest.vendorEvaluation ?? FORM_DEFAULT_VALUES.vendorEvaluation,
+            ajiDnaEnabled: manifest.ajiDnaEnabled ?? false,
+            selectedProducts:
+              manifest.selectedProducts ?? FORM_DEFAULT_VALUES.selectedProducts,
+            customizations:
+              manifest.customizations ?? FORM_DEFAULT_VALUES.customizations,
+            notifyEmail: manifest.notifyEmail ?? "",
+          });
+          // Don't pollute sessionStorage with the cloned manifest — the watch
+          // handler will overwrite it on the next form interaction anyway.
+          try {
+            sessionStorage.removeItem(STORAGE_KEY);
+          } catch {
+            // ignore
+          }
+        } catch (err) {
+          setCloneError(
+            err instanceof Error
+              ? err.message
+              : "Failed to load source run manifest",
+          );
+        } finally {
+          setIsLoadingClone(false);
+        }
+      })();
+      return;
+    }
+
+    // No ?clone — fall back to sessionStorage restore (pre-S35 behavior).
     try {
       const saved = sessionStorage.getItem(STORAGE_KEY);
       if (saved) {
@@ -44,7 +110,7 @@ export function useNewResearchForm() {
     } catch {
       // Ignore parse errors
     }
-  }, [form]);
+  }, [form, searchParams]);
 
   // ── Session storage save (debounced) ───────────────────────────────
 
@@ -313,8 +379,14 @@ export function useNewResearchForm() {
       generatedQuestions: _gq,
       dynamicAnswers: _da,
       extractedContext: _ec,
-      ...payload
+      ...formPayload
     } = data;
+
+    // S35 Clone & Edit — stamp parentSlug if this submission is a clone.
+    // Backend resolves slug→id and writes research_queue.parent_run_id.
+    const payload = cloneSlug
+      ? { ...formPayload, parentSlug: cloneSlug }
+      : formPayload;
 
     try {
       const res = await fetch("/api/queue", {
@@ -336,7 +408,7 @@ export function useNewResearchForm() {
     } finally {
       setIsSubmitting(false);
     }
-  }, [router]);
+  }, [router, cloneSlug]);
 
   const handleFormSubmit = form.handleSubmit(onSubmit);
 
@@ -351,5 +423,10 @@ export function useNewResearchForm() {
     goNext,
     goPrev,
     handleFormSubmit,
+    // S35 Clone & Edit — surfaces to the form page for the banner.
+    cloneSlug,
+    cloneTopic,
+    isLoadingClone,
+    cloneError,
   };
 }

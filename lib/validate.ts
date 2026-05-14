@@ -113,6 +113,12 @@ export const researchJobPayloadSchema = z.object({
   selectedProducts: selectedProductsSchema,
   customizations: customizationsSchema.optional().default({ perplexity: { queryFraming: "", emphasis: [], outputStructure: "" }, notebookLM: { persona: "", researchMode: "deep" as const, priorities: [] }, studio: {} }),
   notifyEmail: z.string().email().optional().or(z.literal("")),
+  // S35 Clone & Edit — set when the form is submitted with ?clone=<slug>.
+  // The submit endpoint resolves <slug>→<id> via research_queue.topic_slug
+  // and persists the id on the new row's parent_run_id column for lineage.
+  // Slug not UUID because the frontend has the slug from the URL; backend
+  // does the lookup. NULL/undefined = fresh submission.
+  parentSlug: z.string().max(120).nullable().optional(),
 });
 
 // Path B (S29): structured extraction of dimensions the topic already covers.

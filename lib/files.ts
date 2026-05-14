@@ -44,6 +44,9 @@ export interface FileEntry {
   product: ProductType | null;
   /** Version number (1 if no explicit -vN suffix) */
   version: number;
+  /** S35 — optional letter-suffix variant (e.g. "a","b","c","d") for batched
+   * A/B/C/D regenerations submitted under the same version. NULL = no variant. */
+  variant: string | null;
   /** Whether this is a title-prefixed copy */
   titlePrefixed: boolean;
   /** Extracted title (only for title-prefixed files) */
@@ -56,6 +59,8 @@ export interface ParsedFilename {
   timestamp: string | null;
   product: string | null;
   version: number;
+  /** S35 — see FileEntry.variant. */
+  variant: string | null;
   extension: string;
   title: string | null;
   suffix: string | null;
@@ -110,23 +115,25 @@ const KNOWN_PRODUCTS = new Set([
 // Timestamp pattern: YYYYMMDD-HHMMSS
 const TS = String.raw`(\d{8}-\d{6})`;
 
-// Raw pattern: TIMESTAMP-product(-vN)?(.ext)
+// Raw pattern: TIMESTAMP-product(-vN<variant>?)?(.ext)
 // Examples:
 //   20260414-062922-audio-v3.mp3
 //   20260414-062922-brief.md
 //   20260414-062922-vendor-evaluation.md
 //   20260414-062922-slides-v2 (2).pdf  (Windows copy artifact)
+//   20260511-153442-video-v5a.mp4      (S35 — A/B/C/D variants of same version)
 const RAW_RE = new RegExp(
-  `^${TS}-([-\\w]+?)(?:-(v\\d+))?(?:\\s*\\(\\d+\\))?\\.([\\w]+)$`,
+  `^${TS}-([-\\w]+?)(?:-v(\\d+)([a-z])?)?(?:\\s*\\(\\d+\\))?\\.([\\w]+)$`,
 );
 
-// Title-prefixed pattern: Title-Slug-TIMESTAMP-product(-vN)?(-suffix)?(.ext)
+// Title-prefixed pattern: Title-Slug-TIMESTAMP-product(-vN<variant>?)?(-suffix)?(.ext)
 // Examples:
 //   Safe-plumbing-for-heavy-upstairs-bathtubs-20260414-062922-audio-v3.mp3
 //   Canyon-Lake-Plumber-Evaluation-20260414-062922-report-v3.md
 //   Hire-a-Plumber-Canyon-Lake-20260414-062922-video-v3-explainer-retry.mp4
+//   the-capital-preservation-imperative-20260511-153442-video-v5a.mp4 (S35)
 const TITLE_RE = new RegExp(
-  `^(.+?)-${TS}-([-\\w]+?)(?:-(v\\d+))?(?:-([-\\w]+))?\\.([\\w]+)$`,
+  `^(.+?)-${TS}-([-\\w]+?)(?:-v(\\d+)([a-z])?)?(?:-([-\\w]+))?\\.([\\w]+)$`,
 );
 
 /**
@@ -139,14 +146,16 @@ export function parseFilename(filename: string): ParsedFilename {
   // Try raw pattern first (more common, more specific)
   const rawMatch = filename.match(RAW_RE);
   if (rawMatch) {
-    const [, timestamp, productRaw, versionStr, ext] = rawMatch;
+    const [, timestamp, productRaw, versionDigits, variantLetter, ext] = rawMatch;
     const product = resolveProduct(productRaw);
-    const version = versionStr ? parseInt(versionStr.slice(1), 10) : 1;
+    const version = versionDigits ? parseInt(versionDigits, 10) : 1;
+    const variant = variantLetter ?? null;
 
     return {
       timestamp,
       product,
       version,
+      variant,
       extension: ext,
       title: null,
       suffix: null,
@@ -157,16 +166,18 @@ export function parseFilename(filename: string): ParsedFilename {
   // Try title-prefixed pattern
   const titleMatch = filename.match(TITLE_RE);
   if (titleMatch) {
-    const [, titleSlug, timestamp, productRaw, versionStr, suffix, ext] =
+    const [, titleSlug, timestamp, productRaw, versionDigits, variantLetter, suffix, ext] =
       titleMatch;
     const product = resolveProduct(productRaw);
-    const version = versionStr ? parseInt(versionStr.slice(1), 10) : 1;
+    const version = versionDigits ? parseInt(versionDigits, 10) : 1;
+    const variant = variantLetter ?? null;
     const title = titleSlug.replace(/-/g, " ");
 
     return {
       timestamp,
       product,
       version,
+      variant,
       extension: ext,
       title,
       suffix: suffix ?? null,
@@ -182,6 +193,7 @@ export function parseFilename(filename: string): ParsedFilename {
     timestamp: null,
     product: null,
     version: 1,
+    variant: null,
     extension: ext,
     title: null,
     suffix: null,
@@ -239,18 +251,27 @@ export function buildFileInventoryFromStorage(
       type: fileType,
       product: (parsed.product as ProductType) ?? null,
       version: parsed.version,
+      variant: parsed.variant,
       titlePrefixed: parsed.titlePrefixed,
       title: parsed.title,
       timestamp: parsed.timestamp,
     });
   }
 
-  // Sort: by product, then version descending (newest first)
+  // Sort: by product asc → version desc → variant desc (newest-first within version)
+  // S35: variants like v5a/v5b/v5c/v5d are tied at version=5; we tiebreak by variant
+  // letter descending so the LATEST experimental variant surfaces as default.
   inventory.sort((a, b) => {
     const pa = a.product ?? "";
     const pb = b.product ?? "";
     if (pa !== pb) return pa.localeCompare(pb);
-    return b.version - a.version;
+    if (b.version !== a.version) return b.version - a.version;
+    // Both versions equal — sort by variant. NULL (no variant) sorts AFTER lettered
+    // variants so v5a/v5b/v5c precede v5 (the base). This keeps user-facing newest
+    // at the top of the dropdown when variants exist.
+    const va = a.variant ?? "";
+    const vb = b.variant ?? "";
+    return vb.localeCompare(va);
   });
 
   return inventory;

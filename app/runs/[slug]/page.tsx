@@ -11,6 +11,7 @@ import {
   Loader2,
   RefreshCw,
   AlertCircle,
+  Copy,
 } from "lucide-react";
 
 // ── Component ───────────────────────────────────────────────────────
@@ -75,13 +76,24 @@ export default function RunDetailPage({
           <p className="mt-1 font-mono text-sm text-zinc-500">{slug}</p>
         </div>
 
-        <button
-          onClick={() => mutate()}
-          className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-300 transition hover:bg-zinc-700 active:scale-95"
-        >
-          <RefreshCw className="h-4 w-4" />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          {/* S35 Clone & Edit — opens the form pre-filled from this run's manifest */}
+          <Link
+            href={`/new?clone=${slug}`}
+            className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-300 transition hover:border-[#c8a951] hover:bg-zinc-700 hover:text-[#c8a951] active:scale-95"
+            title="Open the form with every field pre-filled from this run — edit what you want and submit to create a linked v2"
+          >
+            <Copy className="h-4 w-4" />
+            Clone &amp; Edit
+          </Link>
+          <button
+            onClick={() => mutate()}
+            className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-300 transition hover:bg-zinc-700 active:scale-95"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* ── Phase timeline stepper ─────────────────────────── */}
