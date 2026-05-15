@@ -39,8 +39,10 @@ export async function POST(request: Request) {
   const supabase = getSupabase();
 
   // S35 Clone & Edit — if parentSlug present, resolve to UUID for the
-  // parent_run_id FK. Unknown slug = fresh submission (don't fail loud; the
-  // user's brief is still valid). .maybeSingle() avoids the .single()
+  // parent_run_id FK. Unknown slug for a full-pipeline submission is fine
+  // (the user's brief is still valid); but for studio_only it's fatal —
+  // the worker needs the parent's NLM notebook id and would otherwise be
+  // told to do something it cannot do. .maybeSingle() avoids the .single()
   // zero-rows throw (S33 adversarial #11).
   let parentRunId: string | null = null;
   if (data.parentSlug) {
@@ -52,11 +54,26 @@ export async function POST(request: Request) {
     parentRunId = parentRow?.id ?? null;
   }
 
-  // CE-3 — pipeline_mode only meaningful when we have a parent_run_id.
-  // The agent reads job.pipeline_mode === "studio_only" to branch. The DB
-  // column is NOT NULL with a 'full' default and CHECK ('full','studio_only');
-  // we always write an explicit string (an explicit NULL would still fail the
-  // constraint — the DEFAULT only applies when the column is omitted).
+  // CE-3 Bug 2 — when the user explicitly requested studio_only but the
+  // parent slug doesn't resolve to a queue row, return 400 instead of
+  // silently downgrading to a full pipeline. A silent downgrade burns
+  // ~$5-15 and 1-2 hours on a job the user did not ask for, and many
+  // storage-resident completed runs do not have a queue row (S41 finding).
+  if (data.pipelineMode === "studio_only" && !parentRunId) {
+    return Response.json(
+      {
+        error: "Parent run not found in queue",
+        detail:
+          "Studio-only regeneration requires the parent run to have an active queue row (with the parent NLM notebook). The slug you provided does not match any research_queue.topic_slug. Re-submit as a full pipeline, or pick a different parent run.",
+        parentSlug: data.parentSlug ?? null,
+      },
+      { status: 400 },
+    );
+  }
+
+  // pipeline_mode is NOT NULL with a 'full' default and CHECK ('full',
+  // 'studio_only'); we always write an explicit string (an explicit NULL
+  // would fail the constraint — DEFAULT only applies on column omission).
   const pipelineMode: "full" | "studio_only" =
     parentRunId && data.pipelineMode === "studio_only" ? "studio_only" : "full";
 
