@@ -131,4 +131,7 @@ export interface StepReviewProps {
   isSubmitting: boolean;
   submitError: string | null;
   estMins: number;
+  // CE-3 — when present, StepReview renders the pipeline-mode radio. Absent
+  // for fresh submissions (no parent notebook to reuse).
+  cloneSlug: string | null;
 }

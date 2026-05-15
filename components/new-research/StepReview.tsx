@@ -3,7 +3,7 @@
 import { useFormContext } from "react-hook-form";
 import type { FormData } from "@/lib/validate";
 import type { StepReviewProps } from "@/lib/types/queue";
-import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon, Sparkles } from "lucide-react";
+import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon, Sparkles, RefreshCw, Repeat } from "lucide-react";
 import { TimeEstimate } from "./Shared";
 
 const PRODUCT_META: Record<string, { label: string; icon: typeof Music }> = {
@@ -38,8 +38,8 @@ function FromTopicBadge() {
   );
 }
 
-export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepReviewProps) {
-  const { watch, formState: { errors } } = useFormContext<FormData>();
+export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSlug }: StepReviewProps) {
+  const { watch, setValue, formState: { errors } } = useFormContext<FormData>();
   const topic = watch("topic");
   const products = watch("selectedProducts");
   const vendor = watch("vendorEvaluation");
@@ -48,6 +48,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepR
   const notifyEmail = watch("notifyEmail");
   const userContext = watch("userContext");
   const extractedContext = watch("extractedContext");
+  const pipelineMode = watch("pipelineMode") ?? "full";
 
   const selectedProducts = Object.entries(products ?? {}).filter(([, v]) => v);
 
@@ -196,6 +197,51 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins }: StepR
           <p className="text-xs text-zinc-500 italic">Default settings</p>
         )}
       </div>
+
+      {/* CE-3 — Pipeline mode (only shown when cloning). studio_only skips
+          Claude + deep research; the worker spawns regenerate-studio-products
+          directly against the parent notebook for faster re-cuts. */}
+      {cloneSlug && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-3">
+          <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-500">Pipeline mode</h3>
+          <label className="flex items-start gap-3 cursor-pointer rounded-md border border-transparent hover:border-zinc-700 p-2 -m-2 transition">
+            <input
+              type="radio"
+              name="pipelineMode"
+              value="full"
+              checked={pipelineMode === "full"}
+              onChange={() => setValue("pipelineMode", "full", { shouldDirty: true })}
+              className="mt-1 h-4 w-4 accent-[#c8a951]"
+            />
+            <span className="flex-1">
+              <span className="flex items-center gap-2 text-sm text-zinc-200">
+                <RefreshCw className="h-3.5 w-3.5 text-[#c8a951]" /> Re-run full pipeline
+              </span>
+              <span className="block text-xs text-zinc-500 mt-0.5">
+                Re-do every phase: deep research, NLM ingest, Studio products. Use when the topic or context changed.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-3 cursor-pointer rounded-md border border-transparent hover:border-zinc-700 p-2 -m-2 transition">
+            <input
+              type="radio"
+              name="pipelineMode"
+              value="studio_only"
+              checked={pipelineMode === "studio_only"}
+              onChange={() => setValue("pipelineMode", "studio_only", { shouldDirty: true })}
+              className="mt-1 h-4 w-4 accent-[#c8a951]"
+            />
+            <span className="flex-1">
+              <span className="flex items-center gap-2 text-sm text-zinc-200">
+                <Repeat className="h-3.5 w-3.5 text-[#c8a951]" /> Re-generate Studio products only
+              </span>
+              <span className="block text-xs text-zinc-500 mt-0.5">
+                Skip research; reuse the parent notebook and regenerate the selected NLM Studio products (audio, video, slides, report, infographic).
+              </span>
+            </span>
+          </label>
+        </div>
+      )}
 
       <TimeEstimate minutes={estMins} />
 

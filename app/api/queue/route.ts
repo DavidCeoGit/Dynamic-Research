@@ -52,6 +52,13 @@ export async function POST(request: Request) {
     parentRunId = parentRow?.id ?? null;
   }
 
+  // CE-3 — pipeline_mode only meaningful when we have a parent_run_id.
+  // The agent reads job.pipeline_mode === "studio_only" to branch. Persist
+  // NULL for the full/fresh case so the DB stays semantically clean
+  // (regenerate-studio-products.ts requires a parent or it aborts).
+  const pipelineMode =
+    parentRunId && data.pipelineMode === "studio_only" ? "studio_only" : null;
+
   const { data: row, error } = await supabase
     .from("research_queue")
     .insert({
@@ -65,6 +72,7 @@ export async function POST(request: Request) {
       notify_email: data.notifyEmail || null,
       estimated_minutes: estimate,
       parent_run_id: parentRunId,
+      pipeline_mode: pipelineMode,
     })
     .select("id, topic_slug, estimated_minutes")
     .single();

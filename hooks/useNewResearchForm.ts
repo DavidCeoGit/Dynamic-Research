@@ -374,18 +374,24 @@ export function useNewResearchForm() {
     setIsSubmitting(true);
     setSubmitError(null);
 
-    // Strip transient fields before sending to API
+    // Strip transient fields before sending to API. pipelineMode is also
+    // stripped here so non-clone submissions don't ship a "full" default
+    // that ends up persisted to research_queue.pipeline_mode — keep that
+    // column NULL for fresh runs (CE-3 invariant: studio_only only with
+    // a parent_run_id).
     const {
       generatedQuestions: _gq,
       dynamicAnswers: _da,
       extractedContext: _ec,
+      pipelineMode,
       ...formPayload
     } = data;
 
     // S35 Clone & Edit — stamp parentSlug if this submission is a clone.
     // Backend resolves slug→id and writes research_queue.parent_run_id.
+    // CE-3 — pipelineMode rides alongside parentSlug; never sent without it.
     const payload = cloneSlug
-      ? { ...formPayload, parentSlug: cloneSlug }
+      ? { ...formPayload, parentSlug: cloneSlug, pipelineMode }
       : formPayload;
 
     try {

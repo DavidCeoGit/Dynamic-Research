@@ -119,6 +119,11 @@ export const researchJobPayloadSchema = z.object({
   // Slug not UUID because the frontend has the slug from the URL; backend
   // does the lookup. NULL/undefined = fresh submission.
   parentSlug: z.string().max(120).nullable().optional(),
+  // CE-3 — Studio-only regeneration: "studio_only" tells the worker to skip
+  // Claude + the deep-research pipeline and re-run only NLM Studio products
+  // against the parent notebook. Only meaningful when parentSlug is present;
+  // omitted/"full" = normal pipeline. The agent reads job.pipeline_mode.
+  pipelineMode: z.enum(["full", "studio_only"]).optional(),
 });
 
 // Path B (S29): structured extraction of dimensions the topic already covers.
@@ -193,6 +198,8 @@ export const formDataSchema = z.object({
   generatedQuestions: z.array(generatedQuestionSchema).default([]),
   dynamicAnswers: z.record(z.string(), z.union([z.string(), z.boolean(), z.array(z.string())])).default({}),
   extractedContext: extractedContextSchema.nullable().default(null),
+  // CE-3 — only used when cloning. Hooks/StepReview gate the radio on cloneSlug.
+  pipelineMode: z.enum(["full", "studio_only"]).default("full"),
 });
 
 export type FormData = z.infer<typeof formDataSchema>;
@@ -208,4 +215,5 @@ export const FORM_DEFAULT_VALUES: FormData = {
   generatedQuestions: [],
   dynamicAnswers: {},
   extractedContext: null,
+  pipelineMode: "full",
 };

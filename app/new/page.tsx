@@ -90,7 +90,7 @@ function NewResearchInner() {
           {step === "questions" && <StepQuestions onNext={goNext} onPrev={goPrev} isGenerating={isGenerating} />}
           {step === "products" && <StepProducts onNext={goNext} onPrev={goPrev} estMins={estMins} />}
           {step === "customize" && <StepCustomize onNext={goNext} onPrev={goPrev} />}
-          {step === "review" && <StepReview onPrev={goPrev} isSubmitting={isSubmitting} submitError={submitError} estMins={estMins} />}
+          {step === "review" && <StepReview onPrev={goPrev} isSubmitting={isSubmitting} submitError={submitError} estMins={estMins} cloneSlug={cloneSlug} />}
         </form>
       </FormProvider>
     </div>
