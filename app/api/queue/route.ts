@@ -53,11 +53,12 @@ export async function POST(request: Request) {
   }
 
   // CE-3 — pipeline_mode only meaningful when we have a parent_run_id.
-  // The agent reads job.pipeline_mode === "studio_only" to branch. Persist
-  // NULL for the full/fresh case so the DB stays semantically clean
-  // (regenerate-studio-products.ts requires a parent or it aborts).
-  const pipelineMode =
-    parentRunId && data.pipelineMode === "studio_only" ? "studio_only" : null;
+  // The agent reads job.pipeline_mode === "studio_only" to branch. The DB
+  // column is NOT NULL with a 'full' default and CHECK ('full','studio_only');
+  // we always write an explicit string (an explicit NULL would still fail the
+  // constraint — the DEFAULT only applies when the column is omitted).
+  const pipelineMode: "full" | "studio_only" =
+    parentRunId && data.pipelineMode === "studio_only" ? "studio_only" : "full";
 
   const { data: row, error } = await supabase
     .from("research_queue")
