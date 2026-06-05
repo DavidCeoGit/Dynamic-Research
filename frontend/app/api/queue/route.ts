@@ -1,7 +1,8 @@
 /**
  * POST /api/queue — Creates a new research job in the queue.
  * GET  /api/queue — Lists active jobs (pending, running, failed) for the
- *                   caller's organization.
+ *                   caller's organization, as an envelope so the UI can hide
+ *                   failed/cancelled jobs (S93).
  *
  * Validates inputs via Zod, generates a unique slug, calculates
  * estimated completion time, and inserts into research_queue.
@@ -17,6 +18,13 @@
  *   4. studio_only error message updated to reflect same-org scope.
  *   5. GET filters .eq('organization_id', orgId) so users only see jobs in
  *      their own org.
+ *
+ * S93 — GET now returns { jobs, hiddenCount, canHide } (was a bare array),
+ * mirroring /api/runs. Failed/cancelled jobs the org has hidden (a row in
+ * user_hidden_runs keyed by the job UUID) are filtered out unless ?show_hidden=1,
+ * in which case they are returned annotated `hidden: true`. The hidden set is
+ * org-scoped via the service-role client — the SAME tenant boundary as the
+ * list query itself.
  *
  * Note: unlike the storage routes, the queue routes query research_queue
  * directly (no storage-path scoping). The .eq('organization_id', orgId)
@@ -148,7 +156,10 @@ export async function POST(request: Request) {
   );
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const showHidden = searchParams.get("show_hidden") === "1";
+
   const { orgId, source } = await getOrgContextDualPath();
   const orgHeaders = { "X-Org-Source": source };
 
@@ -168,5 +179,37 @@ export async function GET() {
     );
   }
 
-  return Response.json(data, { headers: orgHeaders });
+  // Org-scoped hidden set — shared user_hidden_runs table. Bounded to the ids
+  // actually returned (Gemini MINOR, S93): without `.in("slug", jobIds)` this
+  // would load the org's entire historical hide set on every 5s poll. Scoping
+  // to the active-job ids keeps it O(visible jobs). Completed-run hides are
+  // storage slugs and never match a job UUID, so they are excluded for free.
+  const jobIds = (data ?? []).map((j) => j.id as string);
+  let hiddenIds = new Set<string>();
+  if (jobIds.length > 0) {
+    try {
+      const { data: hr } = await supabase
+        .from("user_hidden_runs")
+        .select("slug")
+        .eq("organization_id", orgId)
+        .in("slug", jobIds);
+      hiddenIds = new Set((hr ?? []).map((r) => r.slug as string));
+    } catch {
+      hiddenIds = new Set();
+    }
+  }
+
+  const jobs: Record<string, unknown>[] = [];
+  let hiddenCount = 0;
+  for (const job of data ?? []) {
+    const isHidden = hiddenIds.has(job.id as string);
+    if (isHidden) hiddenCount++;
+    if (isHidden && !showHidden) continue;
+    jobs.push(isHidden ? { ...job, hidden: true } : job);
+  }
+
+  return Response.json(
+    { jobs, hiddenCount, canHide: true },
+    { headers: orgHeaders },
+  );
 }

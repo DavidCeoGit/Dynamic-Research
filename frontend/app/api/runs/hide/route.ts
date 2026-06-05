@@ -1,11 +1,22 @@
 /**
- * POST   /api/runs/hide   — hide one or more completed runs from the org's view
+ * POST   /api/runs/hide   — hide one or more runs from the org's view
  * DELETE /api/runs/hide   — unhide (restore to the org's view)
  *
  * v4 (S92): ORG-SCOPED soft hide that works on the env-fallback path (the live
  * dashboard has no session). UI-only, reversible, non-destructive.
  *
- * Invariants (v4 MERGE-gate review, Gemini->Codex):
+ * S93: extended to FAILED + CANCELLED queue jobs (the Active Pipelines section).
+ * A completed run is a STORAGE slug; a failed/cancelled job is a research_queue
+ * row keyed by its UUID `id` (which arrives in the same `slug` field). The two
+ * key spaces are disjoint (storage slugs are topic-slugs, never UUIDs), so a
+ * single body field covers both. POST validation is BATCHED (Gemini MAJOR, S93):
+ *   - all UUID targets   -> ONE `.in("id", jobIds)` query scoped to org +
+ *                           status IN ('failed','cancelled').
+ *   - all slug targets   -> projectExists with bounded concurrency (cap fan-out
+ *                           so a 500-target body can't burst the Storage pool).
+ *   - validated targets  -> ONE bulk upsert (was N sequential upserts).
+ *
+ * Invariants (v4 MERGE-gate review, Gemini->Codex; S93 extends the same shape):
  *  - Org context via getOrgContextDualPath() (env or session) — the SAME tenant
  *    boundary the dashboard reads use. NOT requireOrgContext() (which would 401
  *    the env path and make hide unusable).
@@ -15,18 +26,48 @@
  *    (service-role-only). Route-level org-scoping is the load-bearing boundary.
  *  - No user_id (table is org-scoped). onConflict "organization_id,slug".
  *  - Rate-limited FIRST (before body parse): 429 + Retry-After + X-RateLimit-Remaining.
- *  - Ownership gate on POST: projectExists(orgId, slug) (storage existence in the org).
+ *  - Ownership gate on POST: a target must be a failed/cancelled job OR a storage
+ *    run, both in the resolved org. Unowned targets are skipped, never hidden.
  *  - Body validated by parseHideBody (400 on malformed).
  *
- * See Documentation/runs-hide-from-view-env-path-revision.md.
+ * See Documentation/runs-hide-from-view-env-path-revision.md +
+ *     Documentation/runs-hide-failed-cancelled-peer-review.md.
  */
 import { getOrgContextDualPath } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 import { projectExists } from "@/lib/storage";
-import { parseHideBody } from "@/lib/hidden-runs";
+import { parseHideBody, partitionHideTargets } from "@/lib/hidden-runs";
 import { clientIp, checkRateLimit } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
+
+type SkipReason = "not_found_in_org" | "db_error";
+
+/**
+ * Map over items with a bounded number of in-flight promises (Gemini MAJOR,
+ * S93). Caps the Storage-API fan-out so a large bulk body cannot exhaust the
+ * serverless instance's connection pool. Results are index-aligned with `items`.
+ */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (cursor < items.length) {
+      const i = cursor++;
+      out[i] = await fn(items[i]);
+    }
+  }
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  return out;
+}
 
 async function rateLimited(request: Request): Promise<Response | null> {
   const rl = await checkRateLimit(clientIp(request));
@@ -60,35 +101,63 @@ export async function POST(request: Request) {
 
   const { orgId } = await getOrgContextDualPath();
 
-  const slugs = await readSlugs(request);
-  if (slugs instanceof Response) return slugs;
+  const targets = await readSlugs(request);
+  if (targets instanceof Response) return targets;
 
   const supabase = getSupabase();
-  const hidden: string[] = [];
-  const skipped: { slug: string; reason: string }[] = [];
+  const { jobIds, slugs } = partitionHideTargets(targets);
 
-  for (const slug of slugs) {
-    // Ownership gate: the run must exist in the resolved org's storage prefix.
-    let exists = false;
+  // Queue-job ownership: ONE org-scoped query for all UUID targets. Only this
+  // org's failed/cancelled jobs are hideable.
+  const validJobIds = new Set<string>();
+  if (jobIds.length > 0) {
     try {
-      exists = await projectExists(orgId, slug);
+      const { data } = await supabase
+        .from("research_queue")
+        .select("id")
+        .in("id", jobIds)
+        .eq("organization_id", orgId)
+        .in("status", ["failed", "cancelled"]);
+      for (const r of data ?? []) validJobIds.add(r.id as string);
     } catch {
-      exists = false;
+      /* leave empty → those targets fall through to not_found_in_org */
     }
-    if (!exists) {
-      skipped.push({ slug, reason: "not_found_in_org" });
-      continue;
-    }
+  }
 
+  // Storage-run ownership: bounded-concurrency existence checks in the org prefix.
+  const validSlugs = new Set<string>();
+  if (slugs.length > 0) {
+    const exists = await mapLimit(slugs, 8, (s) =>
+      projectExists(orgId, s).catch(() => false),
+    );
+    slugs.forEach((s, i) => {
+      if (exists[i]) validSlugs.add(s);
+    });
+  }
+
+  const validated = targets.filter(
+    (t) => validJobIds.has(t) || validSlugs.has(t),
+  );
+  const skipped: { slug: string; reason: SkipReason }[] = targets
+    .filter((t) => !validJobIds.has(t) && !validSlugs.has(t))
+    .map((slug) => ({ slug, reason: "not_found_in_org" }));
+
+  let hidden: string[] = [];
+  if (validated.length > 0) {
     const { error } = await supabase.from("user_hidden_runs").upsert(
-      { organization_id: orgId, slug },
+      validated.map((slug) => ({ organization_id: orgId, slug })),
       { onConflict: "organization_id,slug", ignoreDuplicates: true },
     );
     if (error) {
-      skipped.push({ slug, reason: "db_error" });
-      continue;
+      return Response.json({
+        hidden: [],
+        skipped: [
+          ...skipped,
+          ...validated.map((slug) => ({ slug, reason: "db_error" as SkipReason })),
+        ],
+      });
     }
-    hidden.push(slug);
+    hidden = validated;
   }
 
   return Response.json({ hidden, skipped });

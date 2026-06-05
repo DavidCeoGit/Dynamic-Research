@@ -47,6 +47,15 @@ interface RunsEnvelope {
   canHide: boolean;
 }
 
+// /api/queue envelope (S93): same shape as RunsEnvelope so failed/cancelled
+// jobs in Active Pipelines can be soft-hidden (keyed by the job UUID).
+type ActiveJob = ResearchJob & { hidden?: boolean };
+interface QueueEnvelope {
+  jobs: ActiveJob[];
+  hiddenCount: number;
+  canHide: boolean;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 const fetcher = async (url: string) => {
@@ -87,14 +96,21 @@ const PRODUCT_ICONS: Record<string, typeof Music> = {
 // ── Component ───────────────────────────────────────────────────────
 
 export default function HomePage() {
-  const { data: activeJobs, error: activeError } = useSWR<ResearchJob[]>(
-    "/api/queue",
+  // Show-hidden toggle: flips the SWR keys so the archived view caches
+  // separately. Shared across both sections — one "Show hidden" reveals every
+  // hidden item (completed runs + failed/cancelled jobs).
+  const [showHidden, setShowHidden] = useState(false);
+
+  const {
+    data: jobsData,
+    error: activeError,
+    mutate: mutateJobs,
+  } = useSWR<QueueEnvelope>(
+    `/api/queue${showHidden ? "?show_hidden=1" : ""}`,
     fetcher,
     { refreshInterval: 5000 },
   );
 
-  // Show-hidden toggle: flips the SWR key so the archived view caches separately.
-  const [showHidden, setShowHidden] = useState(false);
   const {
     data: runsData,
     error: runsError,
@@ -105,20 +121,25 @@ export default function HomePage() {
     { revalidateOnFocus: true },
   );
 
+  const activeJobs = jobsData?.jobs ?? [];
+  const queueHiddenCount = jobsData?.hiddenCount ?? 0;
+
   const runs = runsData?.runs ?? [];
   const hiddenCount = runsData?.hiddenCount ?? 0;
   const canHide = runsData?.canHide ?? false;
+  const queueCanHide = jobsData?.canHide ?? false;
 
-  const isLoadingActive = !activeJobs && !activeError;
+  const isLoadingActive = !jobsData && !activeError;
   const isLoadingRuns = !runsData && !runsError;
   const isEmpty =
     !isLoadingActive &&
     !isLoadingRuns &&
-    (!activeJobs || activeJobs.length === 0) &&
+    activeJobs.length === 0 &&
+    queueHiddenCount === 0 &&
     runs.length === 0 &&
     hiddenCount === 0;
 
-  // ── Hide / unhide handlers (S92) ──────────────────────────────────
+  // ── Hide / unhide handlers (S92 runs; S93 failed/cancelled jobs) ───
   async function postHide(method: "POST" | "DELETE", body: unknown) {
     try {
       await fetch("/api/runs/hide", {
@@ -127,11 +148,16 @@ export default function HomePage() {
         body: JSON.stringify(body),
       });
     } finally {
+      // Refresh both lists — a hide can affect either section's counts.
       mutateRuns();
+      mutateJobs();
     }
   }
   const hideRun = (slug: string) => postHide("POST", { slug });
   const unhideRun = (slug: string) => postHide("DELETE", { slug });
+  // Queue jobs are keyed by their UUID id (carried in the same `slug` field).
+  const hideJob = (id: string) => postHide("POST", { slug: id });
+  const unhideJob = (id: string) => postHide("DELETE", { slug: id });
 
   function hideAllCompleted() {
     const visible = runs.filter((r) => !r.hidden).map((r) => r.slug);
@@ -144,6 +170,8 @@ export default function HomePage() {
     postHide("POST", { slugs: visible });
   }
 
+  const showActiveSection =
+    isLoadingActive || activeJobs.length > 0 || queueHiddenCount > 0;
   const showRunsSection =
     isLoadingRuns || runs.length > 0 || hiddenCount > 0;
 
@@ -186,11 +214,49 @@ export default function HomePage() {
       )}
 
       {/* ── Active Jobs Section ──────────────────────────────── */}
-      {(isLoadingActive || (activeJobs && activeJobs.length > 0)) && (
+      {showActiveSection && (
         <section className="mb-12">
-          <h2 className="mb-4 flex items-center gap-2 text-lg font-medium text-zinc-300">
-            <Clock className="h-5 w-5 text-[#c8a951]" /> Active Pipelines
-          </h2>
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="flex items-center gap-2 text-lg font-medium text-zinc-300">
+              <Clock className="h-5 w-5 text-[#c8a951]" /> Active Pipelines
+            </h2>
+            {/* Show-hidden toggle (only when there are hidden failed/cancelled jobs) */}
+            {queueCanHide && (queueHiddenCount > 0 || showHidden) && (
+              <button
+                onClick={() => setShowHidden((v) => !v)}
+                className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-400 transition hover:border-zinc-600 hover:text-zinc-200"
+              >
+                {showHidden ? (
+                  <>
+                    <Eye className="h-3.5 w-3.5" /> Hide hidden
+                  </>
+                ) : (
+                  <>
+                    <Eye className="h-3.5 w-3.5" /> Show hidden ({queueHiddenCount})
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+
+          {/* All visible jobs hidden, and not showing them → reassurance */}
+          {!isLoadingActive &&
+            activeJobs.length === 0 &&
+            queueHiddenCount > 0 &&
+            !showHidden && (
+              <div className="rounded-lg border border-dashed border-zinc-700 bg-zinc-900/30 p-8 text-center text-sm text-zinc-400">
+                {queueHiddenCount} failed/cancelled job
+                {queueHiddenCount === 1 ? "" : "s"} hidden from your view — still
+                saved.{" "}
+                <button
+                  onClick={() => setShowHidden(true)}
+                  className="font-medium text-[#c8a951] underline-offset-2 hover:underline"
+                >
+                  Show hidden
+                </button>
+              </div>
+            )}
+
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
             {isLoadingActive ? (
               <>
@@ -198,61 +264,109 @@ export default function HomePage() {
                 <CardSkeleton />
               </>
             ) : (
-              activeJobs?.map((job) => (
-                <Link
-                  key={job.id}
-                  href={`/new/${job.id}`}
-                  className="group relative flex flex-col justify-between overflow-hidden rounded-lg border border-zinc-800 bg-zinc-900/50 p-5 transition-all hover:border-[#c8a951]/50 hover:bg-zinc-800"
-                >
-                  {/* Progress bar at top */}
-                  <div
-                    className={`absolute top-0 left-0 h-1 transition-all duration-1000 ease-out ${
-                      job.status === "failed" ? "bg-red-500" : "bg-[#c8a951]"
+              activeJobs.map((job) => {
+                // Only terminal-failure jobs get a hide control. `cancelled` is
+                // currently filtered out of GET /api/queue upstream so it never
+                // reaches here, but the condition keeps the UI forward-safe if
+                // cancelled is ever surfaced (the hide route already accepts it).
+                const isHideable =
+                  job.status === "failed" || job.status === "cancelled";
+                return (
+                  <Link
+                    key={job.id}
+                    href={`/new/${job.id}`}
+                    className={`group relative flex flex-col justify-between overflow-hidden rounded-lg border p-5 transition-all ${
+                      job.hidden
+                        ? "border-zinc-800/60 bg-zinc-900/40 opacity-60 hover:opacity-100"
+                        : "border-zinc-800 bg-zinc-900/50 hover:border-[#c8a951]/50 hover:bg-zinc-800"
                     }`}
-                    style={{ width: `${job.progress_pct}%` }}
-                  />
-
-                  <div>
-                    <div className="mb-3 flex items-start justify-between gap-4">
-                      <span
-                        className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${
-                          job.status === "failed"
-                            ? "bg-red-500/10 text-red-400"
-                            : "bg-[#c8a951]/10 text-[#c8a951]"
-                        }`}
-                      >
-                        {job.status === "failed" ? (
-                          <AlertTriangle className="h-3 w-3" />
-                        ) : (
-                          <Clock className="h-3 w-3 animate-pulse" />
-                        )}
-                        {job.status}
-                      </span>
-                      <span className="text-xs font-mono text-zinc-500">
-                        {job.progress_pct}%
-                      </span>
-                    </div>
-                    <h3 className="line-clamp-2 text-sm font-medium leading-snug text-zinc-100 group-hover:text-[#c8a951] transition-colors">
-                      {job.topic}
-                    </h3>
-                  </div>
-
-                  <div className="mt-6 flex items-center justify-between border-t border-zinc-800/60 pt-4 text-xs font-medium">
-                    <span className="text-zinc-500">
-                      {new Date(job.created_at).toLocaleDateString()}
-                    </span>
-                    <span
-                      className={`capitalize ${
-                        job.status === "failed" ? "text-red-400" : "text-zinc-400"
+                  >
+                    {/* Progress bar at top */}
+                    <div
+                      className={`absolute top-0 left-0 h-1 transition-all duration-1000 ease-out ${
+                        job.status === "failed" ? "bg-red-500" : "bg-[#c8a951]"
                       }`}
-                    >
-                      {job.status === "failed"
-                        ? "Execution Error"
-                        : phaseFromProgress(job.progress_pct) || job.current_phase || "Pending"}
-                    </span>
-                  </div>
-                </Link>
-              ))
+                      style={{ width: `${job.progress_pct}%` }}
+                    />
+
+                    <div>
+                      <div className="mb-3 flex items-start justify-between gap-4">
+                        <span
+                          className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${
+                            job.status === "failed"
+                              ? "bg-red-500/10 text-red-400"
+                              : "bg-[#c8a951]/10 text-[#c8a951]"
+                          }`}
+                        >
+                          {job.status === "failed" ? (
+                            <AlertTriangle className="h-3 w-3" />
+                          ) : (
+                            <Clock className="h-3 w-3 animate-pulse" />
+                          )}
+                          {job.status}
+                        </span>
+                        <span className="text-xs font-mono text-zinc-500">
+                          {job.progress_pct}%
+                        </span>
+                      </div>
+                      <h3 className="line-clamp-2 text-sm font-medium leading-snug text-zinc-100 group-hover:text-[#c8a951] transition-colors">
+                        {job.topic}
+                        {job.hidden && (
+                          <span className="ml-2 rounded-full bg-zinc-700/50 px-2 py-0.5 align-middle text-[10px] font-medium uppercase tracking-wider text-zinc-400">
+                            Hidden
+                          </span>
+                        )}
+                      </h3>
+                    </div>
+
+                    <div className="mt-6 flex items-center justify-between border-t border-zinc-800/60 pt-4 text-xs font-medium">
+                      <span className="text-zinc-500">
+                        {new Date(job.created_at).toLocaleDateString()}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`capitalize ${
+                            job.status === "failed"
+                              ? "text-red-400"
+                              : "text-zinc-400"
+                          }`}
+                        >
+                          {job.status === "failed"
+                            ? "Execution Error"
+                            : phaseFromProgress(job.progress_pct) ||
+                              job.current_phase ||
+                              "Pending"}
+                        </span>
+                        {/* Hide / Unhide control — only failed/cancelled jobs */}
+                        {isHideable && (
+                          <button
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              job.hidden ? unhideJob(job.id) : hideJob(job.id);
+                            }}
+                            title={
+                              job.hidden
+                                ? "Restore to view"
+                                : "Hide from view"
+                            }
+                            aria-label={
+                              job.hidden ? "Unhide job" : "Hide job from view"
+                            }
+                            className="shrink-0 rounded-md p-1 text-zinc-500 opacity-0 transition hover:bg-zinc-800 hover:text-zinc-200 focus:opacity-100 group-hover:opacity-100"
+                          >
+                            {job.hidden ? (
+                              <RotateCcw className="h-3.5 w-3.5" />
+                            ) : (
+                              <EyeOff className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </Link>
+                );
+              })
             )}
           </div>
         </section>
@@ -388,7 +502,7 @@ export default function HomePage() {
                       </div>
                     </div>
 
-                    {/* Hide / Unhide control (signed-in only) — stops link nav */}
+                    {/* Hide / Unhide control — stops link nav */}
                     {canHide && (
                       <button
                         onClick={(e) => {
