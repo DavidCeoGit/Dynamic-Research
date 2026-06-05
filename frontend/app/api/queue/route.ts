@@ -89,12 +89,23 @@ export async function POST(request: Request) {
   // DB-level trigger (research_queue_parent_same_org) lands in Phase 5.
   let parentRunId: string | null = null;
   if (data.parentSlug) {
-    const { data: parentRow } = await supabase
+    const { data: parentRow, error: parentLookupError } = await supabase
       .from("research_queue")
       .select("id")
       .eq("topic_slug", data.parentSlug)
       .eq("organization_id", orgId)
       .maybeSingle();
+    // Distinguish query-failure from no-data (cf. requireOrgContext taxonomy):
+    // .maybeSingle() returns error:null on zero rows, so a populated error here
+    // is a genuine DB failure — fail loud with 500 rather than letting the null
+    // parentRunId masquerade as "parent not found" (a 400 that would wrongly
+    // tell the user to re-submit, silently destroying their studio_only intent).
+    if (parentLookupError) {
+      return Response.json(
+        { error: "Failed to resolve parent run", detail: parentLookupError.message },
+        { status: 500, headers: orgHeaders },
+      );
+    }
     parentRunId = parentRow?.id ?? null;
   }
 
