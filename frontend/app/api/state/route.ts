@@ -2,20 +2,16 @@
  * GET /api/state
  * GET /api/state?slug=<project-slug>
  *
- * Without slug: returns the most recent state.json across all projects
- * in the caller's org.
- * With slug: returns state.json for the specified project, scoped to the
- * caller's org via the storage-path prefix (<orgId>/<slug>/).
+ * Without slug: returns the most recent state.json across all projects in the
+ * caller's org. With slug: returns state.json for the specified project.
  *
- * S29 hotfix: normalize the state so missing nested fields don't throw
- * "Cannot convert undefined or null to object" downstream.
- *
+ * S29 hotfix: normalize the state so missing nested fields don't throw.
  * S56 Phase 2 — org resolution via per-request getOrgContextDualPath().
  *
- * S92 per-user hide: the no-slug "latest across all projects" path skips runs
- * the caller has hidden, so a hidden newest run does not leak into the
- * dashboard summary (Gemini MINOR). The WITH-slug direct-link path is
- * deliberately NOT filtered — hiding controls the listing, not direct access.
+ * S92 v4 org-scoped hide: the no-slug "latest across all projects" path skips
+ * runs hidden for the resolved org (env or session), fetched via service-role
+ * scoped to the org — so a hidden newest run does not leak into the dashboard
+ * summary. The WITH-slug direct-link path is deliberately NOT filtered.
  */
 
 import {
@@ -25,7 +21,7 @@ import {
   readStateJson,
 } from "@/lib/storage";
 import { getOrgContextDualPath } from "@/lib/auth";
-import { createServerSupabase } from "@/lib/supabase-server";
+import { getSupabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 
@@ -119,7 +115,7 @@ export async function GET(request: Request) {
     }
   }
 
-  // ── Latest across all projects (hide-filtered) ────────────────
+  // ── Latest across all projects (hide-filtered, org-scoped) ────────
   let slugs: string[];
   try {
     slugs = await listProjects(orgId);
@@ -130,17 +126,18 @@ export async function GET(request: Request) {
     );
   }
 
-  // Exclude runs the caller has hidden so a hidden newest run does not surface
-  // in the dashboard summary. Only a real session has a hidden set.
-  if (source === "session") {
-    try {
-      const supabase = await createServerSupabase();
-      const { data } = await supabase.from("user_hidden_runs").select("slug");
-      const hiddenSlugs = new Set((data ?? []).map((r) => r.slug as string));
-      slugs = slugs.filter((s) => !hiddenSlugs.has(s));
-    } catch {
-      // best-effort: on a hidden-set read failure, fall back to unfiltered
-    }
+  // Exclude runs hidden for this org (env or session) so a hidden newest run
+  // does not surface in the dashboard summary. Service-role, org-scoped.
+  try {
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from("user_hidden_runs")
+      .select("slug")
+      .eq("organization_id", orgId);
+    const hiddenSlugs = new Set((data ?? []).map((r) => r.slug as string));
+    slugs = slugs.filter((s) => !hiddenSlugs.has(s));
+  } catch {
+    // best-effort: on a hidden-set read failure, fall back to unfiltered
   }
 
   if (slugs.length === 0) {

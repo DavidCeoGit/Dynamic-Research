@@ -1,50 +1,46 @@
 /**
- * POST   /api/runs/hide   — hide one or more completed runs from MY view
- * DELETE /api/runs/hide   — unhide (restore to MY view)
+ * POST   /api/runs/hide   — hide one or more completed runs from the org's view
+ * DELETE /api/runs/hide   — unhide (restore to the org's view)
  *
- * Per-user SOFT hide (S92). UI-only: never deletes DB/storage data.
+ * v4 (S92): ORG-SCOPED soft hide that works on the env-fallback path (the live
+ * dashboard has no session). UI-only, reversible, non-destructive.
  *
- * Implementation invariants (from the MERGE-gate review):
- *  - DB writes use the RLS-respecting anon+cookie client (createServerSupabase),
- *    NEVER the service-role getSupabase() which bypasses RLS (Codex MAJOR-A).
- *  - Auth via requireOrgContext() directly (401 no-session / 403 no-membership),
- *    NOT getOrgContextDualPath() which env-falls-back on no-membership (Codex MAJOR-B).
- *  - Ownership gate = storage existence under the caller's own org prefix
- *    (projectExists), NOT a research_queue lookup which misses storage-only
- *    legacy runs (Gemini MAJOR-1). projectExists also confines existence
- *    inference to the caller's own org.
- *  - Body validated by a shared zod schema so malformed slugs 400 (not 500).
+ * Invariants (v4 MERGE-gate review, Gemini->Codex):
+ *  - Org context via getOrgContextDualPath() (env or session) — the SAME tenant
+ *    boundary the dashboard reads use. NOT requireOrgContext() (which would 401
+ *    the env path and make hide unusable).
+ *  - DB via the service-role client (getSupabase), ALWAYS scoped
+ *    .eq("organization_id", orgId). The env path has no auth.uid(), so the RLS/
+ *    anon client cannot be used; RLS on the table is enabled with no policies
+ *    (service-role-only). Route-level org-scoping is the load-bearing boundary.
+ *  - No user_id (table is org-scoped). onConflict "organization_id,slug".
+ *  - Rate-limited FIRST (before body parse): 429 + Retry-After + X-RateLimit-Remaining.
+ *  - Ownership gate on POST: projectExists(orgId, slug) (storage existence in the org).
+ *  - Body validated by parseHideBody (400 on malformed).
  *
- * See Documentation/runs-hide-from-view-design-gate.md.
+ * See Documentation/runs-hide-from-view-env-path-revision.md.
  */
-import {
-  requireOrgContext,
-  UnauthorizedError,
-  ForbiddenError,
-  type OrgContext,
-} from "@/lib/auth";
-import { createServerSupabase } from "@/lib/supabase-server";
+import { getOrgContextDualPath } from "@/lib/auth";
+import { getSupabase } from "@/lib/supabase";
 import { projectExists } from "@/lib/storage";
 import { parseHideBody } from "@/lib/hidden-runs";
+import { clientIp, checkRateLimit } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
-/** Resolve the org context, or return a 401/403 Response for the caller to return. */
-async function resolveContext(): Promise<OrgContext | Response> {
-  try {
-    return await requireOrgContext();
-  } catch (err) {
-    if (err instanceof UnauthorizedError) {
-      return Response.json({ error: "Not signed in" }, { status: 401 });
-    }
-    if (err instanceof ForbiddenError) {
-      return Response.json(
-        { error: "No organization membership" },
-        { status: 403 },
-      );
-    }
-    throw err; // genuine failure → 500 via the framework
-  }
+async function rateLimited(request: Request): Promise<Response | null> {
+  const rl = await checkRateLimit(clientIp(request));
+  if (rl.allowed) return null;
+  return Response.json(
+    { error: "Rate limit exceeded" },
+    {
+      status: 429,
+      headers: {
+        "Retry-After": String(rl.retryAfterSec),
+        "X-RateLimit-Remaining": "0",
+      },
+    },
+  );
 }
 
 async function readSlugs(request: Request): Promise<string[] | Response> {
@@ -59,19 +55,20 @@ async function readSlugs(request: Request): Promise<string[] | Response> {
 }
 
 export async function POST(request: Request) {
-  const ctx = await resolveContext();
-  if (ctx instanceof Response) return ctx;
-  const { user, orgId } = ctx;
+  const limited = await rateLimited(request);
+  if (limited) return limited;
+
+  const { orgId } = await getOrgContextDualPath();
 
   const slugs = await readSlugs(request);
   if (slugs instanceof Response) return slugs;
 
-  const supabase = await createServerSupabase();
+  const supabase = getSupabase();
   const hidden: string[] = [];
   const skipped: { slug: string; reason: string }[] = [];
 
   for (const slug of slugs) {
-    // Ownership gate: the run must exist in the caller's OWN storage prefix.
+    // Ownership gate: the run must exist in the resolved org's storage prefix.
     let exists = false;
     try {
       exists = await projectExists(orgId, slug);
@@ -84,8 +81,8 @@ export async function POST(request: Request) {
     }
 
     const { error } = await supabase.from("user_hidden_runs").upsert(
-      { user_id: user.id, organization_id: orgId, slug },
-      { onConflict: "user_id,organization_id,slug", ignoreDuplicates: true },
+      { organization_id: orgId, slug },
+      { onConflict: "organization_id,slug", ignoreDuplicates: true },
     );
     if (error) {
       skipped.push({ slug, reason: "db_error" });
@@ -98,21 +95,18 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const ctx = await resolveContext();
-  if (ctx instanceof Response) return ctx;
-  const { user, orgId } = ctx;
+  const limited = await rateLimited(request);
+  if (limited) return limited;
+
+  const { orgId } = await getOrgContextDualPath();
 
   const slugs = await readSlugs(request);
   if (slugs instanceof Response) return slugs;
 
-  // No projectExists gate on unhide — RLS already restricts the delete to the
-  // caller's own rows, and allowing it even when the run no longer exists in
-  // storage lets a user clean up orphaned hidden rows.
-  const supabase = await createServerSupabase();
+  const supabase = getSupabase();
   const { error } = await supabase
     .from("user_hidden_runs")
     .delete()
-    .eq("user_id", user.id)
     .eq("organization_id", orgId)
     .in("slug", slugs);
 

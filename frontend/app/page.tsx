@@ -39,11 +39,12 @@ interface RunSummary {
 }
 
 // /api/runs envelope (S92): wraps the list so the UI can show "N hidden" and
-// auth-gate the hide controls from the response body.
+// gate the hide controls from the response body. v4: canHide is org-scoped and
+// always true (hide works on the env-fallback path), replacing the v3 `auth`.
 interface RunsEnvelope {
   runs: RunSummary[];
   hiddenCount: number;
-  auth: boolean;
+  canHide: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -106,7 +107,7 @@ export default function HomePage() {
 
   const runs = runsData?.runs ?? [];
   const hiddenCount = runsData?.hiddenCount ?? 0;
-  const canHide = runsData?.auth ?? false;
+  const canHide = runsData?.canHide ?? false;
 
   const isLoadingActive = !activeJobs && !activeError;
   const isLoadingRuns = !runsData && !runsError;
