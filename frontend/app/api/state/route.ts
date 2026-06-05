@@ -8,18 +8,14 @@
  * caller's org via the storage-path prefix (<orgId>/<slug>/).
  *
  * S29 hotfix: normalize the state so missing nested fields don't throw
- * "Cannot convert undefined or null to object" downstream. Recovered /
- * legacy runs (e.g., cam AI run u9el closed by finalize-recovered-run.ts
- * in S28) write state.json without selectedProducts / artifacts /
- * customizations / userContext top-level keys. Filling defaults at the
- * API boundary keeps every downstream consumer safe without scattering
- * null guards.
+ * "Cannot convert undefined or null to object" downstream.
  *
- * S56 Phase 2 — org resolution moves from module-const SYSTEM_DEFAULT_ORG_ID +
- * resolveOrgForSlug() to per-request getOrgContextDualPath(). The cross-org
- * data boundary is the storage path prefix <orgId>/<slug>/ in
- * scopedStoragePath(); a user with org-A's session/env can only resolve
- * paths under <orgA>/, so they cannot read org-B's files (Gemini F1, S56).
+ * S56 Phase 2 — org resolution via per-request getOrgContextDualPath().
+ *
+ * S92 per-user hide: the no-slug "latest across all projects" path skips runs
+ * the caller has hidden, so a hidden newest run does not leak into the
+ * dashboard summary (Gemini MINOR). The WITH-slug direct-link path is
+ * deliberately NOT filtered — hiding controls the listing, not direct access.
  */
 
 import {
@@ -29,6 +25,7 @@ import {
   readStateJson,
 } from "@/lib/storage";
 import { getOrgContextDualPath } from "@/lib/auth";
+import { createServerSupabase } from "@/lib/supabase-server";
 
 export const dynamic = "force-dynamic";
 
@@ -102,16 +99,8 @@ export async function GET(request: Request) {
   const { orgId, source } = await getOrgContextDualPath();
   const orgHeaders = { "X-Org-Source": source };
 
-  // ── Slug-specific lookup ──────────────────────────────────────
+  // ── Slug-specific lookup (NOT hide-filtered — direct access by URL) ──
   if (slugParam) {
-    // Cross-tenant isolation here is the storage path prefix:
-    // findStateFile/listFiles/readStateJson all go through
-    // scopedStoragePath(orgId, slug) → `<orgId>/<slug>/...`. A user with
-    // org-A's session/env can never resolve a path under org-B/, so a slug
-    // owned by another org returns null from findStateFile and 404s below.
-    // No research_queue DB check needed (Gemini F1, S56 — that check would
-    // have blocked legacy runs whose queue row was deleted but storage
-    // remained).
     const stateFilename = await findStateFile(orgId, slugParam);
     if (!stateFilename) {
       return Response.json(
@@ -130,7 +119,7 @@ export async function GET(request: Request) {
     }
   }
 
-  // ── Latest across all projects ────────────────────────────────
+  // ── Latest across all projects (hide-filtered) ────────────────
   let slugs: string[];
   try {
     slugs = await listProjects(orgId);
@@ -139,6 +128,19 @@ export async function GET(request: Request) {
       { error: "Failed to list projects", detail: String(err) },
       { status: 500, headers: orgHeaders },
     );
+  }
+
+  // Exclude runs the caller has hidden so a hidden newest run does not surface
+  // in the dashboard summary. Only a real session has a hidden set.
+  if (source === "session") {
+    try {
+      const supabase = await createServerSupabase();
+      const { data } = await supabase.from("user_hidden_runs").select("slug");
+      const hiddenSlugs = new Set((data ?? []).map((r) => r.slug as string));
+      slugs = slugs.filter((s) => !hiddenSlugs.has(s));
+    } catch {
+      // best-effort: on a hidden-set read failure, fall back to unfiltered
+    }
   }
 
   if (slugs.length === 0) {
