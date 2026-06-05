@@ -1,0 +1,37 @@
+{
+  "_comment": "Sprint 3 Phase A2 (S72): real upstream specs added. Echo stub retained for rollback tests #1-#7 + #10-#12. perplexity + Chrome_DevTools_MCP keys MUST match the executor.ts --allowedTools allowlist server-name prefix (mcp__perplexity__*, mcp__Chrome_DevTools_MCP__*) at agent/executor.ts:858-874.",
+  "_provenance": "perplexity + Chrome_DevTools_MCP specs copied verbatim from ~/.claude.json:872-893 (project + user-global block). Same npx package names + args; env keys propagated via the C-3 unconditional process.env spread in index.ts:88 (PERPLEXITY_API_KEY + PERPLEXITY_TIMEOUT_MS).",
+  "upstreams": {
+    "echo": {
+      "command": "node",
+      "args": [
+        "C:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/agent/mcp-proxy/echo-upstream-stub.mjs"
+      ]
+    },
+    "perplexity": {
+      "command": "npx",
+      "args": [
+        "-yq",
+        "@perplexity-ai/mcp-server"
+      ]
+    },
+    "Chrome_DevTools_MCP": {
+      "command": "npx",
+      "args": [
+        "chrome-devtools-mcp@latest",
+        "--viewport",
+        "1280x720"
+      ],
+      "idempotent": false,
+      "_idempotent_note": "Codex Round 2 C-1: stateful tools (click, press_key, navigate_page, take_snapshot, take_screenshot, type_text, fill, hover, drag, etc.) mutate external page state. L10 dedup-cache MUST be skipped or repeated identical calls return stale prior results and the agent operates on a phantom page state. Setting idempotent=false makes the proxy override POLICY.L10_ENABLED to false for this upstream regardless of the PROXY_L10_ENABLED env."
+    },
+    "stateful_echo": {
+      "command": "node",
+      "args": [
+        "C:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/agent/mcp-proxy/echo-upstream-stub.mjs"
+      ],
+      "idempotent": false,
+      "_idempotent_note": "Test-only upstream entry: same binary as 'echo' but flagged non-idempotent to drive rollback test #13 (verifies L10 skipped under spec.idempotent=false)."
+    }
+  }
+}

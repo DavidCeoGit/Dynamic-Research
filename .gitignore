@@ -1,0 +1,54 @@
+# Dynamic Research — standalone repo .gitignore (authored S90 repo-extraction)
+
+# deps / build
+**/node_modules/
+**/.next/
+**/out/
+**/build/
+*.tsbuildinfo
+
+# env / secrets — BROAD: catch .env, .env.local, and archived/backup variants
+# (e.g. .env.bak-s82-pre-api-key-disable). Exempt only *.example templates.
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env*.example
+*.pem
+*.key
+credentials.*
+**/agent-env*
+# MCP configs often carry server API keys
+.mcp.json
+.mcp.json.*
+**/.mcp.json
+backup-claude-config/
+
+# vercel
+**/.vercel
+
+# worker / agent runtime state
+**/worker.log
+**/.worker.pid
+**/.preflight-backoff
+agent/scripts/.phase-a-bootstrap-state.json
+
+# claude machine-local + session/runtime (DO commit settings.json + sandbox-allowlist)
+**/.claude/settings.local.json
+**/.claude/*.local.json
+**/.claude/sessions/
+**/.claude/scheduled_tasks.lock
+
+# job outputs (large, per-tenant, possibly client-identifying — NEVER commit)
+Projects/
+
+# sandbox — ignore entirely (incl. validated archive: can hold .env/secret snapshots)
+sandbox/
+agent/sandbox/
+
+# NOTE (Codex MAJOR): next-env.d.ts is intentionally NOT ignored — it's a Next type
+# shim that `pnpm test`'s tsc --noEmit needs present on a fresh checkout.
+
+# OS
+.DS_Store

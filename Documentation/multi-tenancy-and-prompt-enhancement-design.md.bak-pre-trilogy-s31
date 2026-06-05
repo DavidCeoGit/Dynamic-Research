@@ -1,0 +1,418 @@
+# Multi-Tenancy + Prompt Enhancement — Unified Design (S31)
+
+**Status:** Design only — no implementation yet.
+**Author:** S31 (2026-05-09).
+**Background:** User requested in S31: (a) multi-tenant access for distributed people/agencies (internal + invite-only model) and (b) per-field prompt enhancement to compress the user's manual Grammarly → expert-rewrite → inconsistency-fix workflow into one tool-driven step.
+**Owner files (when implemented):** Listed per phase.
+
+---
+
+## Why one design doc
+
+These features share ~40% of their concerns and a coherent design avoids the "two docs that contradict each other on auth" problem:
+
+- Both need **Supabase Auth** (multi-tenancy gates the app shell; prompt enhancement gates the cost-bearing endpoint).
+- Both need **RLS discipline** (multi-tenancy on data tables; future enhancement-cost tracking on a usage table).
+- Both need **cost attribution** thinking (per-org compute spend matters once 5+ orgs exist).
+- Both touch the same form (multi-tenancy decides which forms you see; prompt enhancement edits what's in them).
+
+Writing them together forces consistency and lets shared sections (auth, RLS, cost) be factored once.
+
+---
+
+## Goals
+
+**Multi-tenancy (internal + invite-only):**
+- Multiple users sign in via magic link.
+- Each user belongs to one or more organizations.
+- Users see only their org's runs (queue, gallery, history). Storage paths and database rows enforce isolation; guessing a slug from another org returns 404.
+- Existing runs migrate to a default org owned by the primary user (no data orphaned).
+- Invitations are operator-issued (CLI or simple admin script). No public signup.
+
+**Prompt enhancement (per-field v1):**
+- Per-field "Enhance ✨" button on key textareas (topic, persona, queryFraming, jobDescription) and on each `domainKnowledge[i]`.
+- Single Sonnet call performs three logical passes — clarity / expert rewrite / inconsistency-flagging — and returns a structured response with color-coded annotations.
+- User reviews diff: accept clarity edits silently, review structural additions one-by-one, manually resolve flagged inconsistencies.
+- Lives behind authenticated session (post-multi-tenancy).
+
+---
+
+## Non-goals (v1)
+
+**Multi-tenancy:**
+- No per-org billing or quotas (telemetry only).
+- No role tiers beyond owner/member (defer admin/auditor for v2).
+- No SSO (defer; agency tier eventually wants SAML).
+- No audit log UI (the data is in Supabase logs; surface in v2).
+
+**Prompt enhancement:**
+- No auto-on-blur trigger (button only — predictable cost, no jarring auto-mutation).
+- No whole-form coherent rewrite (v2 design doc — needs cross-field consistency model).
+- No polish history / undo beyond browser-level form state.
+- No A/B test infrastructure measuring "enhanced vs. raw" research quality (future).
+
+---
+
+## Part 1 — Multi-Tenancy
+
+### 1.1 Auth choice
+
+**Supabase Auth, magic-link only (no passwords).** Rationale:
+- Native to existing Supabase stack — zero integration overhead, JWTs auto-set on `auth.uid()` for RLS.
+- Magic links eliminate password-management UX (no reset flows, no hash-breach risk).
+- Free tier covers 50K MAU — wildly sufficient for invite-only internal use.
+- Email magic-link UX is well-understood by non-technical agency users.
+
+Trade-off accepted: Supabase Auth's UI is less polished than Clerk/Auth0 and lacks enterprise SSO. That trade is right for invite-only internal; revisit if SaaS pivot happens.
+
+### 1.2 Schema additions
+
+Three table changes, all enforced via RLS. Skeleton SQL:
+
+```sql
+-- New: organizations
+CREATE TABLE organizations (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name         TEXT NOT NULL,
+  slug         TEXT UNIQUE NOT NULL,
+  owner_id     UUID NOT NULL REFERENCES auth.users(id),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- New: organization_members (many-to-many)
+CREATE TABLE organization_members (
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id         UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  role            TEXT NOT NULL DEFAULT 'member',  -- 'owner' | 'member'
+  joined_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (organization_id, user_id)
+);
+
+-- New: organization_invitations (operator-issued)
+CREATE TABLE organization_invitations (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  email           TEXT NOT NULL,
+  invited_by      UUID NOT NULL REFERENCES auth.users(id),
+  role            TEXT NOT NULL DEFAULT 'member',
+  expires_at      TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '14 days'),
+  accepted_at     TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Modified: research_queue gains organization_id
+ALTER TABLE research_queue
+  ADD COLUMN organization_id UUID REFERENCES organizations(id);
+-- Migration backfills then sets NOT NULL (see 1.5).
+```
+
+### 1.3 RLS policies
+
+All three new tables and `research_queue` get policies. The shape:
+
+```sql
+-- research_queue SELECT: only rows where user is in the org
+CREATE POLICY "members read their org's jobs"
+  ON research_queue FOR SELECT
+  USING (
+    organization_id IN (
+      SELECT organization_id FROM organization_members
+      WHERE user_id = auth.uid()
+    )
+  );
+
+-- research_queue INSERT: only with an org_id the user belongs to
+CREATE POLICY "members create jobs in their orgs"
+  ON research_queue FOR INSERT
+  WITH CHECK (
+    organization_id IN (
+      SELECT organization_id FROM organization_members
+      WHERE user_id = auth.uid()
+    )
+  );
+```
+
+Same shape for `organizations` (members can read their own orgs; owners can update), `organization_members` (read-self only), `organization_invitations` (org owners create; invitees read by token).
+
+**Worker daemon bypass:** worker continues using `SUPABASE_SERVICE_ROLE_KEY` which bypasses RLS — that's correct for trusted infrastructure. Worker MUST faithfully stamp `organization_id` on outputs (no leaks possible if it does its job right).
+
+### 1.4 Storage isolation
+
+Path structure changes from:
+```
+research-projects/<slug>/<file>
+```
+to:
+```
+research-projects/<org_id>/<slug>/<file>
+```
+
+Gallery becomes server-side-only:
+1. Client requests `/api/runs/<slug>/files`.
+2. Server resolves slug → row → org_id, then checks `auth.uid() ∈ organization_members(org_id)`.
+3. If allowed: server generates signed URLs (1-hour expiry) for each file. Returns array.
+4. If denied: server returns **404** (do not leak existence — denying with 403 lets attackers enumerate slugs).
+
+Bucket itself becomes private (no public read). Existing anonymous-readable URLs in old gallery pages stop working — accepted (we control the URLs and re-issue via signed flow).
+
+### 1.5 Migration plan
+
+Order matters — RLS-disabled until Phase C is done, otherwise existing worker breaks:
+
+1. Create `organizations`, `organization_members`, `organization_invitations` (RLS **DISABLED** initially).
+2. Insert default org `"David's Workspace"` (slug `david-workspace`), owner_id = primary user's auth.users.id.
+3. Insert primary user as owner member.
+4. `ALTER TABLE research_queue ADD COLUMN organization_id UUID NULL`.
+5. `UPDATE research_queue SET organization_id = '<default_org_id>'` (all existing rows).
+6. `ALTER TABLE research_queue ALTER COLUMN organization_id SET NOT NULL`.
+7. Move existing Storage files from `research-projects/<slug>/...` to `research-projects/<default_org_id>/<slug>/...` (one-time script, ~50 files).
+8. **Deploy frontend + worker simultaneously** with org-aware code.
+9. Enable RLS + apply policies.
+
+Step 8 is the critical sync moment — frontend and worker must both ship before step 9, or RLS denies in-flight queries.
+
+### 1.6 Frontend changes
+
+| File / Component | Change |
+|---|---|
+| `app/login/page.tsx` | NEW — magic link form (Supabase Auth UI or custom) |
+| `middleware.ts` | NEW — redirect unauthed `/runs/*`, `/new`, `/` → `/login` |
+| `app/api/auth/callback/route.ts` | NEW — handles magic link redirect, exchanges code for session |
+| `components/OrgSwitcher.tsx` | NEW — nav dropdown (only shown if user has 2+ orgs) |
+| `lib/auth.ts` | NEW — `getCurrentUser()`, `getCurrentOrg()`, server-side helpers |
+| `app/page.tsx` (dashboard) | Filter by current org; org switcher in header |
+| `app/new/page.tsx` (form) | Pass `organization_id` from current context with submission |
+| `app/runs/[slug]/page.tsx` | Server component checks org access before rendering |
+| `app/runs/[slug]/gallery/page.tsx` | Same — gallery auth-gated, signed URLs |
+
+### 1.7 Invite flow (minimal)
+
+v1 = operator-only, via CLI:
+
+```bash
+node --import=tsx agent/scripts/invite-user.ts <email> <org_id> [role]
+```
+
+Script:
+1. Inserts row in `organization_invitations`.
+2. Calls Supabase `auth.admin.inviteUserByEmail()` — sends magic-link email with the invitation token in the redirect URL.
+3. On link click → user creates account → callback handler matches invitation token → auto-joins org → marks invitation `accepted_at`.
+
+v2 = UI for org owners to issue invites (defer).
+
+### 1.8 Worker daemon contract
+
+Worker reads `organization_id` from claimed `research_queue` row. Stamps it on:
+- Storage upload paths (`<org_id>/<slug>/<file>`).
+- `state.json` field `organization_id`.
+- Future audit log entries.
+
+Worker continues using service-role key. `agent/lib/conventions.ts` gets a new helper `orgScopedPath(orgId, slug, file)`.
+
+`agent/scripts/finalize-recovered-run.ts` honors org_id (reads from state.json or accepts as CLI flag).
+
+### 1.9 Phases
+
+| Phase | Work | Time | Owner |
+|---|---|---|---|
+| **A** | Schema migration + default org backfill + Storage move script | 1 day | Backend |
+| **B** | Frontend auth (login, middleware, callback, org switcher) | 1 day | Frontend |
+| **C** | RLS policies + cross-org isolation tests | 1 day | Backend |
+| **D** | Storage isolation + signed URL gallery API | 0.5 day | Backend |
+| **E** | Worker daemon org-aware updates | 0.5 day | Agent |
+| **F** | Invite CLI helper + email template | 0.5 day | Backend |
+
+Total: **~4-5 days** from start to internal launch.
+
+---
+
+## Part 2 — Prompt Enhancement (per-field v1)
+
+### 2.1 Endpoint contract
+
+```typescript
+// POST /api/queue/enhance-field
+interface EnhanceFieldRequest {
+  field_name: 'topic' | 'persona' | 'queryFraming' | 'jobDescription' | 'domainKnowledge';
+  field_value: string;
+  form_context: {                                  // for cross-field awareness
+    topic?: string;
+    persona?: string;
+    vendorEvaluation?: { vendorType, serviceArea, jobDescription };
+    constraints?: string[];
+    domainKnowledge?: string[];
+  };
+  enhancement_level: 'conservative' | 'standard' | 'aggressive';
+}
+
+interface EnhanceFieldResponse {
+  original: string;
+  enhanced: string;
+  annotations: Array<{
+    type: 'clarity' | 'structural' | 'inconsistency';
+    location: { start: number; end: number };     // char offsets in `enhanced`
+    rationale: string;
+    confidence: 'high' | 'medium' | 'low';
+  }>;
+  warnings: string[];                              // factual claims model couldn't verify
+  meta: {
+    tokens_in: number;
+    tokens_out: number;
+    cost_usd: number;
+    model: 'claude-sonnet-4-6';
+  };
+}
+```
+
+### 2.2 System prompt structure
+
+Three logical sections in ONE Sonnet call (efficient + lets the model reason across passes):
+
+1. **CLARITY pass:** Fix grammar, ambiguous pronouns, broken parallelism. **Must not change meaning.** Annotate as `type: 'clarity'`, `confidence: 'high'`.
+2. **EXPERT REWRITE pass:** Restructure for the audience inferred from `form_context.persona` + `form_context.vendorEvaluation.jobDescription`. Add research-prompt scaffolding (scope boundaries, decision context, named entities). **Tone-only changes** annotate as `clarity`; **content additions** (e.g., "I assumed you meant X") annotate as `structural`, `confidence: 'medium'` or `'low'`.
+3. **INCONSISTENCY flag:** Scan for contradictions across `field_value` + `form_context`. **Do not resolve them** — annotate as `type: 'inconsistency'`, `confidence: 'high'`, with rationale explaining the conflict. User resolves manually.
+
+Date awareness: inject `TODAY` (same fix as the slash command — see `feedback_date_awareness_in_pipeline.md`).
+
+Aggressiveness levels:
+- **conservative** — only `clarity` annotations applied; structural and inconsistency surfaced as warnings only.
+- **standard** (default) — all three annotation types active; user reviews structural/inconsistency individually.
+- **aggressive** — same as standard but model encouraged to make bolder structural rewrites.
+
+### 2.3 UI component
+
+`<FieldEnhancer>` wraps each enhanceable Textarea:
+
+| State | UI |
+|---|---|
+| Idle | Textarea + ✨ button in top-right corner |
+| Loading | Skeleton overlay; ✨ button shows spinner; ESC cancels |
+| Result | Modal opens with side-by-side diff |
+
+Modal content:
+- **Left pane:** original (read-only)
+- **Right pane:** enhanced with **inline color-coded highlights**:
+  - 🟢 green underline = `clarity` (low-risk, accept silently)
+  - 🟡 amber bracket = `structural` (review individually)
+  - 🔴 red wavy = `inconsistency` (resolve manually)
+- **Action bar:** `Accept All Clarity` (auto-applies green) | `Accept` (replaces field) | `Edit` (loads enhanced into field for further editing) | `Reject` (closes, no change)
+
+Per-annotation interactions: hover shows rationale; click toggles accept/dismiss for that specific annotation.
+
+Final action emits `field_value: <enhanced with accepted annotations applied>`.
+
+### 2.4 Cost discipline
+
+| Calculation | Value |
+|---|---|
+| Per call (Sonnet 4.6) | ~5K in + 3K out = **~$0.05** |
+| Per form (5 fields × 1-3 iterations) | $0.05 - $0.75 |
+| Per org per day (estimate: 10 forms × $0.50) | ~$5 |
+| Per research run downstream cost | $5-15 (NLM Studio + APIs) |
+
+ROI: $0.05 enhancement to make a $10 research run **20% better** is decisively positive. No quota needed for v1; telemetry table `enhancement_log` (org_id, user_id, field_name, tokens, cost) supports future per-org dashboards.
+
+### 2.5 Integration with existing endpoints
+
+`extract-context` (Path B from S29) and `enhance-field` overlap conceptually — both analyze prompt structure. Don't refactor v1; ship `enhance-field` as a separate endpoint. **v2 consolidation:** extract a `lib/prompt-analysis.ts` module with shared inference helpers, both endpoints import.
+
+### 2.6 Phases
+
+| Phase | Work | Time |
+|---|---|---|
+| **G** | Backend `/api/queue/enhance-field` + system prompt + Zod schema + tests | 0.5 day |
+| **H** | UI: `<FieldEnhancer>` component + diff modal + annotation rendering | 0.5 day |
+| **I** | Integrate into form (topic, persona, queryFraming, jobDescription, domainKnowledge[i]) + user-pref polish-level setting | 0.5 day |
+
+Total: **~1.5 days**, kicks off after multi-tenancy F.
+
+---
+
+## Part 3 — Cross-feature concerns
+
+### 3.1 Auth gate
+
+`enhance-field` requires authenticated session (via Supabase JWT in cookies). Same pattern as the existing `extract-context` endpoint will gain post-Multi-B middleware. Server-side check in route handler:
+
+```typescript
+const session = await getServerSession();
+if (!session) return Response.json({ error: 'unauthorized' }, { status: 401 });
+```
+
+### 3.2 RLS impact on enhancement
+
+`enhance-field` doesn't touch DB beyond reading user session — no RLS-policy work needed for v1.
+
+Future telemetry table:
+
+```sql
+CREATE TABLE enhancement_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id),
+  user_id UUID NOT NULL REFERENCES auth.users(id),
+  field_name TEXT NOT NULL,
+  tokens_in INT NOT NULL,
+  tokens_out INT NOT NULL,
+  cost_usd NUMERIC(10,4) NOT NULL,
+  enhancement_level TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+RLS: members read their org's logs; insertion is server-only.
+
+### 3.3 Cost attribution (future)
+
+Multi-tenancy enables per-org cost tracking via `enhancement_log` + future `research_run_log`. Daily rollup → per-org dashboard. Defer to billing phase (post-SaaS pivot if it happens).
+
+### 3.4 Date awareness consistency
+
+The same `TODAY` injection pattern applies to:
+- Slash command (already shipped S31, see `feedback_date_awareness_in_pipeline.md`)
+- `enhance-field` system prompt
+- `extract-context` system prompt (apply during Multi-B refactor)
+
+Single source of truth: a `lib/date-context.ts` helper that returns `{ TODAY, TODAY_HUMAN }` strings, imported by every LLM-touching endpoint. Avoids the same drift problem we hit on slug naming pre-conventions module.
+
+---
+
+## Implementation order
+
+Total: **~7 days from start to shipped.**
+
+| Day | Phase | Outcome |
+|---|---|---|
+| 0 | (wait) | Cam AI rerun completes (~70 min remaining at design time) |
+| 1 | Multi-A | Schema + migration deployed (RLS off) |
+| 2 | Multi-B | Login + middleware + callback live |
+| 3 | Multi-C | RLS locked down + cross-org isolation tested |
+| 3.5 | Multi-D | Storage isolated, signed URL gallery |
+| 4 | Multi-E | Worker daemon org-aware |
+| 4.5 | Multi-F | Invite CLI helper shipped |
+| 5 | Enhance-G | Backend endpoint live |
+| 5.5 | Enhance-H | `<FieldEnhancer>` + diff modal built |
+| 6 | Enhance-I | Per-field integration live |
+| 6.5 | Buffer | Bug-fix + Vercel deploy polish |
+
+Pre-req: cam AI rerun must complete — schema migration against running worker job invites lock contention.
+
+---
+
+## Open questions (small, not blocking)
+
+1. **Magic-link email provider** — Supabase default vs. Resend (better deliverability + branded sender)? **Default for v1; revisit if delivery issues.**
+2. **Org name on signup** — auto-generate `<username>'s Workspace` vs. prompt user? **Auto-generate; allow rename later.**
+3. **Multi-org URL structure** — `/o/<org_slug>/...` vs. nav switcher only? **Switcher only for v1 — less plumbing, no SEO concerns for invite-only.**
+4. **Invitation expiry** — 7 / 14 / 30 / never? **14 days; expired generates "request new invite" prompt.**
+5. **Whole-form Enhance v2** — does the cross-field enhancer rewrite all fields with mutual awareness in one call, or sequence per-field with a coherence check at the end? **Defer to v2 design doc.**
+6. **Enhancement diff library** — `jsdiff` (mature, simple) vs. `diff-match-patch` (Google, semantic) vs. custom? **`jsdiff` for v1; revisit if word-level diffs feel wrong on long fields.**
+7. **Worker concurrency post-multi-tenancy** — single local worker still fine, or move to Railway? **Local for invite-only internal; revisit if 3+ concurrent agencies submitting.**
+
+---
+
+## Cross-references
+
+- `feedback_workflow_drift_layer_3_gap.md` — multi-tenancy doesn't address workflow drift; that lives in the workflow-conventions-enforcer module.
+- `feedback_date_awareness_in_pipeline.md` — same `TODAY` injection pattern applies to `enhance-field`.
+- `Documentation/workflow-conventions-enforcer-design.md` — sister design doc; both deferred to ship after the multi-tenant + enhancement work.
+- `agent/lib/conventions.{json,ts,py}` — extend with `orgScopedPath()` helper in Multi-E.
+- `frontend/app/api/queue/extract-context/route.ts` — pattern reference for enhancement endpoint structure.

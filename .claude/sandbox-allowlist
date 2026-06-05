@@ -1,0 +1,7 @@
+# Dynamic Research — sandbox enforcement allowlist
+# Direct Write/Edit permitted only to sandbox/** (plus the hook's hardcoded
+# defaults: .claude/commands|agents|skills, CLAUDE.md, sandbox/*).
+# Everything else (agent/, frontend/, supabase/, Documentation/) routes through
+# sandbox/ + /promote. Pre-authored S90 to pre-empt enforce-sandbox auto-setup
+# (which would otherwise generate this + rewrite .gitignore on first post-init write).
+sandbox/**

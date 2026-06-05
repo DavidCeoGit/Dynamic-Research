@@ -1,0 +1,35 @@
+{
+  "_comment": "Sprint 3 Phase A2 (S72): three server entries (echo + perplexity + Chrome_DevTools_MCP). Each spawns its own proxy instance with the upstream key as argv[2]. Tool prefix surfaces as mcp__<key>__<tool> — matching executor.ts --allowedTools allowlist for perplexity + Chrome_DevTools_MCP at agent/executor.ts:858-874.",
+  "_single_host_note": "G-2 carry-forward (S71): absolute paths Windows-specific to this developer host. Phase B+ TODO for runtime regeneration if Linux-port. Worker daemon never deploys; OK.",
+  "_codex_c1_note": "C-1 carry-forward (S71): absolute file:// URL to tsx loader for cwd-independence. Real executor at agent/executor.ts:888 spawns claude with cwd=per-job workDir (under Projects/<slug>/) which lacks tsx in its node_modules chain.",
+  "_a2_note": "Tool prefix per Gemini G-1 (S71): perplexity key surfaces tools as mcp__perplexity__perplexity_research etc.; Chrome_DevTools_MCP key surfaces as mcp__Chrome_DevTools_MCP__list_pages etc. KEY NAMES MUST MATCH allowlist exactly (case-sensitive).",
+  "mcpServers": {
+    "echo": {
+      "command": "node",
+      "args": [
+        "--import",
+        "file:///C:/Users/ceo/Documents/AI%20Training/Anti%20Gravity/Dynamic%20Research/agent/node_modules/tsx/dist/esm/index.mjs",
+        "C:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/agent/mcp-proxy/index.ts",
+        "echo"
+      ]
+    },
+    "perplexity": {
+      "command": "node",
+      "args": [
+        "--import",
+        "file:///C:/Users/ceo/Documents/AI%20Training/Anti%20Gravity/Dynamic%20Research/agent/node_modules/tsx/dist/esm/index.mjs",
+        "C:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/agent/mcp-proxy/index.ts",
+        "perplexity"
+      ]
+    },
+    "Chrome_DevTools_MCP": {
+      "command": "node",
+      "args": [
+        "--import",
+        "file:///C:/Users/ceo/Documents/AI%20Training/Anti%20Gravity/Dynamic%20Research/agent/node_modules/tsx/dist/esm/index.mjs",
+        "C:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/agent/mcp-proxy/index.ts",
+        "Chrome_DevTools_MCP"
+      ]
+    }
+  }
+}

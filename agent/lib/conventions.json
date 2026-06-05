@@ -1,0 +1,160 @@
+{
+  "_doc": "Canonical conventions for Dynamic Research deliverables. Loaded by both agent/lib/conventions.ts and agent/lib/conventions.py — DO NOT duplicate values in language wrappers. Update this file, then regenerate any cached state in dependent scripts.",
+  "_version": 2,
+  "_last_updated": "2026-05-09 (S30)",
+  "_changelog": {
+    "v2 (S30)": "Added 'nlm-' to skip prefixes (was missing — only 'nlm_' was in v1, but actual NLM-discovered helper filenames use hyphen); added 'context' to research roles (was rejected as 'unknown' by lint script during S29 cleanup); added 'extensions' skip rule with '.py' (helper Python scripts in workdir must not upload to Supabase); documented state.json upload policy explicitly.",
+    "v1 (S28)": "Initial conventions module: slugify rules, filename patterns (studio + research + research_docx_companion), skip files, supabase storage bucket, NLM workflow constants, Windows quirks."
+  },
+  "slugify": {
+    "_doc": "Canyon Lake S12 convention: strip special chars, spaces->hyphens, lowercase, max length, trim trailing hyphen.",
+    "max_length": 60,
+    "strip_pattern_python": "[^a-zA-Z0-9\\s-]",
+    "strip_pattern_js": "[^a-zA-Z0-9\\s-]",
+    "fallback": "untitled"
+  },
+  "filename_patterns": {
+    "_doc": "All deliverable files in a workdir/storage-slug should match one of these patterns. Anything else is a violation.",
+    "studio": {
+      "_doc": "NLM-generated Studio products. Title-prefix from NLM artifact metadata.",
+      "pattern": "{title_slug}-{timestamp}-{product}.{ext}",
+      "regex": "^([a-z0-9-]+)-(\\d{8}-\\d{6})-([a-z]+)\\.([a-z0-9]+)$",
+      "products": {
+        "audio": {
+          "ext": "mp3",
+          "list_method": "list_audio",
+          "download_method": "download_audio"
+        },
+        "video": {
+          "ext": "mp4",
+          "list_method": "list_video",
+          "download_method": "download_video"
+        },
+        "slides": {
+          "ext": "pdf",
+          "list_method": "list_slide_decks",
+          "download_method": "download_slide_deck"
+        },
+        "report": {
+          "ext": "md",
+          "list_method": "list_reports",
+          "download_method": "download_report"
+        },
+        "infographic": {
+          "ext": "png",
+          "list_method": "list_infographics",
+          "download_method": "download_infographic"
+        }
+      }
+    },
+    "research": {
+      "_doc": "Pipeline-generated research/synthesis files. Topic-prefix (not timestamp) - must start with a lowercase letter. 'context' role added in v2 (S30) for the extracted-from-topic context file written by Path B (extract-then-ask) before user customization.",
+      "pattern": "{topic_prefix}-{role}.{ext}",
+      "regex": "^([a-z][a-z0-9-]*)-(brief|perplexity|comparison|vendor-evaluation|notebooklm|context|state)\\.([a-z0-9]+)$",
+      "roles": [
+        "brief",
+        "perplexity",
+        "comparison",
+        "vendor-evaluation",
+        "notebooklm",
+        "context",
+        "state"
+      ]
+    },
+    "research_docx_companion": {
+      "_doc": "Pandoc-generated .docx companions to research .md files. Topic-prefix (not timestamp) - must start with a lowercase letter. 'context' role added in v2 (S30).",
+      "pattern": "{topic_prefix}-{role}.docx",
+      "regex": "^([a-z][a-z0-9-]*)-(brief|perplexity|comparison|vendor-evaluation|notebooklm|context)\\.docx$",
+      "roles": [
+        "brief",
+        "perplexity",
+        "comparison",
+        "vendor-evaluation",
+        "notebooklm",
+        "context"
+      ]
+    }
+  },
+  "skip_files": {
+    "_doc": "Files that should NEVER be uploaded to Supabase Storage. Pipeline-internal state, scratch, or sensitive. v2 (S30) added 'nlm-' prefix (was 'nlm_' only — typo: actual NLM helper filenames use hyphen) and extensions skip set with '.py' (helper Python scripts in workdir).",
+    "exact": [
+      "claude-prompt.md",
+      "job-manifest.json",
+      "studio-task-ids.json",
+      "nlm_discovered_sources.json"
+    ],
+    "prefixes": [
+      "instr-",
+      "nlm_",
+      "nlm-",
+      "write_",
+      "test_",
+      "."
+    ],
+    "extensions": [
+      ".py"
+    ]
+  },
+  "supabase_storage": {
+    "bucket": "research-projects",
+    "_doc": "Files at <bucket>/<topic_slug>/. Topic_slug is the queue row's topic_slug field (not the title prefix).",
+    "state_json_policy": {
+      "_doc": "state.json IS uploaded to Supabase under research file naming pattern: {topic_prefix}-state.json. The 'state' role is in research.roles. This was implicit in v1 (S28) and made explicit here in v2 (S30) after S29 cam AI cleanup surfaced confusion about whether to upload pipeline-internal state files. Decision: state.json is the authoritative record of phase progression and final results metadata, useful for debugging and re-runs; upload it. The skip-prefix '.' still excludes hidden state files like .worker.pid, .meta, etc."
+    }
+  },
+  "nlm": {
+    "_doc": "NotebookLM workflow conventions documented across S12, S25-S27, S30.",
+    "auto_import_research_sources": {
+      "_doc": "When deep research completes, NLM does NOT auto-import the cited sources into the notebook. Studio products will only have access to manually-imported sources. Always: after research.poll() returns completed, iterate poll['sources'], skip already-imported URLs, batch-import the rest, wait 60s for processing, THEN launch Studio products. (S30) Bug 39 wave-2: NLM also surfaces NEW sources during Studio generation — see post_studio_reconcile below.",
+      "memory_ref": "feedback_nlm_session_expires_under_load.md (Bug 5/Bug 35-related), feedback_workflow_drift_layer_3_gap.md (S30)"
+    },
+    "post_studio_reconcile": {
+      "_doc": "(S30 D-2) After Phase 5.5 Studio generation completes, re-run the source-import flow against research status to pick up sources NLM auto-discovered during Studio runs. Required by /research-compare slash command Phase 5.5b. Bug 39 wave-2 fix.",
+      "memory_ref": "dryrun_handoff.md S30 task 2(b)"
+    },
+    "find_or_create_notebook": {
+      "_doc": "(S30 D-1) Before creating a fresh notebook, list existing and search for title match. Reuse preserves source curation across reruns. Anti-pattern (no find-or-create): cam AI 2x notebooks, Gunderson 2x notebooks generated in S29 — quality regression because Studio products generated against under-sourced fresh notebook instead of well-sourced original.",
+      "memory_ref": "dryrun_handoff.md S30 task 2(a), feedback_workflow_drift_layer_3_gap.md"
+    },
+    "session_expiry": {
+      "_doc": "NLM session expires after ~1-2hr of active use, OR after a long source-import batch. Always wrap long-running NLM operations with auth-refresh-on-failure logic. Detect 'Authentication expired' in error message; pause and prompt user for `notebooklm login`; resume.",
+      "typical_lifetime_hours": 1.5,
+      "memory_ref": "feedback_nlm_session_expires_under_load.md"
+    },
+    "studio_polling": {
+      "_doc": "artifact poll lags actual completion (Bug 24/25). Always try direct download every cycle; don't trust poll status. Use list_<type>() for ground truth. NLM occasionally generates 2 takes per request — sort by created_at DESC and pick newest.",
+      "memory_ref": "feedback_nlm_cli_status_unreliable.md"
+    },
+    "infographic_flakiness": {
+      "_doc": "First-attempt infographic generation often returns status=failed with no task_id. Retry with explicit orientation/detail_level/style options.",
+      "memory_ref": "research_compare_learnings.md (S27)"
+    }
+  },
+  "windows_quirks": {
+    "_doc": "Cross-cutting Windows-specific issues that bite Python/Node scripts.",
+    "node_settimeout_during_sleep": {
+      "_doc": "Node setTimeout doesn't fire reliably during S3/S4 sleep. Long deadlines (>1hr) fire late on wake. Use Date.now() comparisons at known event points instead of one-shot setTimeout.",
+      "memory_ref": "feedback_node_settimeout_during_windows_sleep.md (Bug 38)"
+    },
+    "python_path_prefix": {
+      "_doc": "Python on Windows doesn't understand /c/ MSYS paths. Always use C:/ in Python file paths.",
+      "memory_ref": "research_compare_learnings.md (Bug 18)"
+    },
+    "python_subprocess_full_exe": {
+      "_doc": "subprocess.run(['notebooklm', ...]) fails WinError 2. Use full path: C:/Users/ceo/.notebooklm-venv/Scripts/notebooklm.exe.",
+      "memory_ref": "feedback_nlm_subprocess_requires_full_exe_path.md"
+    },
+    "console_cp1252": {
+      "_doc": "Python stdout on Git Bash defaults to cp1252; Unicode crashes. Use ASCII or PYTHONIOENCODING=utf-8.",
+      "memory_ref": "feedback_python_windows_console_cp1252.md"
+    },
+    "task_stop_orphans": {
+      "_doc": "TaskStop on Bash wrapper leaves node descendants orphaned. Multiple orphan workers cause non-deterministic claim arrival + DLL-init failures. Use bash agent/scripts/cleanup-orphans.sh to verify.",
+      "memory_ref": "feedback_worker_taskstop_orphans.md"
+    }
+  },
+  "version_management": {
+    "_doc": "When regenerating Studio products against the same notebook, use orchestrator that filters by created_at >= orchestrator_start. Otherwise SDK 'first completed' returns the OLD artifact. Replace OLD files in storage by deleting bare-pattern files first, then upload titled files.",
+    "naming_v_suffix": "Optional -vN suffix when keeping multiple versions; otherwise overwrite locally + delete-then-upload to storage."
+  }
+}

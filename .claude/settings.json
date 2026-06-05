@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/sandbox/.mcp.json\" \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/.mcp.json\")",
+      "Bash(mv \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/sandbox/.mcp.json\" \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/sandbox/validated/.mcp.json\")",
+      "Bash(cp ~/.claude/commands/research-compare.md \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/backup-claude-config/commands/\")",
+      "Bash(cp ~/.claude/skills/vendor-scoring.md ~/.claude/skills/confidence-index.md ~/.claude/skills/chrome-mcp-patterns.md ~/.claude/skills/notebooklm-cli.md \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/backup-claude-config/skills/\")",
+      "Bash(cp ~/.claude/projects/c--Users-ceo-Documents-AI-Training-Anti-Gravity-Dynamic-Research/memory/dryrun_handoff.md ~/.claude/projects/c--Users-ceo-Documents-AI-Training-Anti-Gravity-Dynamic-Research/memory/research_compare_learnings.md \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/backup-claude-config/memory/\")",
+      "Bash(cp ~/.claude/projects/c--Users-ceo-Documents-AI-Training-Anti-Gravity/memory/MEMORY.md \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/backup-claude-config/memory/\")",
+      "Bash(cp ~/.claude/skills/vendor-scoring.md ~/.claude/skills/chrome-mcp-patterns.md \"c:/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/backup-claude-config/skills/\")",
+      "Skill(research-compare)",
+      "Skill(research-compare:*)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\ceo\\.claude\\commands",
+      "C:\\Users\\ceo\\.claude\\skills",
+      "C:\\Users\\ceo\\.claude\\projects\\c--Users-ceo-Documents-AI-Training-Anti-Gravity-Dynamic-Research\\memory",
+      "c:\\Users\\ceo\\Documents\\AI Training\\Anti Gravity"
+    ]
+  }
+}
