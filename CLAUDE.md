@@ -27,31 +27,28 @@
 
 ---
 
-## 3. Repo + git layout (HEADS UP — frequent footgun)
+## 3. Repo + git layout (standalone repo since S90)
 
-**The git repo is at the PARENT directory `Anti Gravity/`, NOT at `Dynamic Research/`.** Every `git` command must `cd` to the parent or use `git -C "C:/Users/ceo/Documents/AI Training/Anti Gravity"`. Running `git status` from inside `Dynamic Research/` works but the diff scope is the whole parent (which contains other unrelated projects).
+**`Dynamic Research/` is its OWN git repo** (fresh `git init`, S90 2026-06-04 — extracted from the former shared `Anti Gravity/` monorepo; see `Documentation/dr-repo-extraction-design-gate.md`). Run `git status` / `git commit` / `git push` directly from this directory — no `cd` to a parent, no `git -C`.
 
-To scope a status check to this project only:
+The folder did NOT move — it still physically lives under `Anti Gravity/`, but it no longer uses the parent's `.git`. The parent `.git` is being retired as the other entangled stragglers extract; the full pre-split history is archived at `c:/tmp/dr-extraction-backup/anti-gravity-parent-20260604.bundle` (HEAD `11321ac`, restorable via `git clone <bundle>`).
 
-```bash
-git -C "C:/Users/ceo/Documents/AI Training/Anti Gravity" status --short "Dynamic Research/"
-```
+GitHub remote: `origin` = `DavidCeoGit/Dynamic-Research` (the WHOLE project — frontend + agent + supabase + Documentation). `git push origin main` deploys (see §4).
 
-GitHub remote: `DavidCeoGit/Dynamic-Research` (the *push-clone*, see §4).
+**(Historical footgun, RESOLVED S90)** Pre-S90 the git repo was the PARENT `Anti Gravity/` shared across ~34 projects, causing branch-contention + a concurrent force-push that erased DR commits from the shared remote. Gone — DR owns its history now. The `feedback_shared_monorepo_concurrency_stash_hazard` + `feedback_pushclone_divergence_reconcile` patterns no longer apply to DR.
 
 ---
 
-## 4. Push-clone deploy path (CRITICAL)
+## 4. Deploy path (standalone — push-clone RETIRED S90)
 
-**The SoT (source of truth) is `Dynamic Research/frontend/`** — but Vercel does NOT deploy from there. Vercel deploys from a SEPARATE git repo at `c:/tmp/Dynamic-Research/` whose `origin` points to GitHub `DavidCeoGit/Dynamic-Research`.
+**The SoT is `Dynamic Research/frontend/` and Vercel deploys it directly.** Vercel project `dynamic-research` builds from GitHub `DavidCeoGit/Dynamic-Research` with **Root Directory = `frontend/`** (set via the project's settings; the whole project lives in the repo, the Next app is the `frontend/` subdir).
 
-**Deploy flow:**
-1. Edit files in `Dynamic Research/frontend/` (SoT)
-2. Run sync script that copies `Dynamic Research/frontend/` → `c:/tmp/Dynamic-Research/frontend/`
-3. `cd c:/tmp/Dynamic-Research && git add . && git commit && git push`
-4. Vercel auto-builds and deploys
+**Deploy flow (now trivial):**
+1. Edit files in `frontend/` (SoT).
+2. `git add . && git commit && git push origin main`.
+3. Vercel auto-builds (`cd frontend` → `pnpm install` → `next build`) and deploys to `dynamic-research.vercel.app`.
 
-**Known footgun:** the push-clone can silently diverge from SoT when prior sessions edit the push-clone directly. Memory file `feedback_pushclone_divergence_reconcile.md` documents the pattern. Before any deploy, **`diff -rq frontend/ c:/tmp/Dynamic-Research/frontend/`** and reconcile.
+**No more push-clone, no sync script, no 3-way diff.** The old `c:/tmp/Dynamic-Research` push-clone is RETIRED (kept on disk as a cold rollback backup until S91 confirms the new pipeline stable, then deletable). The `feedback_pushclone_divergence_reconcile` footgun no longer applies.
 
 **Sandbox writes are required for `frontend/` edits** — see §5.
 
