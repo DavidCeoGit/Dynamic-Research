@@ -19,7 +19,7 @@
 ## 2. Tech stack (canonical — pinned by package.json files)
 
 - **Package manager:** pnpm everywhere. Never use `npm`/`yarn`. Lockfiles enforce this.
-- **Runtime:** Node ≥ 22; `tsx` is the loader for all TypeScript at runtime (`tsx scripts/foo.ts`, `tsx --import worker.ts`, `node --import=tsx worker.ts`).
+- **Runtime:** Node ≥ 22.19 (transitive floor from `undici` 8.x `engines.node`; encoded in `agent/package.json` engines field S98 — host runs Node 24.x); `tsx` is the loader for all TypeScript at runtime (`tsx scripts/foo.ts`, `tsx --import worker.ts`, `node --import=tsx worker.ts`).
 - **Frontend:** Next 16, React 19, Tailwind 4, AI SDK 6.0 (`maxOutputTokens` param name).
 - **Backend:** Node.js daemon in `agent/`; Supabase (Postgres + Storage + Auth magic-link).
 - **Tests:** `node --test` (NOT vitest). Root `pnpm test` runs: (1) `bash agent/scripts/test-phase-b-storage-paths.sh` grep guard against legacy flat-layout storage paths, (2) strict `tsc --noEmit` on agent + frontend, (3) **the 264 unit tests** — `pnpm -C agent exec node --import=tsx --test "test/*.test.ts"` (247 agent) + the frontend `hidden-runs` suite via agent's tsx (17). Unit-test wiring added S96 (2026-06-05); pre-S96 the script ran only the grep guard + dual tsc (tests existed but never gated). NOTE: Node 22 `node --test` only auto-discovers `*.test.js`; passing an explicit glob arg (`"test/*.test.ts"`) is what makes it find the `.ts` tests.
