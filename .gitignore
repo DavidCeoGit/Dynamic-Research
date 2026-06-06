@@ -7,6 +7,13 @@
 **/build/
 *.tsbuildinfo
 
+# npm/yarn lockfiles — this project is pnpm-only (CLAUDE.md §2). Never commit
+# npm/yarn locks; they shadow pnpm-lock.yaml and risk non-deterministic installs.
+package-lock.json
+**/package-lock.json
+yarn.lock
+**/yarn.lock
+
 # env / secrets — BROAD: catch .env, .env.local, and archived/backup variants
 # (e.g. .env.bak-s82-pre-api-key-disable). Exempt only *.example templates.
 .env
@@ -18,6 +25,8 @@
 *.pem
 *.key
 credentials.*
+*-credentials.json
+service-account*.json
 **/agent-env*
 # MCP configs often carry server API keys
 .mcp.json

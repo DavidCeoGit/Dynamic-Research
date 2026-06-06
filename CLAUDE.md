@@ -112,7 +112,7 @@ Avoid `tasklist /FI` from Git Bash — `/FI` gets interpreted as a path and the 
 - **Filename convention:** **underscore between digit-prefix and name** (`20260523_phase_b_auth_rls_helpers.sql`). The CLI silently skips dash-named files (`20260523-phase-b.sql` → never applied). See `feedback_supabase_db_push_filename_underscore.md`.
 - **No `BEGIN`/`COMMIT` in migration files.** The CLI ExecBatch wraps each file + the schema_migrations history insert in an implicit transaction; explicit BEGIN/COMMIT breaks atomicity. See `feedback_supabase_db_push_no_begin_commit.md`.
 - **No `SET LOCAL` either** — fires WARNING 25P01 and has no effect inside the wrapper transaction.
-- **Multi-tenancy state:** Phase B-1 (auth helpers + RLS policy definitions + `audit_storage_writes`) LANDED. Phase B-2 (DROP DEFAULT + `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` on the 4 existing tenant tables) PENDING. Service-role bypasses RLS, so the worker daemon still functions normally pre-B-2.
+- **Multi-tenancy state:** Phase B-1 (auth helpers + RLS policy definitions + `audit_storage_writes`) LANDED. Phase B-2 migration (DROP DEFAULT + `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` + `CHECK NOT NULL` on the 4 tenant tables) is **AUTHORED** at `supabase/migrations/20260602_phase_b_2_rls_enable.sql` (S80) but **NOT YET `supabase db push`ed to prod** — deployment PENDING (coupled to the cross-project window). Service-role bypasses RLS, so the worker daemon still functions normally pre-B-2-deploy. Phase C (`SET NOT NULL` canonicalization) is tracked separately.
 
 ---
 
@@ -130,7 +130,7 @@ For uploads from the worker, use `uploadWithAudit()` from the same helper — wr
 
 - **All user-supplied data interpolated into LLM prompts MUST use the `untrusted_input` fence pattern** (`agent/lib/untrusted-input.ts` + `frontend/lib/untrusted-input.ts` pair). Closes prompt-injection at frontend AND agent layers. See `feedback_untrusted_input_fence_pattern.md`.
 - **Rate-limit on unauth Anthropic-call routes:** `frontend/app/api/queue/extract-context/route.ts` + `frontend/app/api/queue/generate-questions/route.ts` use `frontend/lib/rate-limit.ts` (per-IP token bucket, 20 tokens, refill 1/180s). `maxOutputTokens` caps further bound per-call cost.
-- **6 SSR-auth stopgap sites** exist across `frontend/app/api/runs/route.ts`, `state/route.ts`, `runs/[slug]/files/route.ts`, `manifest/route.ts`, `file/[filename]/route.ts`. Tagged `// STOPGAP(SSR-auth):` for grep. SSR auth refactor is S53+ work; do not extend the stopgap pattern.
+- **SSR-auth STOPGAP sites — RESOLVED (verified S96 audit, 2026-06-05).** The former 6 `// STOPGAP(SSR-auth):` sites have all been migrated to `getOrgContextDualPath()` (now used across 10 API routes incl. `runs/route.ts`, `state/route.ts`, `runs/[slug]/{files,manifest,file/[filename]}/route.ts`). **Zero** `STOPGAP(SSR-auth)` markers remain in `frontend/`. Do not reintroduce the pattern; derive org context via `getOrgContextDualPath()` before any DB/storage lookup.
 - **CVE posture:** 15/17 closed in S52 #2 sweep. Two postcss XSS findings deferred and cataloged at `Documentation/dependency-exceptions.md`.
 
 ---
@@ -164,5 +164,6 @@ At end of each session, update `dryrun_handoff.md` (status log) + `MEMORY.md` (i
 
 - Per-session bug log → `~/.claude/projects/.../memory/research_compare_learnings.md` + `dryrun_handoff.md` per-session sections.
 - ASC-specific (government-contracting intelligence) → `Projects/ASC-Government-Projects/Documentation/handoff.md`.
-- Per-job worker workdir conventions → `agent/AGENTS.md` (if present) + the per-job `.claude/sandbox-allowlist`.
+- Per-job worker workdir conventions → the per-job `.claude/sandbox-allowlist` (NOTE: `agent/AGENTS.md` referenced here pre-S96 does NOT exist; `frontend/AGENTS.md` is a Next.js boilerplate stub — neither is load-bearing).
+- MCP proxy subsystem (`agent/mcp-proxy/`: `index.ts` + `mcp-config.json` + `upstreams.json`) → design + policy at `Documentation/sprint3-mcp-proxy-design-gate.md` (L5 input-sig dedup, per-upstream `idempotent` flag).
 - Global rules (security, communication style, model preferences, end-session protocol) → `~/CLAUDE.md`.
