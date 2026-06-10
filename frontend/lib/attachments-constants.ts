@@ -52,6 +52,26 @@ export const ATTACHMENT_EXT_TO_MIME: Record<string, AttachmentContentType> = {
 export const ATTACHMENT_STORED_NAME_REGEX = /^[a-z0-9][a-z0-9._-]*\.(pdf|txt|md)$/;
 
 /**
+ * Windows reserved device basenames. Windows treats `con.pdf`, `con.tar.gz`,
+ * etc. as the CON device — the reservation keys on the segment BEFORE THE
+ * FIRST dot, regardless of extension, and a write to such a name fails at the
+ * OS layer. The worker downloads attachments to `<workdir>/sources/<storedName>`
+ * on a WINDOWS host (Phase 3), so a reserved storedName would break that run
+ * (Codex S103 grounded-adversarial MAJOR-2). MIRROR of conventions.json
+ * attachments.reserved_basenames — pair-edit both.
+ */
+export const ATTACHMENT_RESERVED_BASENAMES: ReadonlySet<string> = new Set([
+  "con", "prn", "aux", "nul",
+  "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+  "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+]);
+
+/** True if storedName's first dot-segment is a Windows reserved device name. */
+export function isReservedBasename(storedName: string): boolean {
+  return ATTACHMENT_RESERVED_BASENAMES.has(storedName.toLowerCase().split(".")[0]);
+}
+
+/**
  * Sanitize a user-supplied filename into a storage-safe storedName.
  *
  * - NFKC-normalize + lowercase
@@ -63,6 +83,9 @@ export const ATTACHMENT_STORED_NAME_REGEX = /^[a-z0-9][a-z0-9._-]*\.(pdf|txt|md)
  *   conventions.json and must never reach storage)
  * - empty base falls back to "file"
  * - base bounded to 100 chars so suffixed names stay well under 255
+ * - Windows reserved device basenames (con, nul, com1…) are remapped to
+ *   "file-<base>" so a legit upload literally named "con.pdf" still works
+ *   (renamed) rather than failing the OS write on the Windows worker
  * - optional collision suffix: "-1", "-2", … against `existingNames`
  *
  * CALLER CONTRACT for `existingNames` (S102 interim-review MINOR-4): many
@@ -95,6 +118,9 @@ export function sanitizeAttachmentName(
   if (!base) base = "file";
   base = base.slice(0, 100).replace(/[.\-_]+$/, "");
   if (!base) base = "file";
+  // Remap Windows reserved device names (keyed on the first dot-segment) so
+  // the OS write on the Phase-3 worker never hits CON/NUL/COM1/etc.
+  if (ATTACHMENT_RESERVED_BASENAMES.has(base.split(".")[0])) base = `file-${base}`;
 
   let candidate = `${base}${ext}`;
   let i = 1;

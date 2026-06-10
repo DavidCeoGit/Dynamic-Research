@@ -108,7 +108,13 @@
     "sources_subdir": "sources",
     "staging_ttl_hours": 24,
     "max_pages_read_per_pdf": 50,
-    "max_digest_words_per_file": 500
+    "max_digest_words_per_file": 500,
+    "_reserved_basenames_doc": "Windows reserved device basenames (keyed on the first dot-segment, any extension). The worker writes attachments to <workdir>/sources/<storedName> on a Windows host, so a storedName like 'con.pdf' would fail the OS write. Storage-path helpers reject these; the frontend sanitizer remaps them. Frontend mirror: ATTACHMENT_RESERVED_BASENAMES in attachments-constants.ts (pair-edit). Codex S103 grounded-adversarial MAJOR-2.",
+    "reserved_basenames": [
+      "con", "prn", "aux", "nul",
+      "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+      "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
+    ]
   },
   "supabase_storage": {
     "bucket": "research-projects",

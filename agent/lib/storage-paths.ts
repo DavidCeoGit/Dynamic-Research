@@ -51,6 +51,19 @@ const UUID_SHAPE_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 // the unsanitized originalName must throw here, not corrupt the namespace).
 const STORED_NAME_REGEX = new RegExp(ATTACHMENTS.stored_name_regex);
 
+// S102 — Windows reserved device basenames (con, nul, com1…). The worker
+// downloads attachments to <workdir>/sources/<storedName> on a WINDOWS host,
+// and Windows treats `con.pdf` (any extension) as the CON device — the write
+// fails at the OS layer. The staging/sources helpers reject any storedName
+// whose first dot-segment is reserved (the frontend sanitizer remaps them so
+// a legit upload still works). Canonical list: conventions.json
+// attachments.reserved_basenames; frontend mirror: ATTACHMENT_RESERVED_BASENAMES
+// in attachments-constants.ts (Codex S103 grounded-adversarial MAJOR-2).
+const RESERVED_BASENAMES = new Set(ATTACHMENTS.reserved_basenames);
+function isReservedBasename(file: string): boolean {
+  return RESERVED_BASENAMES.has(file.toLowerCase().split(".")[0]);
+}
+
 /**
  * Construct a tenant-scoped storage path.
  *
@@ -114,7 +127,12 @@ export function scopedStagingPath(
   if (!draftId || !UUID_SHAPE_REGEX.test(draftId)) {
     throw new Error(`scopedStagingPath: invalid draftId "${draftId}"`);
   }
-  if (file && (!STORED_NAME_REGEX.test(file) || file.includes(".."))) {
+  if (
+    file &&
+    (!STORED_NAME_REGEX.test(file) ||
+      file.includes("..") ||
+      isReservedBasename(file))
+  ) {
     throw new Error(`scopedStagingPath: invalid attachment file name "${file}"`);
   }
   const prefix = `${orgId}/${ATTACHMENTS.staging_prefix}/${draftId}`;
@@ -138,7 +156,12 @@ export function scopedSourcesPath(
   file: string,
 ): string {
   const base = scopedStoragePath(orgId, projectSlug);
-  if (!file || !STORED_NAME_REGEX.test(file) || file.includes("..")) {
+  if (
+    !file ||
+    !STORED_NAME_REGEX.test(file) ||
+    file.includes("..") ||
+    isReservedBasename(file)
+  ) {
     throw new Error(`scopedSourcesPath: invalid attachment file name "${file}"`);
   }
   return `${base}/${ATTACHMENTS.sources_subdir}/${file}`;

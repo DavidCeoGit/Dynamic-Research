@@ -60,6 +60,24 @@ export async function POST(request: Request) {
     );
   }
 
+  // S102 attachments — Phase 1 fail-CLOSED guard (Codex S103 grounded-adversarial
+  // MAJOR-1). The payload CONTRACT accepts `attachments`/`attachmentsDraftId` so
+  // the schema + types land ahead of the upload UI, but the submit→storage copy
+  // path does not exist until Phase 2. Without this guard a direct API client
+  // could POST a valid attachments array and receive a 201 while the bytes are
+  // silently dropped (the insert below omits the column, so the row gets the DB
+  // default '[]'). Reject instead of accept-and-drop. Phase 2 replaces this
+  // block with real staging→sources verify+copy.
+  if (
+    parsed.data.attachments.length > 0 ||
+    (parsed.data.attachmentsDraftId ?? null) !== null
+  ) {
+    return Response.json(
+      { error: "Attachments are not yet supported on submission" },
+      { status: 400, headers: { "X-Org-Source": "none" } },
+    );
+  }
+
   // §4.4 (C-C1): derive orgId FIRST, before any DB lookup. The parent
   // lookup in step 2 below depends on knowing the caller's org so it can
   // refuse cross-org parent references.

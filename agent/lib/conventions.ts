@@ -60,6 +60,13 @@ interface AttachmentsConfig {
   staging_ttl_hours: number;
   max_pages_read_per_pdf: number;
   max_digest_words_per_file: number;
+  /**
+   * Windows reserved device basenames (con, nul, com1…). Storage-path helpers
+   * reject any storedName whose first dot-segment matches; the frontend
+   * sanitizer remaps. Mirror: ATTACHMENT_RESERVED_BASENAMES in
+   * attachments-constants.ts (pair-edit). Codex S103 grounded MAJOR-2.
+   */
+  reserved_basenames: string[];
 }
 
 interface Conventions {

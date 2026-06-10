@@ -22,6 +22,7 @@ import {
   ATTACHMENT_SOURCES_SUBDIR,
   ATTACHMENT_STAGING_PREFIX,
   ATTACHMENT_STORED_NAME_REGEX,
+  isReservedBasename,
 } from "./attachments-constants";
 
 // Canonical UUID SHAPE (8-4-4-4-12 hex). v1 used a looser 36-hex-with-dashes
@@ -88,7 +89,12 @@ export function scopedStagingPath(
   }
   // S102 interim-review MINOR — enforce the full storedName contract (not
   // just / \ ..) so a mis-wire passing unsanitized originalName throws.
-  if (file && (!ATTACHMENT_STORED_NAME_REGEX.test(file) || file.includes(".."))) {
+  if (
+    file &&
+    (!ATTACHMENT_STORED_NAME_REGEX.test(file) ||
+      file.includes("..") ||
+      isReservedBasename(file))
+  ) {
     throw new Error(`scopedStagingPath: invalid attachment file name "${file}"`);
   }
   const prefix = `${orgId}/${ATTACHMENT_STAGING_PREFIX}/${draftId}`;
@@ -110,7 +116,12 @@ export function scopedSourcesPath(
   file: string,
 ): string {
   const base = scopedStoragePath(orgId, projectSlug);
-  if (!file || !ATTACHMENT_STORED_NAME_REGEX.test(file) || file.includes("..")) {
+  if (
+    !file ||
+    !ATTACHMENT_STORED_NAME_REGEX.test(file) ||
+    file.includes("..") ||
+    isReservedBasename(file)
+  ) {
     throw new Error(`scopedSourcesPath: invalid attachment file name "${file}"`);
   }
   return `${base}/${ATTACHMENT_SOURCES_SUBDIR}/${file}`;

@@ -10,6 +10,7 @@ import {
   ATTACHMENT_MAX_FILE_BYTES,
   ATTACHMENT_MAX_TOTAL_BYTES,
   ATTACHMENT_STORED_NAME_REGEX,
+  isReservedBasename,
 } from "./attachments-constants";
 
 // ── Slug generation ─────────────────────────────────────────────────
@@ -131,7 +132,12 @@ const attachmentMetaBaseSchema = z.object({
     .min(1)
     .max(160)
     .regex(ATTACHMENT_STORED_NAME_REGEX, "invalid stored filename")
-    .refine((s) => !s.includes(".."), { message: "stored filename must not contain '..'" }),
+    .refine((s) => !s.includes(".."), { message: "stored filename must not contain '..'" })
+    // Codex S103 grounded-adversarial MAJOR-2 — a sanitized storedName never
+    // hits a Windows reserved device name (sanitizeAttachmentName remaps), so
+    // a reserved one here means tampering or a non-sanitizer path; reject it
+    // before it can reach the Phase-3 Windows worker's sources/ write.
+    .refine((s) => !isReservedBasename(s), { message: "stored filename uses a reserved device name" }),
   sizeBytes: z.number().int().min(1).max(ATTACHMENT_MAX_FILE_BYTES),
   // Gemini-grounded interim MINOR-2 — reference the canonical list so a
   // future type addition cannot drift between constants and validation.

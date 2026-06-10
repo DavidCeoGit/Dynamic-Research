@@ -76,6 +76,19 @@ test("sanitize: collision suffixing against existing names", () => {
   assert.equal(sanitizeAttachmentName("Report.pdf", existing), "report-2.pdf");
 });
 
+test("sanitize: Windows reserved device names are remapped, not failed (Codex S103 MAJOR-2)", () => {
+  // The OS write on the Phase-3 Windows worker would fail on these; the
+  // sanitizer remaps so a legit upload literally named "con.pdf" still works.
+  assert.equal(sanitizeAttachmentName("CON.PDF"), "file-con.pdf");
+  assert.equal(sanitizeAttachmentName("nul.txt"), "file-nul.txt");
+  assert.equal(sanitizeAttachmentName("com1.md"), "file-com1.md");
+  assert.equal(sanitizeAttachmentName("con.tar.pdf"), "file-con.tar.pdf");
+  // remapped output is itself non-reserved and contract-valid
+  assert.match(sanitizeAttachmentName("CON.PDF"), ATTACHMENT_STORED_NAME_REGEX);
+  // not reserved: merely starts with a reserved string
+  assert.equal(sanitizeAttachmentName("connection.pdf"), "connection.pdf");
+});
+
 test("sanitize: output always satisfies the storedName contract", () => {
   const inputs = [
     "Report.PDF",
@@ -132,6 +145,19 @@ test("schema: storedName shape enforced (case, leading char, traversal)", () => 
   assert.throws(() => attachmentMetaSchema.parse({ ...VALID_META, storedName: "../x.pdf" }));
   assert.throws(() => attachmentMetaSchema.parse({ ...VALID_META, storedName: "a..b.pdf" }));
   assert.throws(() => attachmentMetaSchema.parse({ ...VALID_META, storedName: "x.exe" }));
+});
+
+test("schema: reserved device storedNames rejected (Codex S103 MAJOR-2)", () => {
+  // A sanitized storedName is never reserved (sanitizer remaps), so a reserved
+  // one reaching zod means tampering or a non-sanitizer path — reject it.
+  assert.throws(() => attachmentMetaSchema.parse({ ...VALID_META, storedName: "con.pdf" }));
+  assert.throws(() => attachmentMetaSchema.parse({ ...VALID_META, storedName: "nul.pdf" }));
+  assert.throws(() => attachmentMetaSchema.parse({ ...VALID_META, storedName: "com9.pdf" }));
+  // non-reserved lookalike still passes
+  assert.equal(
+    attachmentMetaSchema.parse({ ...VALID_META, storedName: "connection.pdf" }).storedName,
+    "connection.pdf",
+  );
 });
 
 test("schema: contentType must match extension (interim MAJOR-1)", () => {
@@ -288,4 +314,16 @@ test("mirror sources: happy path + rejections", () => {
   assert.throws(() => scopedSourcesPath(ORG, SLUG, "a/b.pdf"));
   assert.throws(() => scopedSourcesPath(ORG, "a/b", "report.pdf"));
   assert.throws(() => scopedSourcesPath("not-a-uuid", SLUG, "report.pdf"));
+});
+
+test("mirror helpers: reject Windows reserved device basenames (Codex S103 MAJOR-2)", () => {
+  assert.throws(() => scopedStagingPath(ORG, DRAFT, "con.pdf"));
+  assert.throws(() => scopedStagingPath(ORG, DRAFT, "com1.md"));
+  assert.throws(() => scopedSourcesPath(ORG, SLUG, "nul.txt"));
+  assert.throws(() => scopedSourcesPath(ORG, SLUG, "con.tar.pdf"));
+  // non-reserved lookalike passes through both helpers
+  assert.equal(
+    scopedStagingPath(ORG, DRAFT, "connection.pdf"),
+    `${ORG}/uploads/${DRAFT}/connection.pdf`,
+  );
 });

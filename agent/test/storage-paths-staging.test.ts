@@ -65,6 +65,19 @@ test("staging: enforces the full storedName contract on file (S102 r3)", () => {
   assert.throws(() => scopedStagingPath(ORG, DRAFT, "a\nb.pdf"));
 });
 
+test("staging: rejects Windows reserved device basenames (Codex S103 MAJOR-2)", () => {
+  assert.throws(() => scopedStagingPath(ORG, DRAFT, "con.pdf"));
+  assert.throws(() => scopedStagingPath(ORG, DRAFT, "nul.txt"));
+  assert.throws(() => scopedStagingPath(ORG, DRAFT, "com1.md"));
+  assert.throws(() => scopedStagingPath(ORG, DRAFT, "lpt9.pdf"));
+  assert.throws(() => scopedStagingPath(ORG, DRAFT, "con.tar.pdf")); // reservation keys on first dot-segment
+  // a name merely STARTING with a reserved string is NOT reserved
+  assert.equal(
+    scopedStagingPath(ORG, DRAFT, "connection.pdf"),
+    `${ORG}/uploads/${DRAFT}/connection.pdf`,
+  );
+});
+
 // ── scopedSourcesPath ───────────────────────────────────────────────
 
 test("sources: happy path", () => {
@@ -90,6 +103,16 @@ test("sources: enforces the full storedName contract on file (S102 r3)", () => {
   assert.throws(() => scopedSourcesPath(ORG, SLUG, "UPPER.PDF"));
   assert.throws(() => scopedSourcesPath(ORG, SLUG, "evil.exe"));
   assert.throws(() => scopedSourcesPath(ORG, SLUG, "a\u0000b.pdf"));
+});
+
+test("sources: rejects Windows reserved device basenames (Codex S103 MAJOR-2)", () => {
+  assert.throws(() => scopedSourcesPath(ORG, SLUG, "con.pdf"));
+  assert.throws(() => scopedSourcesPath(ORG, SLUG, "nul.md"));
+  assert.throws(() => scopedSourcesPath(ORG, SLUG, "com3.txt"));
+  assert.equal(
+    scopedSourcesPath(ORG, SLUG, "connection.pdf"),
+    `${ORG}/${SLUG}/sources/connection.pdf`,
+  );
 });
 
 test("sources: rejects invalid slug (delegated to scopedStoragePath)", () => {
