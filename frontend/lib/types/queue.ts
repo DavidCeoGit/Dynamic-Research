@@ -70,6 +70,48 @@ export interface Customizations {
   studio: Record<string, Record<string, unknown>>;
 }
 
+// ── Attachments (S102 file-upload feature) ──────────────────────────
+
+export type AttachmentContentType =
+  | "application/pdf"
+  | "text/plain"
+  | "text/markdown";
+
+/**
+ * Metadata for one user-attached source file (PDF/TXT/MD). Stored in the
+ * research_queue.attachments jsonb column (migration
+ * 20260610_research_queue_attachments.sql); the storage object lives at
+ * scopedSourcesPath(orgId, slug, storedName) once the run is submitted.
+ *
+ * originalName is DISPLAY ONLY and must never be used in a storage path.
+ * storedName comes from sanitizeAttachmentName() (lib/attachments-constants)
+ * and is re-validated by attachmentMetaSchema at submit. Mirrors
+ * agent/types.ts.
+ */
+export interface AttachmentMeta {
+  originalName: string;
+  storedName: string;
+  sizeBytes: number;
+  /* uploadedAt below must be UTC "Z"-form ISO-8601 (new Date().toISOString());
+     zod .datetime() rejects timezone offsets. */
+  contentType: AttachmentContentType;
+  uploadedAt: string;
+}
+
+/**
+ * Where a payload attachment's bytes currently live, so the submit route
+ * knows where to copy FROM:
+ *   "staging" — freshly uploaded this draft → <orgId>/uploads/<draftId>/
+ *   "parent"  — carried over by Clone & Edit → <orgId>/<parentSlug>/sources/
+ * Payload-only; the DB row stores plain AttachmentMeta (origin stripped
+ * after the submit-time copy resolves it).
+ */
+export type AttachmentOrigin = "staging" | "parent";
+
+export interface AttachmentPayloadItem extends AttachmentMeta {
+  origin: AttachmentOrigin;
+}
+
 // ── Form submission payload (POST /api/queue) ───────────────────────
 
 export interface ResearchJobPayload {
@@ -80,6 +122,18 @@ export interface ResearchJobPayload {
   selectedProducts: SelectedProducts;
   customizations: Customizations;
   notifyEmail?: string;
+  /**
+   * S102 file-upload. Attachment refs the submit route verifies + copies
+   * into the new run's sources/ folder before inserting the row. Optional
+   * so pre-S102 clients keep working; defaulted to [] by zod.
+   */
+  attachments?: AttachmentPayloadItem[];
+  /**
+   * S102 — the client-generated draft UUID locating staged uploads at
+   * <orgId>/uploads/<draftId>/. Required by the submit route whenever any
+   * attachment has origin "staging".
+   */
+  attachmentsDraftId?: string | null;
 }
 
 // ── Queue row shape (GET /api/queue/[id]) ───────────────────────────
@@ -135,6 +189,13 @@ export interface ResearchJob {
   plan_review_attempts?: number;
   plan_review_next_attempt_at?: string | null;
   plan_review_error?: string | null;
+  /**
+   * S102 file-upload (migration 20260610_research_queue_attachments.sql).
+   * Optional so rows from before the migration deserialize cleanly. Plain
+   * AttachmentMeta — the payload-level `origin` field is resolved (and
+   * stripped) by the submit-time copy.
+   */
+  attachments?: AttachmentMeta[];
 }
 
 // ── Form step constants & component interfaces ─────────────────────

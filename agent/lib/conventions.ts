@@ -42,12 +42,33 @@ interface SkipFiles {
   extensions?: string[];
 }
 
+/**
+ * v3 (S102) user file-upload feature. Caps + path-segment names for
+ * user-attached source files. Pair-edited frontend mirror:
+ * frontend/lib/attachments-constants.ts.
+ */
+interface AttachmentsConfig {
+  allowed_extensions: string[];
+  allowed_mime_types: string[];
+  /** Pattern every storedName must match; compiled by storage-paths.ts. */
+  stored_name_regex: string;
+  max_file_bytes: number;
+  max_total_bytes: number;
+  max_files: number;
+  staging_prefix: string;
+  sources_subdir: string;
+  staging_ttl_hours: number;
+  max_pages_read_per_pdf: number;
+  max_digest_words_per_file: number;
+}
+
 interface Conventions {
   _version: number;
   _last_updated: string;
   slugify: SlugifyConfig;
   filename_patterns: FilenamePatterns;
   skip_files: SkipFiles;
+  attachments: AttachmentsConfig;
   supabase_storage: { bucket: string };
 }
 
@@ -63,6 +84,14 @@ export const BUCKET = data.supabase_storage.bucket;
 export const SKIP_FILES = new Set(data.skip_files.exact);
 export const SKIP_PREFIXES = data.skip_files.prefixes;
 export const SKIP_EXTENSIONS = data.skip_files.extensions ?? [];
+
+/**
+ * S102 file-upload caps + path segments. Consumed by agent/lib/storage-paths.ts
+ * (staging/sources path helpers), the executor's attachment download, and the
+ * staging TTL sweep. conventions.json is the canonical source; the frontend
+ * duplicates these values in frontend/lib/attachments-constants.ts (pair-edit).
+ */
+export const ATTACHMENTS = data.attachments;
 
 export const RESEARCH_ROLES = new Set(data.filename_patterns.research.roles);
 export const RESEARCH_DOCX_ROLES = new Set(data.filename_patterns.research_docx_companion.roles);

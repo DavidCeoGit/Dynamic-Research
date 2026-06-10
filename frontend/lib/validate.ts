@@ -3,6 +3,14 @@
  */
 
 import { z } from "zod";
+import {
+  ATTACHMENT_ALLOWED_MIME_TYPES,
+  ATTACHMENT_EXT_TO_MIME,
+  ATTACHMENT_MAX_FILES,
+  ATTACHMENT_MAX_FILE_BYTES,
+  ATTACHMENT_MAX_TOTAL_BYTES,
+  ATTACHMENT_STORED_NAME_REGEX,
+} from "./attachments-constants";
 
 // ── Slug generation ─────────────────────────────────────────────────
 
@@ -105,6 +113,81 @@ export const customizationsSchema = z.object({
   studio: z.record(z.string(), z.record(z.string(), z.unknown())).optional().default({}),
 });
 
+// ── Attachments (S102 file-upload feature) ──────────────────────────
+
+/**
+ * One user-attached source file's metadata as stored on the queue row.
+ * storedName must match sanitizeAttachmentName() output exactly — lowercase,
+ * safe charset, allowed extension, no leading dot (a leading "." is a
+ * skip-prefix in conventions.json), no ".." (charset admits dots, so the
+ * refine closes the consecutive-dots hole the regex leaves open). The
+ * storage-path helpers re-reject traversal at every path construction
+ * (defense in depth — a zod bypass still cannot build a traversal path).
+ */
+const attachmentMetaBaseSchema = z.object({
+  originalName: z.string().min(1).max(255),
+  storedName: z
+    .string()
+    .min(1)
+    .max(160)
+    .regex(ATTACHMENT_STORED_NAME_REGEX, "invalid stored filename")
+    .refine((s) => !s.includes(".."), { message: "stored filename must not contain '..'" }),
+  sizeBytes: z.number().int().min(1).max(ATTACHMENT_MAX_FILE_BYTES),
+  // Gemini-grounded interim MINOR-2 — reference the canonical list so a
+  // future type addition cannot drift between constants and validation.
+  contentType: z.enum(ATTACHMENT_ALLOWED_MIME_TYPES),
+  // NOTE: zod .datetime() accepts UTC "Z"-form only (offsets rejected) —
+  // clients must emit new Date().toISOString().
+  uploadedAt: z.string().datetime(),
+});
+
+// S102 interim-review MAJOR-1 — extension and MIME type are both
+// client-supplied; without this cross-check a .md payload could be stored
+// and later served as application/pdf (content-type confusion at Phase 2
+// upload + Phase 3 worker handling). ATTACHMENT_EXT_TO_MIME is canonical.
+// Applied to BOTH the meta schema and the payload variant (the base object
+// stays refine-free so .extend() remains available).
+const extMatchesContentType = {
+  check: (m: { storedName: string; contentType: string }) =>
+    ATTACHMENT_EXT_TO_MIME[m.storedName.slice(m.storedName.lastIndexOf("."))] ===
+    m.contentType,
+  opts: { message: "contentType must match the stored filename's extension", path: ["contentType"] },
+};
+
+export const attachmentMetaSchema = attachmentMetaBaseSchema.refine(
+  extMatchesContentType.check,
+  extMatchesContentType.opts,
+);
+
+/**
+ * Payload variant: adds `origin` so the submit route knows where to copy
+ * bytes FROM ("staging" = this draft's uploads/ area; "parent" = a Clone &
+ * Edit carry-over living under the parent run's sources/). origin is
+ * stripped before the row is inserted — the DB stores plain AttachmentMeta.
+ */
+export const attachmentPayloadItemSchema = attachmentMetaBaseSchema
+  .extend({
+    origin: z.enum(["staging", "parent"]),
+  })
+  .refine(extMatchesContentType.check, extMatchesContentType.opts);
+
+/**
+ * The attachments array as submitted: bounded count, bounded total bytes,
+ * and unique storedNames (duplicates would collide at the submit-time copy
+ * destination <orgId>/<slug>/sources/<storedName>).
+ */
+export const attachmentsArraySchema = z
+  .array(attachmentPayloadItemSchema)
+  .max(ATTACHMENT_MAX_FILES, `at most ${ATTACHMENT_MAX_FILES} attachments`)
+  .refine(
+    (arr) => arr.reduce((sum, a) => sum + a.sizeBytes, 0) <= ATTACHMENT_MAX_TOTAL_BYTES,
+    { message: "total attachment size exceeds the limit" },
+  )
+  .refine(
+    (arr) => new Set(arr.map((a) => a.storedName)).size === arr.length,
+    { message: "duplicate stored filenames" },
+  );
+
 export const researchJobPayloadSchema = z.object({
   topic: z.string().min(10, "Topic must be at least 10 characters").max(10000),
   userContext: userContextSchema.optional().default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
@@ -124,6 +207,38 @@ export const researchJobPayloadSchema = z.object({
   // against the parent notebook. Only meaningful when parentSlug is present;
   // omitted/"full" = normal pipeline. The agent reads job.pipeline_mode.
   pipelineMode: z.enum(["full", "studio_only"]).optional(),
+  // S102 file-upload. Defaulted [] so pre-S102 clients keep working. The
+  // submit route additionally requires a session-sourced org whenever
+  // non-empty (the cross-field origin rules are enforced right here).
+  attachments: attachmentsArraySchema.optional().default([]),
+  attachmentsDraftId: z.string().uuid().nullable().optional(),
+}).superRefine((data, ctx) => {
+  // S102 Gemini MERGE MINOR-1 — make the cross-field contract self-enforcing
+  // rather than delegating to the Phase 2 route: staged attachments are
+  // unlocatable without the draft id (their bytes live at
+  // <orgId>/uploads/<attachmentsDraftId>/), and parent carry-overs are
+  // unlocatable without the parent run's slug. A payload violating either
+  // pairing is malformed at the schema level, not a route concern.
+  if (
+    data.attachments.some((a) => a.origin === "staging") &&
+    !data.attachmentsDraftId
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["attachmentsDraftId"],
+      message: 'attachmentsDraftId is required when any attachment has origin "staging"',
+    });
+  }
+  if (
+    data.attachments.some((a) => a.origin === "parent") &&
+    !data.parentSlug
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["parentSlug"],
+      message: 'parentSlug is required when any attachment has origin "parent"',
+    });
+  }
 });
 
 // Path B (S29): structured extraction of dimensions the topic already covers.
@@ -244,6 +359,12 @@ export const formDataSchema = z.object({
   extractedContext: extractedContextSchema.nullable().default(null),
   // CE-3 — only used when cloning. Hooks/StepReview gate the radio on cloneSlug.
   pipelineMode: z.enum(["full", "studio_only"]).default("full"),
+  // S102 file-upload. Items carry origin ("staging" for fresh uploads,
+  // "parent" for Clone & Edit carry-overs). Files upload at select-time —
+  // File objects can't survive the sessionStorage draft persistence, but
+  // these metadata refs can.
+  attachments: attachmentsArraySchema.default([]),
+  attachmentsDraftId: z.string().uuid().nullable().default(null),
 });
 
 export type FormData = z.infer<typeof formDataSchema>;
@@ -260,4 +381,6 @@ export const FORM_DEFAULT_VALUES: FormData = {
   dynamicAnswers: {},
   extractedContext: null,
   pipelineMode: "full",
+  attachments: [],
+  attachmentsDraftId: null,
 };

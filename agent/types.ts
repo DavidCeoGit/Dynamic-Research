@@ -71,6 +71,28 @@ export interface Customizations {
   studio: Record<string, Record<string, unknown>>;
 }
 
+/**
+ * S102 file-upload feature — metadata for one user-attached source file
+ * (PDF/TXT/MD). The storage object lives at
+ * scopedSourcesPath(organization_id, topic_slug, storedName) in the
+ * research-projects bucket; the executor downloads it into
+ * <workdir>/sources/ before spawning the pipeline.
+ *
+ * originalName is DISPLAY ONLY (fenced before reaching any prompt) and must
+ * never be used in a storage path. storedName is produced by the frontend's
+ * sanitizeAttachmentName() and re-validated by zod at submit + the path
+ * helpers at every construction. Mirrors frontend lib/types/queue.ts.
+ */
+export interface AttachmentMeta {
+  originalName: string;
+  storedName: string;
+  sizeBytes: number;
+  /* uploadedAt below must be UTC "Z"-form ISO-8601 (new Date().toISOString());
+     zod .datetime() rejects timezone offsets. */
+  contentType: "application/pdf" | "text/plain" | "text/markdown";
+  uploadedAt: string;
+}
+
 export interface ResearchJob {
   id: string;
   created_at: string;
@@ -126,6 +148,13 @@ export interface ResearchJob {
   plan_review_attempts?: number;
   plan_review_next_attempt_at?: string | null;
   plan_review_error?: string | null;
+  /**
+   * S102 file-upload (migration 20260610_research_queue_attachments.sql).
+   * Optional so rows from before the migration deserialize cleanly. The
+   * executor treats undefined/empty as "no attachments" and skips the
+   * download step entirely (also skipped on the studio_only path).
+   */
+  attachments?: AttachmentMeta[];
 }
 
 /**

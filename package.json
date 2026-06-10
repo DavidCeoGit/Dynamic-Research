@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "bash agent/scripts/test-phase-b-storage-paths.sh && pnpm -C agent exec tsc --noEmit && pnpm -C frontend exec tsc --noEmit && pnpm -C agent exec node --import=tsx --test \"test/*.test.ts\" && pnpm -C agent exec node --import=tsx --test \"../frontend/lib/__tests__/hidden-runs.test.ts\""
+    "test": "bash agent/scripts/test-phase-b-storage-paths.sh && pnpm -C agent exec tsc --noEmit && pnpm -C frontend exec tsc --noEmit && pnpm -C agent exec node --import=tsx --test \"test/*.test.ts\" && pnpm -C agent exec node --import=tsx --test \"../frontend/lib/__tests__/hidden-runs.test.ts\" \"../frontend/lib/__tests__/attachments.test.ts\""
   },
   "keywords": [],
   "author": "",

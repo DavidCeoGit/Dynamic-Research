@@ -1,8 +1,9 @@
 {
   "_doc": "Canonical conventions for Dynamic Research deliverables. Loaded by both agent/lib/conventions.ts and agent/lib/conventions.py — DO NOT duplicate values in language wrappers. Update this file, then regenerate any cached state in dependent scripts.",
-  "_version": 2,
-  "_last_updated": "2026-05-09 (S30)",
+  "_version": 3,
+  "_last_updated": "2026-06-10 (S102)",
   "_changelog": {
+    "v3 (S102)": "Added 'attachments' block for the user file-upload feature: allowed extensions/MIME types (PDF/TXT/MD only), per-file/total size caps, max file count, staging prefix + sources subdir names, staging TTL, and the orchestrator's PDF page-read + per-file digest caps. Frontend mirror: frontend/lib/attachments-constants.ts (pair-edit). NOTE: conventions.json changes require a worker daemon restart (project CLAUDE.md §7).",
     "v2 (S30)": "Added 'nlm-' to skip prefixes (was missing — only 'nlm_' was in v1, but actual NLM-discovered helper filenames use hyphen); added 'context' to research roles (was rejected as 'unknown' by lint script during S29 cleanup); added 'extensions' skip rule with '.py' (helper Python scripts in workdir must not upload to Supabase); documented state.json upload policy explicitly.",
     "v1 (S28)": "Initial conventions module: slugify rules, filename patterns (studio + research + research_docx_companion), skip files, supabase storage bucket, NLM workflow constants, Windows quirks."
   },
@@ -94,6 +95,20 @@
     "extensions": [
       ".py"
     ]
+  },
+  "attachments": {
+    "_doc": "v3 (S102) user file-upload feature. Users attach source files at submission; files stage at <orgId>/{staging_prefix}/<draftId>/<storedName>, are copied to <orgId>/<topic_slug>/{sources_subdir}/<storedName> at submit, and the worker downloads them into <workdir>/{sources_subdir}/ for the pipeline (NLM sources + bounded digests for the Perplexity/Claude legs). Caps protect the $15/job cost guard: the orchestrator reads at most max_pages_read_per_pdf pages per PDF and digests each file to max_digest_words_per_file words — raw file text never inlines into prompts. The staging_prefix can never collide with a topic_slug because generateSlug() always appends '-<8 hex>'. Frontend mirror of these values: frontend/lib/attachments-constants.ts (pair-edit both). Changing this block requires a worker daemon restart.",
+    "allowed_extensions": [".pdf", ".txt", ".md"],
+    "allowed_mime_types": ["application/pdf", "text/plain", "text/markdown"],
+    "stored_name_regex": "^[a-z0-9][a-z0-9._-]*\\.(pdf|txt|md)$",
+    "max_file_bytes": 15728640,
+    "max_total_bytes": 41943040,
+    "max_files": 5,
+    "staging_prefix": "uploads",
+    "sources_subdir": "sources",
+    "staging_ttl_hours": 24,
+    "max_pages_read_per_pdf": 50,
+    "max_digest_words_per_file": 500
   },
   "supabase_storage": {
     "bucket": "research-projects",

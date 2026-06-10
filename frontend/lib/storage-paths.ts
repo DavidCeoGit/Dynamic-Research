@@ -1,9 +1,12 @@
 /**
  * Phase B / S50 — frontend mirror of agent/lib/storage-paths.ts.
+ * S102 — staging + sources path helpers for the file-upload feature.
  *
- * The frontend is read-only against the research-projects bucket, so only
- * the path-construction helper is needed here. Uploads (and therefore the
- * audit hook) live entirely in `agent/`.
+ * Pre-S102 the frontend was read-only against the research-projects bucket,
+ * so only the path-construction helpers live here. The S102 attachment flow
+ * adds frontend-initiated writes (signed-URL staging + submit-time copy), but
+ * the audit hook stays a small local helper in lib/storage.ts — the agent's
+ * uploadWithAudit wrapper is not mirrored.
  *
  * Kept as a local mirror per v3 plan §2.7 file table ("Use scopedStoragePath()
  * helper from agent/lib (or a frontend-local mirror)") — agent/ and frontend/
@@ -15,17 +18,25 @@
  * both files when changing the path scheme or the validation rules.
  */
 
-// Strict canonical UUID v4 layout (8-4-4-4-12 hex). v1 used a looser
-// 36-hex-with-dashes match (no layout enforcement) — accepted pathological
-// strings like 36 consecutive hyphens (S50 Gemini MERGE M1).
-const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import {
+  ATTACHMENT_SOURCES_SUBDIR,
+  ATTACHMENT_STAGING_PREFIX,
+  ATTACHMENT_STORED_NAME_REGEX,
+} from "./attachments-constants";
+
+// Canonical UUID SHAPE (8-4-4-4-12 hex). v1 used a looser 36-hex-with-dashes
+// match (no layout enforcement) — accepted pathological strings like 36
+// consecutive hyphens (S50 Gemini MERGE M1). NOTE: shape only — version/
+// variant nibbles NOT pinned to v4 (S102 interim-review MINOR; renamed from
+// UUID_V4_REGEX whose name overclaimed). Pair-edited with agent/lib.
+const UUID_SHAPE_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function scopedStoragePath(
   orgId: string,
   projectSlug: string,
   file?: string,
 ): string {
-  if (!orgId || !UUID_V4_REGEX.test(orgId)) {
+  if (!orgId || !UUID_SHAPE_REGEX.test(orgId)) {
     throw new Error(`scopedStoragePath: invalid orgId "${orgId}"`);
   }
   // Slug validation symmetric with filename validation below: reject "/",
@@ -49,4 +60,58 @@ export function scopedStoragePath(
     throw new Error(`scopedStoragePath: invalid file name components "${file}"`);
   }
   return file ? `${orgId}/${projectSlug}/${file}` : `${orgId}/${projectSlug}`;
+}
+
+// ── S102 attachment path helpers (pair-edited with agent/lib) ───────
+
+/**
+ * Construct a tenant-scoped STAGING path for a not-yet-submitted attachment.
+ *
+ * Layout: `<orgId>/uploads/<draftId>` or `<orgId>/uploads/<draftId>/<file>`.
+ * "uploads" can never collide with a real topic_slug because generateSlug()
+ * always appends "-<8 hex>". draftId is a client-generated UUID v4; the orgId
+ * prefix means a caller can only ever stage into (and copy out of) its own
+ * org. Staged objects older than ATTACHMENT_STAGING_TTL_HOURS are garbage by
+ * construction — submit copies out of staging synchronously BEFORE inserting
+ * the queue row.
+ */
+export function scopedStagingPath(
+  orgId: string,
+  draftId: string,
+  file?: string,
+): string {
+  if (!orgId || !UUID_SHAPE_REGEX.test(orgId)) {
+    throw new Error(`scopedStagingPath: invalid orgId "${orgId}"`);
+  }
+  if (!draftId || !UUID_SHAPE_REGEX.test(draftId)) {
+    throw new Error(`scopedStagingPath: invalid draftId "${draftId}"`);
+  }
+  // S102 interim-review MINOR — enforce the full storedName contract (not
+  // just / \ ..) so a mis-wire passing unsanitized originalName throws.
+  if (file && (!ATTACHMENT_STORED_NAME_REGEX.test(file) || file.includes(".."))) {
+    throw new Error(`scopedStagingPath: invalid attachment file name "${file}"`);
+  }
+  const prefix = `${orgId}/${ATTACHMENT_STAGING_PREFIX}/${draftId}`;
+  return file ? `${prefix}/${file}` : prefix;
+}
+
+/**
+ * Construct the tenant-scoped SOURCES path for a submitted run's attachment.
+ *
+ * Layout: `<orgId>/<slug>/sources/<file>`. The sources/ subdir is invisible
+ * to the gallery (lib/storage.ts listFiles filters sub-folders), so
+ * attachments never pollute the run's deliverables list. Org/slug validation
+ * is delegated to scopedStoragePath; `file` is REQUIRED (a bare sources/ dir
+ * is never a valid storage object target).
+ */
+export function scopedSourcesPath(
+  orgId: string,
+  projectSlug: string,
+  file: string,
+): string {
+  const base = scopedStoragePath(orgId, projectSlug);
+  if (!file || !ATTACHMENT_STORED_NAME_REGEX.test(file) || file.includes("..")) {
+    throw new Error(`scopedSourcesPath: invalid attachment file name "${file}"`);
+  }
+  return `${base}/${ATTACHMENT_SOURCES_SUBDIR}/${file}`;
 }
