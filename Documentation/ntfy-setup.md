@@ -158,7 +158,11 @@ No app redeploy needed.
 
 ## What's promoted where
 
-- `20260610_phase_a_notifications_ntfy_webhook.sql` → `supabase/migrations/`
+- `20260610120000_phase_a_notifications_ntfy_webhook.sql` → `supabase/migrations/`
+  (renamed from `20260610_…` in S104 — its original date-only version token
+  `20260610` collided with the already-applied attachments migration, which
+  `supabase db push` silently skips; the 14-digit `20260610120000` version
+  makes it apply. Do NOT rename it back.)
 - `NTFY-SETUP.md` → `Documentation/ntfy-setup.md`
 
 The topic name itself never enters git — it's stored only in Vault.
