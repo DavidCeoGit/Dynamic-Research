@@ -110,34 +110,59 @@ const EXT_TO_MIME = new Map<string, string>(
   ]),
 );
 
-/** Returns a skip reason, or null if the meta is well-formed. */
-export function validateAttachmentMeta(meta: AttachmentMeta): string | null {
-  if (typeof meta.storedName !== "string" || meta.storedName.length === 0) {
+/**
+ * Returns a skip reason, or null if the meta is well-formed. Takes `unknown`
+ * because the DB CHECK only guarantees the COLUMN is a JSON array — an
+ * element can be null/string/number (audit 2026-06-11 A6/A20), and a forged
+ * `[null, {...}]` row must produce a skip reason here, not a TypeError that
+ * escapes downloadAttachments' never-throws contract and hard-fails the job.
+ */
+export function validateAttachmentMeta(meta: unknown): string | null {
+  if (typeof meta !== "object" || meta === null || Array.isArray(meta)) {
+    return "malformed meta: element is not an object";
+  }
+  const m = meta as Partial<Record<keyof AttachmentMeta, unknown>>;
+  if (typeof m.storedName !== "string" || m.storedName.length === 0) {
     return "malformed meta: storedName missing";
   }
   if (
-    typeof meta.originalName !== "string" ||
-    meta.originalName.length === 0 ||
-    meta.originalName.length > 255
+    typeof m.originalName !== "string" ||
+    m.originalName.length === 0 ||
+    m.originalName.length > 255
   ) {
     return "malformed meta: originalName missing or over 255 chars";
   }
   if (
-    typeof meta.sizeBytes !== "number" ||
-    !Number.isSafeInteger(meta.sizeBytes) ||
-    meta.sizeBytes <= 0
+    typeof m.sizeBytes !== "number" ||
+    !Number.isSafeInteger(m.sizeBytes) ||
+    m.sizeBytes <= 0
   ) {
     return "malformed meta: sizeBytes must be a positive integer";
   }
-  if (!ATTACHMENTS.allowed_mime_types.includes(meta.contentType)) {
-    return `malformed meta: contentType "${meta.contentType}" not allowed`;
+  if (
+    typeof m.contentType !== "string" ||
+    !ATTACHMENTS.allowed_mime_types.includes(m.contentType)
+  ) {
+    return `malformed meta: contentType "${String(m.contentType)}" not allowed`;
   }
-  const dot = meta.storedName.lastIndexOf(".");
-  const ext = dot >= 0 ? meta.storedName.slice(dot).toLowerCase() : "";
-  if (EXT_TO_MIME.get(ext) !== meta.contentType) {
-    return `malformed meta: extension "${ext}" does not match contentType "${meta.contentType}"`;
+  const dot = m.storedName.lastIndexOf(".");
+  const ext = dot >= 0 ? m.storedName.slice(dot).toLowerCase() : "";
+  if (EXT_TO_MIME.get(ext) !== m.contentType) {
+    return `malformed meta: extension "${ext}" does not match contentType "${m.contentType}"`;
   }
   return null;
+}
+
+/**
+ * Narrow a raw attachments-array element to an object-shaped meta, or null.
+ * Skip records carry the original meta for the manifest/log trail, but a
+ * non-object element (audit A6/A20) has nothing to carry — consumers of
+ * SkippedAttachment.meta must guard for null instead of dereferencing.
+ */
+export function asMetaOrNull(meta: unknown): AttachmentMeta | null {
+  return typeof meta === "object" && meta !== null && !Array.isArray(meta)
+    ? (meta as AttachmentMeta)
+    : null;
 }
 
 // ── Download ────────────────────────────────────────────────────────
@@ -170,7 +195,8 @@ export interface StorageDownloaderLike {
 }
 
 export interface SkippedAttachment {
-  meta: AttachmentMeta;
+  /** null when the raw array element wasn't even an object (audit A6/A20). */
+  meta: AttachmentMeta | null;
   reason: string;
 }
 
@@ -228,7 +254,7 @@ export async function downloadAttachments(
   } catch (err) {
     const reason = `could not prepare sources dir: ${(err as Error).message}`;
     logFn(`[attachments] ${reason} — skipping all ${metas.length} attachments`);
-    result.skipped = metas.map((meta) => ({ meta, reason }));
+    result.skipped = metas.map((meta) => ({ meta: asMetaOrNull(meta), reason }));
     return result;
   }
 
@@ -255,7 +281,7 @@ export async function downloadAttachments(
   } catch (err) {
     const reason = `could not list sources/ for size verification: ${(err as Error).message}`;
     logFn(`[attachments] ${reason} — skipping all ${metas.length} attachments (fail-closed)`);
-    result.skipped = metas.map((meta) => ({ meta, reason }));
+    result.skipped = metas.map((meta) => ({ meta: asMetaOrNull(meta), reason }));
     return result;
   }
 
@@ -267,7 +293,7 @@ export async function downloadAttachments(
     // hand-edited DB row must not amplify download work).
     if (idx >= ATTACHMENTS.max_files) {
       result.skipped.push({
-        meta,
+        meta: asMetaOrNull(meta),
         reason: `exceeds max_files cap (${ATTACHMENTS.max_files})`,
       });
       continue;
@@ -277,7 +303,7 @@ export async function downloadAttachments(
     // otherwise reach the sniffer and the fenced prompt block).
     const metaReason = validateAttachmentMeta(meta);
     if (metaReason) {
-      result.skipped.push({ meta, reason: metaReason });
+      result.skipped.push({ meta: asMetaOrNull(meta), reason: metaReason });
       continue;
     }
     // Duplicate storedName would silently overwrite the earlier file in the
@@ -376,7 +402,9 @@ export async function downloadAttachments(
   }
 
   for (const s of result.skipped) {
-    logFn(`[attachments] SKIPPED ${s.meta.storedName}: ${s.reason}`);
+    logFn(
+      `[attachments] SKIPPED ${s.meta?.storedName ?? "<malformed element>"}: ${s.reason}`,
+    );
   }
   return result;
 }

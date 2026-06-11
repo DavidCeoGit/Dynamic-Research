@@ -218,6 +218,18 @@ export async function POST(request: Request): Promise<Response> {
 }
 
 export async function DELETE(request: Request): Promise<Response> {
+  // Audit A22 — same per-IP throttle as the POST sibling. Each DELETE costs
+  // an auth round-trip + a storage remove(); this was the only attachment
+  // endpoint without the limiter.
+  const ip = clientIp(request);
+  const rl = await checkRateLimit(ip);
+  if (!rl.allowed) {
+    return Response.json(
+      { error: "Rate limit exceeded", detail: `Try again in ${rl.retryAfterSec}s.` },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+    );
+  }
+
   const auth = await requireSessionOrg();
   if (!auth.ok) return auth.res;
   const { orgId } = auth;

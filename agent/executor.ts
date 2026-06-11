@@ -27,6 +27,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { updateJob, completeJob, failJob, updatePlanReviewStatus } from "./api-client.js";
 import { ATTACHMENTS, getContentType } from "./lib/conventions.js";
 import {
+  asMetaOrNull,
   downloadAttachments,
   type AttachmentDownloadResult,
 } from "./lib/attachments.js";
@@ -459,8 +460,11 @@ export async function executeJob(job: ResearchJob): Promise<string> {
       );
       attachmentsResult = {
         downloaded: [],
+        // asMetaOrNull: a forged row can hold non-object elements (audit
+        // A18); raw nulls here used to TypeError later in buildManifest's
+        // s.meta.originalName dereference and hard-fail the job.
         skipped: (job.attachments ?? []).map((meta) => ({
-          meta,
+          meta: asMetaOrNull(meta),
           reason: `download stage errored: ${(err as Error).message}`,
         })),
       };
@@ -804,8 +808,10 @@ export function buildManifest(
       // the prompt-level untrusted-data contract covers userContext.*).
       attachments: downloaded,
       attachmentsSkipped: skipped.map((s) => ({
-        originalName: s.meta.originalName,
-        storedName: s.meta.storedName,
+        // meta is null for non-object array elements (audit A6/A20) — the skip
+        // record must still reach the manifest without throwing.
+        originalName: s.meta?.originalName ?? "<malformed element>",
+        storedName: s.meta?.storedName ?? "<malformed element>",
         reason: s.reason,
       })),
       // Read caps for the orchestrator's digest step (canonical values from
