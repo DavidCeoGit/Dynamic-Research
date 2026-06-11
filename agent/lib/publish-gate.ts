@@ -84,6 +84,18 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const truncate = (s: string): string => (s.length > REASON_SLICE ? `${s.slice(0, REASON_SLICE)}…` : s);
 
 /**
+ * Flag check tolerant of LLM-stringified booleans (S108 Gemini G2): the state
+ * file is written by the spawned pipeline, which can serialize `true` as
+ * `"true"`. Accepting the string form makes the gate fire MORE often — the
+ * fail-closed direction; the reverse (a string silently reading as false and
+ * skipping the gate) is the fail-open this closes. Applied to the jsonb job
+ * flag too: zod guarantees a real boolean on the API path, but direct DB
+ * writes bypass zod.
+ */
+const truthyFlag = (v: unknown): boolean =>
+  v === true || (typeof v === "string" && v.trim().toLowerCase() === "true");
+
+/**
  * publish_required is an OR of the durable job flag (user_context jsonb, set
  * at submit) and the pipeline-declared state flag. The OR is load-bearing:
  * the spawned pipeline omitting/zeroing its state flag must not un-publish a
@@ -93,7 +105,7 @@ export function isPublishRequired(
   job: Pick<ResearchJob, "user_context">,
   state: PipelineState | null | undefined,
 ): boolean {
-  return job.user_context?.publishRequired === true || state?.publish_required === true;
+  return truthyFlag(job.user_context?.publishRequired) || truthyFlag(state?.publish_required);
 }
 
 function validateClaim(claim: unknown, idx: number, reasons: string[]): void {
@@ -203,6 +215,17 @@ export function evaluatePublishGate(
       reasons.push(
         `claims_extraction_status is "${truncate(String(ces))}" (must be "populated" or "no_load_bearing_claims")`,
       );
+    }
+    // S108 Gemini G4: "no load-bearing claims" is a tempting LLM escape hatch
+    // from the heavy verification step — require a substantive written
+    // justification so invoking it leaves an auditable, falsifiable record.
+    if (ces === "no_load_bearing_claims") {
+      const just = pv.no_claims_justification;
+      if (typeof just !== "string" || just.trim().length < 20) {
+        reasons.push(
+          'claims_extraction_status="no_load_bearing_claims" requires a substantive no_claims_justification (>=20 chars) explaining why a research deliverable carries no load-bearing factual claims',
+        );
+      }
     }
     if (!Array.isArray(claimsRaw)) {
       reasons.push("claims is not an array");

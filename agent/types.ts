@@ -89,6 +89,12 @@ export interface PublishVerification {
   claims_extraction_status: ClaimsExtractionStatus;
   vendor_legs: PublishVendorLegs;
   claims: VerifiedClaim[];
+  /**
+   * REQUIRED (>=20 chars) when claims_extraction_status is
+   * "no_load_bearing_claims" — the escape hatch from claim verification must
+   * leave an auditable justification (S108 Gemini G4).
+   */
+  no_claims_justification?: string;
 }
 
 export interface VendorEvaluation {

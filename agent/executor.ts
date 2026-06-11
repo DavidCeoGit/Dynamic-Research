@@ -21,6 +21,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { fileURLToPath } from "node:url";
 import * as fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { updateJob, completeJob, failJob, updatePlanReviewStatus } from "./api-client.js";
@@ -750,6 +751,17 @@ export function buildManifest(
     // (lib/publish-gate.ts).
     publish_required: job.user_context.publishRequired === true,
     publish_verification: null,
+    // S108 Gemini G1 (bypass reachability): tell the orchestrator whether a
+    // HUMAN already placed an URGENT sign-off for THIS job. Default behavior
+    // on a dead vendor leg is cheap fail-fast (ERROR-exit at the leg); when a
+    // sign-off pre-exists, the skill instead runs to completion in degraded
+    // mode (honest failing manifest + deliverables) so the worker gate can
+    // apply the human bypass. Informational only — the gate re-validates the
+    // actual file at completion time; the spawned pipeline cannot forge the
+    // authorization by editing this field.
+    urgent_signoff_present: existsSync(
+      path.join(PUBLISH_RISK_ACCEPT_DIR, `${job.id}.txt`),
+    ),
     aji_dna_enabled: job.aji_dna_enabled,
     persona_configured: false,
     topic_half_life: null,
@@ -894,7 +906,14 @@ async function runStudioOnly(
     if (studioStateFile) {
       studioState = JSON.parse(await fs.readFile(studioStateFile, "utf-8")) as PipelineState;
     }
-  } catch {
+  } catch (err) {
+    // Loud, not fatal (S108 Gemini G3): a publish-flagged job (durable jsonb
+    // flag — the only flag a worker job can carry) still fails closed below
+    // via the missing manifest; this log is for the state-corruption forensics.
+    log(
+      job.id,
+      `[publish-gate] state.json unreadable in studio_only workdir (${(err as Error).message}) — gate evaluates with null state`,
+    );
     studioState = null;
   }
   const publishGate = await evaluatePublishGateForJob(job, studioState, PUBLISH_RISK_ACCEPT_DIR);

@@ -108,6 +108,18 @@ test("isPublishRequired: pipeline-declared state flag alone is enough", () => {
   assert.equal(isPublishRequired(jobWith(undefined), publishState(greenManifest())), true);
 });
 
+test('isPublishRequired: LLM-stringified "true" still fires the gate (S108 Gemini G2)', () => {
+  const state = { publish_required: "true", publish_verification: null } as unknown as PipelineState;
+  assert.equal(isPublishRequired(jobWith(undefined), state), true);
+  // jsonb job flag written outside zod gets the same tolerance
+  const job = jobWith(undefined);
+  (job.user_context as unknown as Record<string, unknown>).publishRequired = "TRUE";
+  assert.equal(isPublishRequired(job, null), true);
+  // but arbitrary truthy junk does NOT (only boolean true / string "true")
+  const junk = { publish_required: "yes" } as unknown as PipelineState;
+  assert.equal(isPublishRequired(jobWith(undefined), junk), false);
+});
+
 // ── evaluatePublishGate: clean pass + no_load_bearing_claims ────────
 
 test("gate passes on an all-green manifest", () => {
@@ -117,11 +129,28 @@ test("gate passes on an all-green manifest", () => {
   assert.deepEqual(res.reasons, []);
 });
 
-test("gate passes with zero claims when extraction says no_load_bearing_claims", () => {
+test("gate passes with zero claims when extraction says no_load_bearing_claims WITH justification", () => {
   const res = evaluatePublishGate(
-    publishState(greenManifest({ claims_extraction_status: "no_load_bearing_claims", claims: [] })),
+    publishState(
+      greenManifest({
+        claims_extraction_status: "no_load_bearing_claims",
+        claims: [],
+        no_claims_justification:
+          "Purely procedural how-to content; no quantitative figures, named entities, or factual premises drive any conclusion.",
+      }),
+    ),
   );
   assert.equal(res.ok, true);
+});
+
+test("no_load_bearing_claims WITHOUT a substantive justification blocks (S108 Gemini G4)", () => {
+  for (const just of [undefined, "", "trust me", "   "]) {
+    const m = greenManifest({ claims_extraction_status: "no_load_bearing_claims", claims: [] });
+    if (just !== undefined) m.no_claims_justification = just;
+    const res = evaluatePublishGate(publishState(m));
+    assert.equal(res.ok, false, `justification=${JSON.stringify(just)} should block`);
+    assert.ok(res.reasons.some((r) => r.includes("no_claims_justification")));
+  }
 });
 
 // ── Vendor-leg failures (the S100 root cause) ───────────────────────
@@ -415,4 +444,24 @@ test("buildManifest seeds publish_required from the job flag and a null manifest
   const off = buildManifest(manifestJob()) as Record<string, unknown>;
   assert.equal(off.publish_required, false);
   assert.equal(off.publish_verification, null);
+});
+
+test("buildManifest urgent_signoff_present reflects the operator sign-off file (S108 Gemini G1)", async () => {
+  // Default: no sign-off file for this job id anywhere → false.
+  const absent = buildManifest(manifestJob(true)) as Record<string, unknown>;
+  assert.equal(absent.urgent_signoff_present, false);
+
+  // With the file present in the (env-unset) cwd-derived dir → true.
+  // PUBLISH_RISK_ACCEPT_DIR defaults to <cwd>/.publish-risk-accepted at module
+  // load; create the marker there, assert, and clean up (dir is gitignored).
+  const dir = process.env.PUBLISH_RISK_ACCEPT_DIR ?? path.join(process.cwd(), ".publish-risk-accepted");
+  const file = path.join(dir, `${JOB_ID}.txt`);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(file, VALID_SIGNOFF);
+  try {
+    const present = buildManifest(manifestJob(true)) as Record<string, unknown>;
+    assert.equal(present.urgent_signoff_present, true);
+  } finally {
+    await fs.rm(file, { force: true });
+  }
 });
