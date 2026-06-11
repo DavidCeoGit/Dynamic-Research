@@ -33,6 +33,62 @@ export interface UserContext {
   constraints: string[];
   additionalUrls: string[];
   claimsToVerify: string[];
+  /**
+   * MRPF PUBLISH gate (S108). True marks the job's output as bound for
+   * external distribution / decision authorization: the worker then refuses
+   * completeJob() unless state.json carries a passing publish_verification
+   * manifest (lib/publish-gate.ts), and the orchestrator treats the
+   * Perplexity WebSearch fallback as a HARD FAILURE instead of a substitute.
+   * Optional so pre-S108 rows deserialize cleanly; absent means false.
+   * Lives inside the user_context jsonb column — no migration required.
+   */
+  publishRequired?: boolean;
+}
+
+// ── MRPF PUBLISH verification manifest (S108) ───────────────────────
+// Written by the /research-compare orchestrator into state.json for
+// publish-required jobs; structurally re-validated at runtime by
+// lib/publish-gate.ts (the state file is pipeline-written and untrusted).
+
+export type VendorLegStatus = "ok" | "degraded" | "failed" | "skipped";
+
+export interface VendorLegReport {
+  status: VendorLegStatus;
+  /** e.g. "sonar-deep-research completed", "WebSearch fallback", "401 insufficient_quota" */
+  detail?: string;
+}
+
+export interface PublishVendorLegs {
+  perplexity: VendorLegReport;
+  notebooklm: VendorLegReport;
+  claude: VendorLegReport;
+}
+
+export type ClaimVerdict = "verified" | "verified_with_caveat" | "refuted" | "unverifiable";
+
+export interface VerifiedClaim {
+  text: string;
+  /** Temporal anchor — the ISO date the claim is asserted current as of. */
+  asOfDate: string;
+  sourceUrls: string[];
+  /** Publication or access date per source (parallel to sourceUrls). */
+  sourceDates: string[];
+  /** e.g. "primary" | "official" | "reputable-secondary" | "weak" */
+  sourceQualityClass: string;
+  /** Why the corroborating sources do NOT trace to the same upstream. */
+  upstreamIndependenceBasis: string;
+  verdict: ClaimVerdict;
+  /** Explicit "none found" required — silence is not evidence of absence. */
+  counterEvidenceNotes: string;
+}
+
+export type ClaimsExtractionStatus = "populated" | "no_load_bearing_claims";
+
+export interface PublishVerification {
+  verification_status: "passed" | "failed" | "not_run";
+  claims_extraction_status: ClaimsExtractionStatus;
+  vendor_legs: PublishVendorLegs;
+  claims: VerifiedClaim[];
 }
 
 export interface VendorEvaluation {
@@ -186,4 +242,13 @@ export interface PipelineState {
   };
   artifacts: Record<string, unknown>;
   files_written: string[];
+  /**
+   * MRPF PUBLISH gate (S108). Seeded by buildManifest from
+   * user_context.publishRequired; the orchestrator must carry it forward and
+   * populate publish_verification before declaring the pipeline complete.
+   * Optional so pre-S108 state files deserialize cleanly. The gate treats the
+   * state file as untrusted and re-validates structurally at runtime.
+   */
+  publish_required?: boolean;
+  publish_verification?: PublishVerification | null;
 }

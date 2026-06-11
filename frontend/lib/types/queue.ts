@@ -26,6 +26,14 @@ export interface UserContext {
   constraints: string[];
   additionalUrls: string[];
   claimsToVerify: string[];
+  /**
+   * MRPF PUBLISH gate (S108). True marks the run's output as bound for
+   * external distribution / decision authorization; the worker then refuses
+   * completion without a passing publish_verification manifest
+   * (agent/lib/publish-gate.ts). Optional: absent means false. No UI sets it
+   * yet (dark-launch); zod defaults it false at submit.
+   */
+  publishRequired?: boolean;
 }
 
 // ── Vendor evaluation config ────────────────────────────────────────
