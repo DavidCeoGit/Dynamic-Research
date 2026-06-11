@@ -36,6 +36,10 @@ export function useNewResearchForm() {
   const [isLoadingClone, setIsLoadingClone] = useState(false);
   const [cloneError, setCloneError] = useState<string | null>(null);
   const isMounted = useRef(false);
+  // A2 — prevent a late upload setValue from resurrecting the draft after the
+  // user has already submitted. The form.watch handler checks this flag and
+  // skips the sessionStorage write once submission is underway.
+  const isSubmittedRef = useRef(false);
 
   const form = useForm<FormData>({
     resolver: zodResolver(formDataSchema) as unknown as Resolver<FormData>,
@@ -125,6 +129,11 @@ export function useNewResearchForm() {
   useEffect(() => {
     if (!isMounted.current) return;
     const sub = form.watch((values) => {
+      // A2 — after submit succeeds, a late in-flight upload can fire setValue
+      // which would re-persist the form to sessionStorage — resurrecting a
+      // "draft" (with the orphaned staged attachment) on the next /new visit.
+      // Skipping the write once submitted closes the resurrection window.
+      if (isSubmittedRef.current) return;
       try {
         sessionStorage.setItem(STORAGE_KEY, JSON.stringify(values));
       } catch {
@@ -415,6 +424,9 @@ export function useNewResearchForm() {
       }
 
       const result = await res.json();
+      // A2 — set BEFORE removeItem so any late upload setValue that fires
+      // between here and the navigation is suppressed by the watch guard.
+      isSubmittedRef.current = true;
       sessionStorage.removeItem(STORAGE_KEY);
       router.push(`/new/${result.id}`);
     } catch (err) {

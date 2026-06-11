@@ -34,6 +34,44 @@ import type {
 
 const BUCKET = "research-projects";
 
+/**
+ * Minimal structural type for the Supabase client surface used by the
+ * attachment helpers. Mirrors the agent-side StorageDownloaderLike pattern:
+ * lets tests inject a plain-object mock without pulling @supabase/supabase-js
+ * type machinery into the test file.
+ *
+ * Audit A1 — verifyAndCopyAttachments and its cleanup helpers were untestable
+ * because they hard-coded getSupabase(). The injectable _sb parameter closes
+ * that gap without breaking any existing callers (all pass no _sb → falls
+ * back to getSupabase() as before).
+ */
+export interface StorageClientLike {
+  storage: {
+    from(bucket: string): {
+      list(
+        prefix: string,
+        opts: { limit: number; sortBy?: { column: string; order: string } },
+      ): Promise<{
+        data: Array<{ name: string; metadata: Record<string, unknown> | null }> | null;
+        error: { message: string } | null;
+      }>;
+      copy(
+        fromPath: string,
+        toPath: string,
+      ): Promise<{
+        data: unknown | null;
+        error: { message: string } | null;
+      }>;
+      remove(
+        paths: string[],
+      ): Promise<{
+        data: unknown[] | null;
+        error: { message: string } | null;
+      }>;
+    };
+  };
+}
+
 // ── In-memory cache ──────────────────────────────────────────────
 
 interface CacheEntry<T> {
@@ -289,13 +327,13 @@ function sizeMapFromList(
  * names the call site so an orphan can be traced from the log line.
  */
 async function bestEffortRemove(
-  supabase: ReturnType<typeof getSupabase>,
+  sb: StorageClientLike,
   paths: string[],
   context: string,
 ): Promise<void> {
   if (paths.length === 0) return;
   try {
-    const { error } = await supabase.storage.from(BUCKET).remove(paths);
+    const { error } = await sb.storage.from(BUCKET).remove(paths);
     if (error) {
       console.warn(
         `[storage] ${context}: remove failed (non-blocking, orphans left): ${error.message}`,
@@ -427,11 +465,12 @@ export async function removeStagedFiles(
   orgId: string,
   draftId: string,
   storedNames: string[],
+  _sb?: StorageClientLike,
 ): Promise<void> {
   if (storedNames.length === 0) return;
-  const supabase = getSupabase();
+  const sb = _sb ?? getSupabase();
   const paths = storedNames.map((n) => scopedStagingPath(orgId, draftId, n));
-  await bestEffortRemove(supabase, paths, `removeStagedFiles(${orgId}/${draftId})`);
+  await bestEffortRemove(sb, paths, `removeStagedFiles(${orgId}/${draftId})`);
 }
 
 export interface VerifyAndCopyResult {
@@ -462,11 +501,13 @@ export async function verifyAndCopyAttachments(opts: {
   parentSlug?: string | null;
   items: AttachmentPayloadItem[];
   caller: string;
+  /** Injectable client for testing (omit in production — falls back to getSupabase()). */
+  _sb?: StorageClientLike;
 }): Promise<VerifyAndCopyResult> {
-  const { orgId, newSlug, draftId, parentSlug, items, caller } = opts;
+  const { orgId, newSlug, draftId, parentSlug, items, caller, _sb } = opts;
   if (items.length === 0) return { ok: true, verified: [] };
 
-  const supabase = getSupabase();
+  const supabase = _sb ?? getSupabase();
 
   let plan;
   try {
@@ -587,12 +628,13 @@ export async function removeRunSources(
   orgId: string,
   slug: string,
   storedNames: string[],
+  _sb?: StorageClientLike,
 ): Promise<void> {
   if (storedNames.length === 0) return;
   // Codex MERGE-gate MINOR — route the remove through bestEffortRemove so a
   // resolved `{ error }` (the SDK's normal storage-failure shape) is logged,
   // not just a thrown exception. Still never throws.
-  const supabase = getSupabase();
+  const sb = _sb ?? getSupabase();
   const paths = storedNames.map((n) => scopedSourcesPath(orgId, slug, n));
-  await bestEffortRemove(supabase, paths, `removeRunSources(${orgId}/${slug})`);
+  await bestEffortRemove(sb, paths, `removeRunSources(${orgId}/${slug})`);
 }

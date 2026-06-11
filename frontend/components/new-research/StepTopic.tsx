@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useFormContext } from "react-hook-form";
 import type { FormData } from "@/lib/validate";
 import type { StepProps } from "@/lib/types/queue";
@@ -60,7 +60,35 @@ export function StepTopic({ onNext }: StepProps) {
   // and error rows that never reach the form.
   const [uiItems, setUiItems] = useState<UiAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  // A2 — shown when the user clicks Next while an upload is still in-flight.
+  const [uploadPendingError, setUploadPendingError] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // A3 — AbortController per in-flight upload, keyed by tempId. Removing an
+  // uploading row deletes its entry and aborts the XHR; the success path checks
+  // whether its entry still exists before appending to the form.
+  const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
+
+  // A4 — On mount, seed uiItems from form state so chips and remove buttons
+  // reappear after back-navigation (StepTopic unmounts on Next, so local state
+  // was previously lost). Only staging-origin items: parent carry-overs are
+  // rendered separately from the parentItems derived array above.
+  useEffect(() => {
+    const stagingItems = ((getValues("attachments") ?? []) as AttachmentPayloadItem[]).filter(
+      (a) => a.origin === "staging",
+    );
+    if (stagingItems.length > 0) {
+      setUiItems(
+        stagingItems.map((a) => ({
+          tempId: a.storedName,
+          originalName: a.originalName,
+          sizeBytes: a.sizeBytes,
+          status: "ready" as const,
+          storedName: a.storedName,
+        })),
+      );
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentionally run only on mount
 
   const ensureDraftId = useCallback((): string => {
     const existing = getValues("attachmentsDraftId");
@@ -156,6 +184,12 @@ export function StepTopic({ onNext }: StepProps) {
         { tempId, originalName: file.name, sizeBytes: file.size, status: "uploading" },
       ]);
 
+      // A3 — register an AbortController for this upload so removeItem can
+      // cancel in-flight XHRs. The entry is deleted either by removeItem
+      // (cancellation) or by the success/error path below (completion).
+      const controller = new AbortController();
+      abortControllersRef.current.set(tempId, controller);
+
       try {
         const draftId = ensureDraftId();
 
@@ -180,6 +214,7 @@ export function StepTopic({ onNext }: StepProps) {
             contentType,
             reservedStoredNames,
           }),
+          signal: controller.signal,
         });
         if (!mintRes.ok) {
           const err = await mintRes.json().catch(() => ({ error: `HTTP ${mintRes.status}` }));
@@ -197,9 +232,29 @@ export function StepTopic({ onNext }: StepProps) {
           method: "PUT",
           headers: { "Content-Type": contentType },
           body: file,
+          signal: controller.signal,
         });
         if (!putRes.ok) {
           throw new Error(`Upload failed (HTTP ${putRes.status})`);
+        }
+
+        // A3 — Check whether the user removed this row while the upload was
+        // in-flight. removeItem deletes the controller entry BEFORE aborting,
+        // so by the time we reach here a missing entry means "was removed".
+        const wasRemoved = !abortControllersRef.current.has(tempId);
+        abortControllersRef.current.delete(tempId);
+        if (wasRemoved) {
+          // Best-effort delete the orphaned staging object — the TTL sweep
+          // reclaims it on miss, but a prompt DELETE avoids leaving a ghost.
+          const draftIdCurrent = getValues("attachmentsDraftId");
+          if (draftIdCurrent) {
+            fetch("/api/queue/attachments", {
+              method: "DELETE",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ draftId: draftIdCurrent, storedName }),
+            }).catch(() => {});
+          }
+          return;
         }
 
         // (3) Append the successful item to the persisted form array.
@@ -220,6 +275,9 @@ export function StepTopic({ onNext }: StepProps) {
           ),
         );
       } catch (err) {
+        abortControllersRef.current.delete(tempId);
+        // Suppress AbortError — the removeItem handler already cleaned the UI row.
+        if (err instanceof DOMException && err.name === "AbortError") return;
         setUiItems((prev) =>
           prev.map((u) =>
             u.tempId === tempId
@@ -241,10 +299,20 @@ export function StepTopic({ onNext }: StepProps) {
   );
 
   // Remove a row: for ready items, DELETE the staged object then drop from form
-  // + UI. For error/uploading rows (no storedName) just drop the UI row.
+  // + UI. For error rows just drop the UI row. For uploading rows, abort the
+  // XHR (A3) and drop the UI row — the success path checks the controller map
+  // and skips appending to the form, then best-effort deletes the staged object.
   const removeItem = useCallback(
     async (ui: UiAttachment) => {
-      if (ui.status !== "ready" || !ui.storedName) {
+      if (ui.status === "uploading") {
+        // Delete controller BEFORE abort so the success path sees entry missing.
+        const controller = abortControllersRef.current.get(ui.tempId);
+        abortControllersRef.current.delete(ui.tempId);
+        controller?.abort();
+        setUiItems((prev) => prev.filter((u) => u.tempId !== ui.tempId));
+        return;
+      }
+      if (ui.status === "error" || !ui.storedName) {
         setUiItems((prev) => prev.filter((u) => u.tempId !== ui.tempId));
         return;
       }
@@ -439,10 +507,26 @@ export function StepTopic({ onNext }: StepProps) {
         )}
       </div>
 
+      {/* A2 — warn when Next is clicked while an upload is still in-flight */}
+      {uploadPendingError && (
+        <p className="mt-1 text-xs text-amber-400" role="alert">
+          Wait for uploads to finish before continuing.
+        </p>
+      )}
+
       <div className="flex justify-end">
         <button
           type="button"
-          onClick={onNext}
+          onClick={() => {
+            // A2 — block Next while any upload is in-flight so no attachment
+            // races past the submit snapshot.
+            if (uiItems.some((u) => u.status === "uploading")) {
+              setUploadPendingError(true);
+              return;
+            }
+            setUploadPendingError(false);
+            onNext();
+          }}
           className="flex items-center gap-2 rounded-lg bg-[#c8a951] px-5 py-2.5 text-sm font-medium text-[#1a2744] hover:bg-[#d4b85e] transition"
         >
           Next <ArrowRight className="h-4 w-4" />

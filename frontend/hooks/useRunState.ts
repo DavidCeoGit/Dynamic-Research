@@ -38,6 +38,10 @@ export interface RunState {
     domainKnowledge: string[];
     constraints: string[];
     localSourcePath: string | null;
+    /** A5 — present when ≥1 attachment was submitted but all were skipped by the worker. */
+    allAttachmentsSkipped?: boolean;
+    /** A5 — per-file skip reasons, present when allAttachmentsSkipped is true. */
+    attachmentsSkipped?: Array<{ originalName: string; storedName: string; reason: string }>;
   };
   selectedProducts: Record<string, boolean>;
   customizations: {
