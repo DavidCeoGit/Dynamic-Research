@@ -33,15 +33,66 @@ import {
   LAST_UPDATED,
   type FileClass,
 } from "../lib/conventions.js";
-import { isStateFileName } from "../lib/find-state-file.js";
+import { findStateFile, isStateFileName } from "../lib/find-state-file.js";
 
 const args = process.argv.slice(2);
 const workDir = args[0];
 const strict = args.includes("--strict");
+// S108 (S107 follow-up): strict studio-coverage is SELECTION-AWARE. Partial
+// product selection is normal (M&A ran 3/5, S107 ran 1/5) — requiring all 5
+// made standalone --strict error on every partial run. Explicit override:
+// --products=audio,report. Otherwise the workdir's job-manifest.json /
+// state.json selectedProducts is consulted; only with NO selection source do
+// we fall back to expecting all 5.
+const productsArg = args.find((a) => a.startsWith("--products="));
 
 if (!workDir) {
-  console.error("usage: lint-deliverables.ts <workdir> [--strict]");
+  console.error("usage: lint-deliverables.ts <workdir> [--strict] [--products=audio,report,...]");
   process.exit(2);
+}
+
+/** Resolve which Studio products this run was supposed to produce. */
+async function resolveSelectedProducts(): Promise<{ products: string[] | null; source: string }> {
+  const valid = new Set(Object.keys(STUDIO_PRODUCTS));
+  if (productsArg) {
+    const list = productsArg
+      .slice("--products=".length)
+      .split(",")
+      .map((p) => p.trim().toLowerCase())
+      .filter((p) => p.length > 0);
+    const bad = list.filter((p) => !valid.has(p));
+    if (bad.length > 0) {
+      console.error(`--products contains unknown product(s): ${bad.join(", ")} (valid: ${[...valid].join(", ")})`);
+      process.exit(2);
+    }
+    return { products: list, source: "--products flag" };
+  }
+  // job-manifest.json (worker runs) then state.json (any run) — both carry
+  // selectedProducts as {audio: bool, ...}.
+  const candidates: Array<{ file: string; label: string }> = [
+    { file: path.join(workDir, "job-manifest.json"), label: "job-manifest.json" },
+  ];
+  try {
+    const stateFile = await findStateFile(workDir);
+    if (stateFile) candidates.push({ file: stateFile, label: path.basename(stateFile) });
+  } catch {
+    // state discovery is best-effort
+  }
+  for (const { file, label } of candidates) {
+    try {
+      const parsed = JSON.parse(await fs.readFile(file, "utf-8")) as {
+        selectedProducts?: Record<string, unknown>;
+      };
+      const sel = parsed.selectedProducts;
+      if (sel && typeof sel === "object") {
+        const list = Object.keys(sel).filter((p) => valid.has(p) && sel[p] === true);
+        if (list.length > 0) return { products: list, source: label };
+      }
+    } catch {
+      // missing/unparseable — try next source
+    }
+  }
+  return { products: null, source: "none (expecting all products)" };
 }
 
 interface Violation {
@@ -215,9 +266,16 @@ async function main() {
   }
   console.log();
 
-  // Studio coverage
-  const expectedProducts = Object.keys(STUDIO_PRODUCTS);
+  // Studio coverage — selection-aware (S108): only the products this run
+  // actually selected are REQUIRED; unselected ones are reported as info.
+  const selection = await resolveSelectedProducts();
+  const expectedProducts = selection.products ?? Object.keys(STUDIO_PRODUCTS);
+  console.log(`Studio selection source: ${selection.source} → expecting [${expectedProducts.join(", ")}]`);
   const missingProducts = expectedProducts.filter((p) => !studioProductsSeen.has(p));
+  const unselectedSeen = [...studioProductsSeen].filter((p) => !expectedProducts.includes(p));
+  if (unselectedSeen.length > 0) {
+    console.log(`Studio products present beyond selection (info): ${unselectedSeen.join(", ")}`);
+  }
   if (missingProducts.length > 0) {
     console.log(`Studio products MISSING: ${missingProducts.join(", ")}`);
     if (strict) {
@@ -225,12 +283,12 @@ async function main() {
         violations.push({
           severity: "error",
           file: "(missing)",
-          msg: `Expected Studio product "${p}" not present in workdir`,
+          msg: `Selected Studio product "${p}" not present in workdir (selection source: ${selection.source})`,
         });
       }
     }
   } else {
-    console.log("Studio coverage: all 5 products present ✓");
+    console.log(`Studio coverage: all ${expectedProducts.length} selected product(s) present ✓`);
   }
   console.log();
 
