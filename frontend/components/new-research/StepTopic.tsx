@@ -13,7 +13,7 @@ import {
   ATTACHMENT_MAX_TOTAL_BYTES,
   type AttachmentContentType,
 } from "@/lib/attachments-constants";
-import { ArrowRight, Upload, FileText, X, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
+import { ArrowRight, Upload, FileText, X, Loader2, CheckCircle2, AlertCircle, Repeat } from "lucide-react";
 
 type UiStatus = "uploading" | "ready" | "error";
 
@@ -47,6 +47,13 @@ export function StepTopic({ onNext }: StepProps) {
     useFormContext<FormData>();
   const topic = watch("topic") ?? "";
   const attachments = watch("attachments") ?? [];
+  // Audit A16 — parent carry-overs (origin:"parent" from a clone) never enter
+  // uiItems (only uploadFile creates rows), so without these they'd be
+  // invisible on this step and unremovable anywhere: a clone of a 5-file /
+  // 40MB run would have its attachment set frozen with no explanation.
+  const parentItems = (attachments as AttachmentPayloadItem[]).filter(
+    (a) => a.origin === "parent",
+  );
 
   // Per-file UI status (uploading/ready/error). The persisted form array holds
   // only successfully-uploaded items; this local state drives chips + in-flight
@@ -76,6 +83,24 @@ export function StepTopic({ onNext }: StepProps) {
         "attachments",
         current.filter(
           (a) => !(a.storedName === storedName && a.origin === "staging"),
+        ),
+        { shouldDirty: true },
+      );
+    },
+    [getValues, setValue],
+  );
+
+  // Audit A16 — drop a parent carry-over from the form. NO storage DELETE:
+  // the bytes belong to the PARENT run's sources/ (the submit route copies
+  // them only for items still in the array). Scoped to origin:"parent" for
+  // the same reason removeFromForm scopes to "staging".
+  const removeParentItem = useCallback(
+    (storedName: string) => {
+      const current = (getValues("attachments") ?? []) as AttachmentPayloadItem[];
+      setValue(
+        "attachments",
+        current.filter(
+          (a) => !(a.storedName === storedName && a.origin === "parent"),
         ),
         { shouldDirty: true },
       );
@@ -321,6 +346,48 @@ export function StepTopic({ onNext }: StepProps) {
             className="hidden"
           />
         </div>
+
+        {/* Parent carry-overs from a clone (audit A16) — rendered from the
+            form array (not uiItems) so they're visible and removable here.
+            Removal frees cap slots; bytes stay in the parent run. */}
+        {parentItems.length > 0 && (
+          <ul className="mt-3 space-y-1.5">
+            {parentItems.map((a) => (
+              <li
+                key={a.storedName}
+                className="flex items-center gap-2.5 rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2"
+              >
+                <FileText className="h-4 w-4 shrink-0 text-zinc-500" />
+                <span className="flex-1 min-w-0 truncate text-sm text-zinc-300" title={a.originalName}>
+                  {a.originalName}
+                </span>
+                <span className="shrink-0 text-xs text-zinc-600">{humanSize(a.sizeBytes)}</span>
+                {/* S109 review — the badge states provenance only. The earlier
+                    "Removing it only affects this new run" reassurance was
+                    dropped: it lived solely in this title tooltip (invisible on
+                    touch + to screen readers — the audit A18 channel problem)
+                    and was inaccurate for studio_only clones, where the parent
+                    NLM notebook still drives the deliverables regardless of
+                    this form list. The remove button's aria-label conveys
+                    removability accessibly. */}
+                <span
+                  className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[#c8a951]/10 border border-[#c8a951]/30 px-2 py-0.5 text-[10px] font-medium text-[#c8a951]"
+                  title="Carried over from the run you cloned."
+                >
+                  <Repeat className="h-2.5 w-2.5" /> from original run
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeParentItem(a.storedName)}
+                  className="shrink-0 rounded p-0.5 text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition"
+                  aria-label={`Remove ${a.originalName}`}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
 
         {/* Current attachments — uploaded (ready) + in-flight/error UI rows. */}
         {uiItems.length > 0 && (
