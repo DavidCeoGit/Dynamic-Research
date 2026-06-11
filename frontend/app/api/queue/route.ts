@@ -36,8 +36,13 @@
 import { getSupabase } from "@/lib/supabase";
 import { researchJobPayloadSchema, generateSlug } from "@/lib/validate";
 import { estimateMinutes } from "@/lib/estimates";
-import type { SelectedProducts } from "@/lib/types/queue";
+import type { SelectedProducts, AttachmentMeta } from "@/lib/types/queue";
 import { getOrgContextDualPath } from "@/lib/auth";
+import {
+  verifyAndCopyAttachments,
+  removeRunSources,
+  removeStagedFiles,
+} from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -60,23 +65,11 @@ export async function POST(request: Request) {
     );
   }
 
-  // S102 attachments — Phase 1 fail-CLOSED guard (Codex S103 grounded-adversarial
-  // MAJOR-1). The payload CONTRACT accepts `attachments`/`attachmentsDraftId` so
-  // the schema + types land ahead of the upload UI, but the submit→storage copy
-  // path does not exist until Phase 2. Without this guard a direct API client
-  // could POST a valid attachments array and receive a 201 while the bytes are
-  // silently dropped (the insert below omits the column, so the row gets the DB
-  // default '[]'). Reject instead of accept-and-drop. Phase 2 replaces this
-  // block with real staging→sources verify+copy.
-  if (
-    parsed.data.attachments.length > 0 ||
-    (parsed.data.attachmentsDraftId ?? null) !== null
-  ) {
-    return Response.json(
-      { error: "Attachments are not yet supported on submission" },
-      { status: 400, headers: { "X-Org-Source": "none" } },
-    );
-  }
+  // S102/Phase-2 attachments: the S103 fail-CLOSED guard that lived here is now
+  // REPLACED by real staging→sources verify+copy. That work runs further down,
+  // AFTER the slug and parent_run_id are resolved (the copy destination is
+  // <orgId>/<slug>/sources/, and parent-origin files copy out of the parent
+  // run's sources/). See the "attachments verify+copy" block before the insert.
 
   // §4.4 (C-C1): derive orgId FIRST, before any DB lookup. The parent
   // lookup in step 2 below depends on knowing the caller's org so it can
@@ -151,6 +144,37 @@ export async function POST(request: Request) {
   const pipelineMode: "full" | "studio_only" =
     parentRunId && data.pipelineMode === "studio_only" ? "studio_only" : "full";
 
+  // Attachments verify+copy (Phase 2). Run AFTER slug + parent resolution and
+  // BEFORE the insert, so the run folder is self-contained and a failed copy is
+  // retry-safe (no row references the slug). Session-required: an env-fallback
+  // submit cannot own staged bytes (the mint route is session-only), so reject
+  // attachments unless org came from a real session. On any verify/copy failure
+  // we return that status and insert NO row.
+  let verifiedAttachments: AttachmentMeta[] = [];
+  if (data.attachments.length > 0) {
+    if (source !== "session") {
+      return Response.json(
+        { error: "Authentication required to submit attachments" },
+        { status: 401, headers: orgHeaders },
+      );
+    }
+    const copyResult = await verifyAndCopyAttachments({
+      orgId,
+      newSlug: slug,
+      draftId: data.attachmentsDraftId ?? null,
+      parentSlug: data.parentSlug ?? null,
+      items: data.attachments,
+      caller: "api/queue/route",
+    });
+    if (!copyResult.ok) {
+      return Response.json(
+        { error: "Attachment processing failed", detail: copyResult.error },
+        { status: copyResult.status ?? 500, headers: orgHeaders },
+      );
+    }
+    verifiedAttachments = copyResult.verified ?? [];
+  }
+
   // §4.4 (C-C1): explicit organization_id on insert replaces the Phase A
   // schema DEFAULT. Phase 5 will DROP DEFAULT, making this mandatory.
   const { data: row, error } = await supabase
@@ -168,15 +192,35 @@ export async function POST(request: Request) {
       estimated_minutes: estimate,
       parent_run_id: parentRunId,
       pipeline_mode: pipelineMode,
+      attachments: verifiedAttachments,
     })
     .select("id, topic_slug, estimated_minutes")
     .single();
 
   if (error) {
+    // Gemini MERGE-gate MAJOR #3 — the attachments were already copied into
+    // <orgId>/<slug>/sources/ above; the slug is single-use, so a failed insert
+    // would orphan them permanently. Best-effort clean up before returning.
+    if (verifiedAttachments.length > 0) {
+      await removeRunSources(orgId, slug, verifiedAttachments.map((a) => a.storedName));
+    }
     return Response.json(
       { error: "Failed to create job", detail: error.message },
       { status: 500, headers: orgHeaders },
     );
+  }
+
+  // Codex MERGE-gate MAJOR — the row is committed and the bytes now live under
+  // <orgId>/<slug>/sources/, so the consumed staging copies are dead weight.
+  // Best-effort delete them now (never throws), bounding the common case; the
+  // Phase-3 24h TTL sweep is the backstop for ABANDONED drafts. Only
+  // staging-origin items have a staging object to reclaim; parent carry-overs
+  // must be left intact (they belong to the parent run).
+  if (data.attachmentsDraftId) {
+    const stagedNames = data.attachments
+      .filter((a) => a.origin === "staging")
+      .map((a) => a.storedName);
+    await removeStagedFiles(orgId, data.attachmentsDraftId, stagedNames);
   }
 
   return Response.json(

@@ -14,6 +14,10 @@ import {
 import { estimateMinutes } from "@/lib/estimates";
 import type { FormStep, GeneratedQuestion } from "@/lib/types/queue";
 import { FORM_STEPS } from "@/lib/types/queue";
+// S102 file-upload — carry the parent run's attachments into a cloned draft
+// as origin:"parent" payload items so the submit route copies their bytes
+// from the parent run's sources/ folder.
+import { mapDbAttachmentsToParentPayload } from "@/lib/attachments-copy";
 
 const STORAGE_KEY = "new-research-draft";
 
@@ -79,6 +83,10 @@ export function useNewResearchForm() {
             customizations:
               manifest.customizations ?? FORM_DEFAULT_VALUES.customizations,
             notifyEmail: manifest.notifyEmail ?? "",
+            // S102 — carry parent attachments as origin:"parent". The draft id
+            // stays null (default) for clone; staged uploads in the new draft
+            // get their own draft id lazily when the user adds files.
+            attachments: mapDbAttachmentsToParentPayload(manifest.attachments),
           });
           // Don't pollute sessionStorage with the cloned manifest — the watch
           // handler will overwrite it on the next form interaction anyway.
