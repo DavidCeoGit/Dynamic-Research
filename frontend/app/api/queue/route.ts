@@ -38,6 +38,7 @@ import { researchJobPayloadSchema, generateSlug } from "@/lib/validate";
 import { estimateMinutes } from "@/lib/estimates";
 import type { SelectedProducts, AttachmentMeta } from "@/lib/types/queue";
 import { getOrgContextDualPath } from "@/lib/auth";
+import { clientIp, checkRateLimit } from "@/lib/rate-limit";
 import {
   verifyAndCopyAttachments,
   removeRunSources,
@@ -78,6 +79,37 @@ export async function POST(request: Request) {
   const orgHeaders = { "X-Org-Source": source };
 
   const data = parsed.data;
+
+  // Audit A10/M1 — throttle the attachment copy-amplifier. Submit performs
+  // the same verify+copy storage fan-out as replay (up to 5 copies + audit
+  // rows per call) whenever it carries staging attachments OR a parentSlug
+  // (origin:"parent" carry-overs copied out of the parent run's sources/).
+  // Replay gained a per-IP limiter for exactly this; submit was the open
+  // path. GATED on copy-bearing submits only (the audit's amplifier is the
+  // copy fan-out, which a text-only submit never triggers) so the common
+  // path never draws from the shared 20-token/IP bucket — a wizard flow
+  // already spends ~extract + generate + N mints, and the terminal submit
+  // must not 429 (review S109). Plain text submits stay unthrottled here,
+  // matching the route's pre-feature behavior.
+  const triggersCopyFanout =
+    (Array.isArray(data.attachments) && data.attachments.length > 0) ||
+    typeof data.parentSlug === "string";
+  if (triggersCopyFanout) {
+    const rl = await checkRateLimit(clientIp(request));
+    if (!rl.allowed) {
+      return Response.json(
+        { error: "Rate limit exceeded", detail: `Try again in ${rl.retryAfterSec}s.` },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(rl.retryAfterSec),
+            "X-Org-Source": "none",
+          },
+        },
+      );
+    }
+  }
+
   const slug = generateSlug(data.topic);
   const estimate = estimateMinutes(
     data.selectedProducts as SelectedProducts,

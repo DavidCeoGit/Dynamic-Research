@@ -23,6 +23,8 @@ import * as path from "node:path";
 import {
   sniffAttachment,
   downloadAttachments,
+  validateAttachmentMeta,
+  asMetaOrNull,
   type StorageDownloaderLike,
 } from "../lib/attachments.js";
 import { ATTACHMENTS } from "../lib/conventions.js";
@@ -435,6 +437,85 @@ test("download: never throws even when every entry is hostile", async () => {
   const result = await downloadAttachments(mockSb({}), job(hostile), workDir);
   assert.equal(result.downloaded.length, 0);
   assert.equal(result.skipped.length, hostile.length);
+});
+
+// ── Audit 2026-06-11 A6/A20 — non-object array elements ────────────────
+// The DB CHECK only guarantees jsonb_typeof='array', so a forged row can
+// hold attachments='[null, {...valid...}]'. These must SKIP-AND-RECORD,
+// never TypeError out of the never-throws contract (which used to hard-fail
+// the whole job via the executor's guard catch + buildManifest dereference).
+
+test("validateAttachmentMeta: non-object elements return a reason, never throw (A6/A20)", () => {
+  for (const junk of [null, undefined, "report.pdf", 42, true, ["nested"]]) {
+    const reason = validateAttachmentMeta(junk);
+    assert.match(reason ?? "", /not an object/, `expected object-reject for ${String(junk)}`);
+  }
+});
+
+test("asMetaOrNull: null for non-objects, identity for objects (A6/A20)", () => {
+  assert.equal(asMetaOrNull(null), null);
+  assert.equal(asMetaOrNull("x"), null);
+  assert.equal(asMetaOrNull(7), null);
+  assert.equal(asMetaOrNull(["a"]), null);
+  const m = meta();
+  assert.equal(asMetaOrNull(m), m);
+});
+
+test("download: null element skipped-and-recorded, valid sibling still downloads (A6/A20)", async () => {
+  const workDir = await tmpWorkDir();
+  const m = meta();
+  const sb = mockSb({ [`${ORG}/${SLUG}/sources/report.pdf`]: PDF_BYTES });
+  const logs: string[] = [];
+
+  const result = await downloadAttachments(
+    sb,
+    job([null as unknown as AttachmentMeta, m]),
+    workDir,
+    (msg) => logs.push(msg),
+  );
+
+  assert.equal(result.downloaded.length, 1, "valid sibling must survive the null element");
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].meta, null);
+  assert.match(result.skipped[0].reason, /not an object/);
+  // The final log loop dereferenced s.meta.storedName pre-fix — must now
+  // print the placeholder instead of throwing.
+  assert.ok(
+    logs.some((l) => l.includes("<malformed element>")),
+    `expected placeholder in skip log, got: ${logs.join(" | ")}`,
+  );
+  const written = await fs.readFile(path.join(workDir, "sources", "report.pdf"));
+  assert.ok(written.equals(PDF_BYTES));
+});
+
+test("download: null element past the max_files cap also safe (A6/A20 second instance)", async () => {
+  const workDir = await tmpWorkDir();
+  // max_files valid-shaped entries, then a null at an index >= the cap —
+  // the cap branch pushes the RAW element into skipped before validation
+  // ever runs, so it must normalize too.
+  const metas = Array.from({ length: ATTACHMENTS.max_files }, (_, i) =>
+    meta({ storedName: `f${i}.pdf` }),
+  );
+  metas.push(null as unknown as AttachmentMeta);
+  const result = await downloadAttachments(mockSb({}), job(metas), workDir);
+  const capSkip = result.skipped.find((s) => /max_files cap/.test(s.reason));
+  assert.ok(capSkip, "null element must be recorded against the cap");
+  assert.equal(capSkip.meta, null);
+});
+
+test("manifest: skipped entry with meta:null carries placeholders, never throws (A6/A20)", () => {
+  const manifest = buildManifest(fullJob([meta()]), {
+    downloaded: [],
+    skipped: [{ meta: null, reason: "malformed meta: element is not an object" }],
+  });
+  const uc = manifest.userContext as Record<string, unknown>;
+  assert.deepEqual(uc.attachmentsSkipped, [
+    {
+      originalName: "<malformed element>",
+      storedName: "<malformed element>",
+      reason: "malformed meta: element is not an object",
+    },
+  ]);
 });
 
 // ── 3 + 4. buildManifest / buildPrompt assertions ───────────────────
