@@ -73,6 +73,11 @@ export const userContextSchema = z.object({
     z.array(z.string().url().max(2000)),
   ).default([]),
   claimsToVerify: z.array(z.string().max(5000)).default([]),
+  // MRPF PUBLISH gate (S108): output bound for external distribution /
+  // decision authorization. Defaults false (dark-launch — no UI sets it yet);
+  // when true the worker refuses completion without a passing
+  // publish_verification manifest (agent/lib/publish-gate.ts).
+  publishRequired: z.boolean().default(false),
 });
 
 export const vendorEvaluationSchema = z.object({
@@ -196,7 +201,7 @@ export const attachmentsArraySchema = z
 
 export const researchJobPayloadSchema = z.object({
   topic: z.string().min(10, "Topic must be at least 10 characters").max(10000),
-  userContext: userContextSchema.optional().default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
+  userContext: userContextSchema.optional().default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [], publishRequired: false }),
   vendorEvaluation: vendorEvaluationSchema.optional().default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
   ajiDnaEnabled: z.boolean().default(false),
   selectedProducts: selectedProductsSchema,
@@ -354,7 +359,7 @@ export const selectedProductsBaseSchema = z.object({
 
 export const formDataSchema = z.object({
   topic: z.string().min(10, "Topic must be at least 10 characters").max(10000),
-  userContext: userContextSchema.default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] }),
+  userContext: userContextSchema.default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [], publishRequired: false }),
   vendorEvaluation: vendorEvaluationSchema.default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
   ajiDnaEnabled: z.boolean().default(false),
   selectedProducts: selectedProductsBaseSchema,
@@ -377,7 +382,7 @@ export type FormData = z.infer<typeof formDataSchema>;
 
 export const FORM_DEFAULT_VALUES: FormData = {
   topic: "",
-  userContext: { domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [] },
+  userContext: { domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [], publishRequired: false },
   vendorEvaluation: { enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 },
   ajiDnaEnabled: false,
   selectedProducts: { audio: false, video: false, slides: false, report: false, infographic: false },

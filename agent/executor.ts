@@ -21,6 +21,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { fileURLToPath } from "node:url";
 import * as fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { updateJob, completeJob, failJob, updatePlanReviewStatus } from "./api-client.js";
@@ -47,11 +48,23 @@ import {
   classifyTerminalError,
   markPendingTerminalExit,
 } from "./lib/preflight-backoff.js";
+import {
+  evaluatePublishGateForJob,
+  isPublishRequired,
+  readUrgentBypass,
+} from "./lib/publish-gate.js";
 import type { ResearchJob, PipelineState } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
 
 const WORKING_DIR = process.env.WORKING_DIR ?? "/c/tmp/research-compare";
+
+// MRPF PUBLISH gate (S108): operator-only URGENT risk-acceptance files live
+// here as <job-id>.txt (gitignored; OUTSIDE per-job workdirs so the spawned
+// pipeline has no business writing one). See lib/publish-gate.ts.
+const PUBLISH_RISK_ACCEPT_DIR =
+  process.env.PUBLISH_RISK_ACCEPT_DIR ??
+  path.join(process.cwd(), ".publish-risk-accepted");
 const PROJECTS_DIR = process.env.PROJECTS_DIR ??
   "/c/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/Projects";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
@@ -490,7 +503,25 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     progress_pct: 2,
   });
 
+  // MRPF PUBLISH gate (S108 Codex C3): snapshot the operator sign-off BEFORE
+  // spawning the pipeline. The completion gate consumes THIS snapshot, never a
+  // post-run re-read — the spawned child (same OS user, has Write/Bash, knows
+  // its own job id from the manifest) could otherwise forge the sign-off file
+  // mid-run. A file that must pre-date the spawn cannot be child-authored.
+  const bypassSnapshot = await readUrgentBypass(PUBLISH_RISK_ACCEPT_DIR, job.id);
+
   if (DRY_RUN) {
+    // S108 Codex C4: DRY_RUN produces no content and writes no state file, so
+    // it can never satisfy the publish gate — completing it would mark a
+    // publish-required row "completed" without any verification. Fail closed.
+    if (isPublishRequired(job, null)) {
+      const reason =
+        "PUBLISH gate fail-closed (MRPF): DRY_RUN cannot publish-clear a publish-required job — unset publishRequired for dry runs";
+      log(job.id, reason);
+      await failJob(job.id, reason);
+      await notifyTerminal(job, "failed", reason);
+      throw new Error(reason);
+    }
     log(job.id, "[DRY RUN] Skipping Claude CLI execution");
     await simulateDryRun(job);
     return slug;
@@ -600,6 +631,37 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     }
     log(job.id, verdict.reason);
 
+    // MRPF PUBLISH gate (S108) — fail-closed, BEFORE any upload: a
+    // publish-required job whose verification manifest is missing, degraded,
+    // or failed must never reach the gallery. Closes the S100 fail-open
+    // (silently-401'd Perplexity leg → WebSearch fallback → fabricated stats
+    // shipped). See lib/publish-gate.ts + the design synthesis in
+    // Documentation/mrpf-publish-gate-design-gate-peer-review.md.
+    const publishGate = evaluatePublishGateForJob(
+      job,
+      verdict.state ?? null,
+      bypassSnapshot,
+    );
+    if (publishGate.applicable) {
+      if (!publishGate.ok) {
+        const reason =
+          `PUBLISH gate fail-closed (MRPF): ${publishGate.reasons.join("; ")}`.slice(0, 2000);
+        log(job.id, reason);
+        await failJob(job.id, reason);
+        await notifyTerminal(job, "failed", reason);
+        throw new Error(reason);
+      }
+      if (publishGate.bypassed) {
+        log(
+          job.id,
+          (`[publish-gate] URGENT human risk-acceptance applied (${publishGate.signoffLine}); ` +
+            `accepted defects: ${publishGate.reasons.join("; ")}`).slice(0, 2000),
+        );
+      } else {
+        log(job.id, "[publish-gate] publish_verification PASSED — all legs live, all claims verified");
+      }
+    }
+
     log(job.id, "Pipeline complete — uploading outputs to Supabase Storage");
     const uploadResult = await uploadOutputs(job, projectsDir);
 
@@ -703,6 +765,25 @@ export function buildManifest(
     notebook_title: null,
     projects_path: path.join(PROJECTS_DIR, job.topic_slug),
     perplexity_mcp_available: true,
+    // MRPF PUBLISH gate (S108): seeded from the durable job flag; the
+    // orchestrator must carry publish_required forward in state.json and
+    // populate publish_verification before declaring completion. For
+    // publish-required jobs the Perplexity WebSearch fallback is a HARD
+    // FAILURE (skill Phase 1) and completeJob() is gated on the manifest
+    // (lib/publish-gate.ts).
+    publish_required: job.user_context.publishRequired === true,
+    publish_verification: null,
+    // S108 Gemini G1 (bypass reachability): tell the orchestrator whether a
+    // HUMAN already placed an URGENT sign-off for THIS job. Default behavior
+    // on a dead vendor leg is cheap fail-fast (ERROR-exit at the leg); when a
+    // sign-off pre-exists, the skill instead runs to completion in degraded
+    // mode (honest failing manifest + deliverables) so the worker gate can
+    // apply the human bypass. Informational only — the gate re-validates the
+    // actual file at completion time; the spawned pipeline cannot forge the
+    // authorization by editing this field.
+    urgent_signoff_present: existsSync(
+      path.join(PUBLISH_RISK_ACCEPT_DIR, `${job.id}.txt`),
+    ),
     aji_dna_enabled: job.aji_dna_enabled,
     persona_configured: false,
     topic_half_life: null,
@@ -807,7 +888,21 @@ async function runStudioOnly(
     progress_pct: 10,
   });
 
+  // MRPF PUBLISH gate (S108 Codex C3): pre-spawn sign-off snapshot — same
+  // contract as the full-pipeline path; the regen child must not be able to
+  // author its own authorization.
+  const bypassSnapshot = await readUrgentBypass(PUBLISH_RISK_ACCEPT_DIR, job.id);
+
   if (DRY_RUN) {
+    // S108 Codex C4: same fail-closed rule as the full-pipeline DRY_RUN.
+    if (isPublishRequired(job, null)) {
+      const reason =
+        "PUBLISH gate fail-closed (MRPF, studio_only): DRY_RUN cannot publish-clear a publish-required job — unset publishRequired for dry runs";
+      log(job.id, reason);
+      await failJob(job.id, reason);
+      await notifyTerminal(job, "failed", reason);
+      throw new Error(reason);
+    }
     log(job.id, "[DRY RUN] Skipping regenerate-studio-products.ts execution");
     await completeJob(job.id, slug);
     await notifyTerminal(job, "completed");
@@ -834,6 +929,44 @@ async function runStudioOnly(
     await failJob(job.id, reason);
     await notifyTerminal(job, "failed", reason);
     throw new Error(reason);
+  }
+
+  // MRPF PUBLISH gate (S108) — studio_only re-serializes existing research
+  // for external distribution, so a publish-required job must still carry a
+  // passing publish_verification in its state file. State read errors leave
+  // studioState null, which the gate treats as a missing manifest (fail
+  // closed) rather than a pass.
+  let studioState: PipelineState | null = null;
+  try {
+    const studioStateFile = await findStateFile(workDir);
+    if (studioStateFile) {
+      studioState = JSON.parse(await fs.readFile(studioStateFile, "utf-8")) as PipelineState;
+    }
+  } catch (err) {
+    // Loud, not fatal (S108 Gemini G3): a publish-flagged job (durable jsonb
+    // flag — the only flag a worker job can carry) still fails closed below
+    // via the missing manifest; this log is for the state-corruption forensics.
+    log(
+      job.id,
+      `[publish-gate] state.json unreadable in studio_only workdir (${(err as Error).message}) — gate evaluates with null state`,
+    );
+    studioState = null;
+  }
+  const publishGate = evaluatePublishGateForJob(job, studioState, bypassSnapshot);
+  if (publishGate.applicable && !publishGate.ok) {
+    const reason =
+      `PUBLISH gate fail-closed (MRPF, studio_only): ${publishGate.reasons.join("; ")}`.slice(0, 2000);
+    log(job.id, reason);
+    await failJob(job.id, reason);
+    await notifyTerminal(job, "failed", reason);
+    throw new Error(reason);
+  }
+  if (publishGate.applicable && publishGate.bypassed) {
+    log(
+      job.id,
+      (`[publish-gate] URGENT human risk-acceptance applied (${publishGate.signoffLine}); ` +
+        `accepted defects: ${publishGate.reasons.join("; ")}`).slice(0, 2000),
+    );
   }
 
   await updateJob(job.id, {
@@ -1336,6 +1469,9 @@ function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
 interface CompletionVerdict {
   success: boolean;
   reason: string;
+  /** Parsed state.json on success — consumed by the PUBLISH gate so the
+   * caller doesn't re-read/re-parse the file it was just verified from. */
+  state?: PipelineState;
 }
 
 async function verifyPipelineCompletion(workDir: string): Promise<CompletionVerdict> {
@@ -1390,7 +1526,11 @@ async function verifyPipelineCompletion(workDir: string): Promise<CompletionVerd
     };
   }
 
-  return { success: true, reason: `Pipeline reached terminal state (phase ${phaseRaw}, phase_status: "${phaseStatusStr}")` };
+  return {
+    success: true,
+    reason: `Pipeline reached terminal state (phase ${phaseRaw}, phase_status: "${phaseStatusStr}")`,
+    state,
+  };
 }
 
 // ── Output uploader ─────────────────────────────────────────────────

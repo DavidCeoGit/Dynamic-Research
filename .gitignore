@@ -43,6 +43,9 @@ backup-claude-config/
 **/.preflight-backoff
 **/.staging-sweep-last
 agent/scripts/.phase-a-bootstrap-state.json
+# MRPF PUBLISH gate: operator-only URGENT risk-acceptance files (<job-id>.txt).
+# Never committed — a sign-off is per-job human authorization, not a reusable artifact.
+agent/.publish-risk-accepted/
 
 # claude machine-local + session/runtime (DO commit settings.json + sandbox-allowlist)
 **/.claude/settings.local.json
