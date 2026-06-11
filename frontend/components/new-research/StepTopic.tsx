@@ -15,11 +15,6 @@ import {
 } from "@/lib/attachments-constants";
 import { ArrowRight, Upload, FileText, X, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 
-// S102 file-upload — the entire attachments zone is gated behind this flag.
-// MUST be accessed as this EXACT static expression so the Next 16 Edge runtime
-// inlines the NEXT_PUBLIC_* value at build time. Do not destructure or compute.
-const ATTACHMENTS_ENABLED = process.env.NEXT_PUBLIC_ATTACHMENTS_ENABLED === "1";
-
 type UiStatus = "uploading" | "ready" | "error";
 
 interface UiAttachment {
@@ -287,97 +282,95 @@ export function StepTopic({ onNext }: StepProps) {
         </div>
       </div>
 
-      {ATTACHMENTS_ENABLED && (
-        <div>
-          <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-500 mb-2">
-            Attach files <span className="text-zinc-600 normal-case font-normal">(optional)</span>
-          </h3>
+      <div>
+        <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-500 mb-2">
+          Attach files <span className="text-zinc-600 normal-case font-normal">(optional)</span>
+        </h3>
 
-          {/* Drop zone */}
-          <div
-            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-            onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
-            onDrop={onDrop}
-            className={`rounded-lg border border-dashed px-4 py-6 text-center transition ${
-              isDragging
-                ? "border-[#c8a951] bg-[#c8a951]/5"
-                : "border-zinc-700 bg-zinc-900/40"
-            }`}
-          >
-            <Upload className="mx-auto h-5 w-5 text-zinc-500" />
-            <p className="mt-2 text-sm text-zinc-400">
-              Drag &amp; drop, or{" "}
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="text-[#c8a951] hover:underline font-medium"
-              >
-                browse
-              </button>
-            </p>
-            <p className="mt-1 text-xs text-zinc-600">
-              PDF, TXT, MD · up to {ATTACHMENT_MAX_FILES} files · {humanSize(ATTACHMENT_MAX_FILE_BYTES)} each
-            </p>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept={acceptAttr}
-              onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
-              className="hidden"
-            />
-          </div>
-
-          {/* Current attachments — uploaded (ready) + in-flight/error UI rows. */}
-          {uiItems.length > 0 && (
-            <ul className="mt-3 space-y-1.5">
-              {uiItems.map((ui) => (
-                <li
-                  key={ui.tempId}
-                  className="flex items-center gap-2.5 rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2"
-                >
-                  <FileText className="h-4 w-4 shrink-0 text-zinc-500" />
-                  <span className="flex-1 min-w-0 truncate text-sm text-zinc-300" title={ui.originalName}>
-                    {ui.originalName}
-                  </span>
-                  <span className="shrink-0 text-xs text-zinc-600">{humanSize(ui.sizeBytes)}</span>
-                  {ui.status === "uploading" && (
-                    <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
-                      <Loader2 className="h-2.5 w-2.5 animate-spin" /> uploading
-                    </span>
-                  )}
-                  {ui.status === "ready" && (
-                    <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 text-[10px] text-emerald-400">
-                      <CheckCircle2 className="h-2.5 w-2.5" /> ready
-                    </span>
-                  )}
-                  {ui.status === "error" && (
-                    <span
-                      className="inline-flex shrink-0 items-center gap-1 rounded-full bg-red-500/10 border border-red-500/30 px-2 py-0.5 text-[10px] text-red-400"
-                      title={ui.errorMessage}
-                    >
-                      <AlertCircle className="h-2.5 w-2.5" /> error
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => void removeItem(ui)}
-                    className="shrink-0 rounded p-0.5 text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition"
-                    aria-label={`Remove ${ui.originalName}`}
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-          {attachments.length > 0 && (
-            <p className="mt-1.5 text-[11px] text-zinc-600">
-              {attachments.length} file{attachments.length === 1 ? "" : "s"} attached
-            </p>
-          )}
+        {/* Drop zone */}
+        <div
+          onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+          onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+          onDrop={onDrop}
+          className={`rounded-lg border border-dashed px-4 py-6 text-center transition ${
+            isDragging
+              ? "border-[#c8a951] bg-[#c8a951]/5"
+              : "border-zinc-700 bg-zinc-900/40"
+          }`}
+        >
+          <Upload className="mx-auto h-5 w-5 text-zinc-500" />
+          <p className="mt-2 text-sm text-zinc-400">
+            Drag &amp; drop, or{" "}
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="text-[#c8a951] hover:underline font-medium"
+            >
+              browse
+            </button>
+          </p>
+          <p className="mt-1 text-xs text-zinc-600">
+            PDF, TXT, MD · up to {ATTACHMENT_MAX_FILES} files · {humanSize(ATTACHMENT_MAX_FILE_BYTES)} each
+          </p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept={acceptAttr}
+            onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
+            className="hidden"
+          />
         </div>
-      )}
+
+        {/* Current attachments — uploaded (ready) + in-flight/error UI rows. */}
+        {uiItems.length > 0 && (
+          <ul className="mt-3 space-y-1.5">
+            {uiItems.map((ui) => (
+              <li
+                key={ui.tempId}
+                className="flex items-center gap-2.5 rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2"
+              >
+                <FileText className="h-4 w-4 shrink-0 text-zinc-500" />
+                <span className="flex-1 min-w-0 truncate text-sm text-zinc-300" title={ui.originalName}>
+                  {ui.originalName}
+                </span>
+                <span className="shrink-0 text-xs text-zinc-600">{humanSize(ui.sizeBytes)}</span>
+                {ui.status === "uploading" && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
+                    <Loader2 className="h-2.5 w-2.5 animate-spin" /> uploading
+                  </span>
+                )}
+                {ui.status === "ready" && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 text-[10px] text-emerald-400">
+                    <CheckCircle2 className="h-2.5 w-2.5" /> ready
+                  </span>
+                )}
+                {ui.status === "error" && (
+                  <span
+                    className="inline-flex shrink-0 items-center gap-1 rounded-full bg-red-500/10 border border-red-500/30 px-2 py-0.5 text-[10px] text-red-400"
+                    title={ui.errorMessage}
+                  >
+                    <AlertCircle className="h-2.5 w-2.5" /> error
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void removeItem(ui)}
+                  className="shrink-0 rounded p-0.5 text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition"
+                  aria-label={`Remove ${ui.originalName}`}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {attachments.length > 0 && (
+          <p className="mt-1.5 text-[11px] text-zinc-600">
+            {attachments.length} file{attachments.length === 1 ? "" : "s"} attached
+          </p>
+        )}
+      </div>
 
       <div className="flex justify-end">
         <button
