@@ -1,8 +1,9 @@
 {
   "_doc": "Canonical conventions for Dynamic Research deliverables. Loaded by both agent/lib/conventions.ts and agent/lib/conventions.py — DO NOT duplicate values in language wrappers. Update this file, then regenerate any cached state in dependent scripts.",
   "_version": 3,
-  "_last_updated": "2026-06-10 (S102)",
+  "_last_updated": "2026-06-11 (S107)",
   "_changelog": {
+    "v3.1 (S107)": "Studio report mds now get a pandoc .docx companion ({title_slug}-{timestamp}-report.docx) so the gallery can offer a Word download for the Studio report like it does for research mds. Added per-product 'docx_companion' flag (report: true, others: false); lint-deliverables accepts ext 'docx' for flagged products and excludes companions from duplicate/coverage counting; skill Phase 6 Step C now converts ALL *.md deliverables in the Projects folder (research mds + titled Studio report md). Gallery unchanged — it keys off .docx existence.",
     "v3 (S102)": "Added 'attachments' block for the user file-upload feature: allowed extensions/MIME types (PDF/TXT/MD only), per-file/total size caps, max file count, staging prefix + sources subdir names, staging TTL, and the orchestrator's PDF page-read + per-file digest caps. Frontend mirror: frontend/lib/attachments-constants.ts (pair-edit). NOTE: conventions.json changes require a worker daemon restart (project CLAUDE.md §7).",
     "v2 (S30)": "Added 'nlm-' to skip prefixes (was missing — only 'nlm_' was in v1, but actual NLM-discovered helper filenames use hyphen); added 'context' to research roles (was rejected as 'unknown' by lint script during S29 cleanup); added 'extensions' skip rule with '.py' (helper Python scripts in workdir must not upload to Supabase); documented state.json upload policy explicitly.",
     "v1 (S28)": "Initial conventions module: slugify rules, filename patterns (studio + research + research_docx_companion), skip files, supabase storage bucket, NLM workflow constants, Windows quirks."
@@ -20,29 +21,35 @@
       "_doc": "NLM-generated Studio products. Title-prefix from NLM artifact metadata.",
       "pattern": "{title_slug}-{timestamp}-{product}.{ext}",
       "regex": "^([a-z0-9-]+)-(\\d{8}-\\d{6})-([a-z]+)\\.([a-z0-9]+)$",
+      "_docx_companion_doc": "v3.1 (S107): when true, a pandoc-generated .docx companion ({title_slug}-{timestamp}-{product}.docx) is a valid sibling of the canonical file — lint accepts it and excludes it from duplicate/coverage counting. Only 'report' (an .md deliverable) has one; media products cannot.",
       "products": {
         "audio": {
           "ext": "mp3",
+          "docx_companion": false,
           "list_method": "list_audio",
           "download_method": "download_audio"
         },
         "video": {
           "ext": "mp4",
+          "docx_companion": false,
           "list_method": "list_video",
           "download_method": "download_video"
         },
         "slides": {
           "ext": "pdf",
+          "docx_companion": false,
           "list_method": "list_slide_decks",
           "download_method": "download_slide_deck"
         },
         "report": {
           "ext": "md",
+          "docx_companion": true,
           "list_method": "list_reports",
           "download_method": "download_report"
         },
         "infographic": {
           "ext": "png",
+          "docx_companion": false,
           "list_method": "list_infographics",
           "download_method": "download_infographic"
         }
