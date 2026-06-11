@@ -26,6 +26,13 @@ interface SlugifyConfig {
 
 interface ProductDef {
   ext: string;
+  /**
+   * v3.1 (S107): when true, a pandoc-generated `.docx` sibling
+   * (`{title_slug}-{timestamp}-{product}.docx`) is a valid companion of the
+   * canonical file — lint accepts it and excludes it from duplicate/coverage
+   * counting. Only `report` (an .md deliverable) carries one.
+   */
+  docx_companion: boolean;
   list_method: string;
   download_method: string;
 }

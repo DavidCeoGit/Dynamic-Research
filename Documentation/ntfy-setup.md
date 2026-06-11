@@ -56,6 +56,19 @@ generate your own:
 
     node -e "console.log('dr-queue-' + require('crypto').randomBytes(16).toString('base64url'))"
 
+PowerShell-native equivalent (no Node, no quoting risk):
+
+    $b = [byte[]]::new(16)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($b)
+    'dr-queue-' + [Convert]::ToBase64String($b).TrimEnd('=').Replace('+','-').Replace('/','_')
+
+Channel pre-check (verifies phone+topic before any DB wiring — Windows
+PowerShell aliases `curl` to Invoke-WebRequest, so use `curl.exe`):
+
+    curl.exe -d "manual test from terminal" ntfy.sh/<your-topic-name>
+
+Phone should buzz within ~2s.
+
 ### Step 2 — Install the ntfy app
 
 - iOS:     https://apps.apple.com/us/app/ntfy/id1625396347
@@ -158,11 +171,20 @@ No app redeploy needed.
 
 ## What's promoted where
 
-- `20260610120000_phase_a_notifications_ntfy_webhook.sql` → `supabase/migrations/`
-  (renamed from `20260610_…` in S104 — its original date-only version token
-  `20260610` collided with the already-applied attachments migration, which
-  `supabase db push` silently skips; the 14-digit `20260610120000` version
-  makes it apply. Do NOT rename it back.)
+- `20260611000000_phase_a_notifications_ntfy_webhook.sql` → `supabase/migrations/`
+  (renamed TWICE — both renames load-bearing, do NOT rename back:
+  1. S104: `20260610_…` → `20260610120000_…` — the date-only version token
+     `20260610` collided with the already-applied attachments migration, which
+     `supabase db push` silently skips.
+  2. S105: `20260610120000_…` → `20260611000000_…` — the CLI sorts files by
+     FILENAME for its local↔remote merge-join, and `20260610120000_…` sorts
+     BEFORE `20260610_research_queue_attachments.sql` (digit `1` < underscore
+     `_` in ASCII). That broke the pairing of the applied `20260610` attachments
+     migration and made `db push` abort with "Remote migration versions not
+     found in local migrations directory" — and the CLI's auto-suggested fix
+     (`migration repair --status reverted 20260610`) targets the WRONG, applied
+     migration; never run it. A pending migration's version must sort AFTER
+     every same-day applied one, hence the next-day `20260611000000` stamp.)
 - `NTFY-SETUP.md` → `Documentation/ntfy-setup.md`
 
 The topic name itself never enters git — it's stored only in Vault.

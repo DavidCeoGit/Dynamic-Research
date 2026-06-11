@@ -101,16 +101,26 @@ async function main() {
           });
         }
         const expectedExt = STUDIO_PRODUCTS[parsed.product]?.ext;
-        if (expectedExt && parsed.ext !== expectedExt) {
+        // v3.1 (S107): a .docx sibling is a valid pandoc companion for
+        // products flagged docx_companion (report only) — the gallery keys
+        // its Word-download button off the companion's existence.
+        const isDocxCompanion =
+          parsed.ext === "docx" &&
+          STUDIO_PRODUCTS[parsed.product]?.docx_companion === true;
+        if (expectedExt && parsed.ext !== expectedExt && !isDocxCompanion) {
           violations.push({
             severity: "error",
             file: name,
             msg: `Studio product "${parsed.product}" expects .${expectedExt}, got .${parsed.ext}`,
           });
         }
-        const list = studioProductsSeen.get(parsed.product) ?? [];
-        list.push(name);
-        studioProductsSeen.set(parsed.product, list);
+        // Companions don't count toward duplicate/coverage tracking — only
+        // canonical-ext files represent the product.
+        if (!isDocxCompanion) {
+          const list = studioProductsSeen.get(parsed.product) ?? [];
+          list.push(name);
+          studioProductsSeen.set(parsed.product, list);
+        }
       }
     }
 

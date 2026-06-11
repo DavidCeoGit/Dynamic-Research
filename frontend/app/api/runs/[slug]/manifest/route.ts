@@ -24,6 +24,8 @@ import {
   projectExists,
 } from "@/lib/storage";
 import { getOrgContextDualPath } from "@/lib/auth";
+import { getSupabase } from "@/lib/supabase";
+import type { AttachmentMeta } from "@/lib/types/queue";
 
 export const dynamic = "force-dynamic";
 
@@ -58,6 +60,12 @@ interface ManifestResponse {
     studio: Record<string, Record<string, unknown>>;
   };
   notifyEmail: string;
+  // S102 file-upload — the parent run's stored attachments (plain
+  // AttachmentMeta, origin stripped). Clone & Edit re-tags these origin:"parent"
+  // so the submit route copies their bytes from the parent's sources/ folder.
+  // Sourced from the research_queue row (not state.json), org-scoped. [] when
+  // the parent has none / is a pre-S102 row.
+  attachments: AttachmentMeta[];
   // Lineage — the slug being cloned. Form re-sends this as parentSlug on submit.
   parentSlug: string;
   parentTopic: string;
@@ -97,6 +105,34 @@ export async function GET(
       { status: 500, headers: orgHeaders },
     );
   }
+
+  // S102 file-upload — attachments are NOT in state.json; they live on the
+  // research_queue row. Read them org-scoped (the `.eq("organization_id")` is
+  // the cross-tenant boundary, matching plan-review/route.ts + replay/route.ts).
+  // Defaults to [] when the column is null/absent or the row is gone (legacy
+  // storage-only run) — never fails the manifest just because attachments
+  // couldn't be loaded.
+  // Gemini MERGE-gate BLOCKING #2 — distinguish "no queue row" (legacy
+  // storage-only run → [] is correct, must still clone) from "DB query errored"
+  // (transient → must NOT silently drop the parent's attachments, which would
+  // permanently truncate the clone). .maybeSingle() returns error:null + data:
+  // null when the row is simply absent, so a populated error is a genuine
+  // failure → fail closed with 500 rather than returning [].
+  let attachments: AttachmentMeta[] = [];
+  const supabase = getSupabase();
+  const { data: attachRow, error: attachErr } = await supabase
+    .from("research_queue")
+    .select("attachments")
+    .eq("topic_slug", slug)
+    .eq("organization_id", orgId)
+    .maybeSingle();
+  if (attachErr) {
+    return Response.json(
+      { error: "Failed to read attachments", detail: attachErr.message },
+      { status: 500, headers: orgHeaders },
+    );
+  }
+  attachments = (attachRow?.attachments as AttachmentMeta[] | null) ?? [];
 
   // Strip runtime-only fields. The form ingests userContext sans contextFilePath
   // + localSourcePath; vendorEvaluation sans vendorsDiscovered/Shortlisted/Excluded
@@ -156,6 +192,7 @@ export async function GET(
       studio: (cust.studio as Record<string, Record<string, unknown>>) ?? {},
     },
     notifyEmail: "",
+    attachments,
     parentSlug: slug,
     parentTopic: (state.topic as string) ?? "",
   };

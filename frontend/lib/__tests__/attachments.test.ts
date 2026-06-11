@@ -25,6 +25,13 @@ import {
   attachmentsArraySchema,
   researchJobPayloadSchema,
 } from "../validate";
+import {
+  mapDbAttachmentsToParentPayload,
+  partitionByOrigin,
+  stripOrigin,
+  buildCopyPlan,
+} from "../attachments-copy";
+import type { AttachmentMeta } from "../types/queue";
 
 const ORG = "0a1b2c3d-0a1b-4c3d-8e9f-0a1b2c3d4e5f";
 const DRAFT = "11111111-2222-4333-8444-555555555555";
@@ -326,4 +333,146 @@ test("mirror helpers: reject Windows reserved device basenames (Codex S103 MAJOR
     scopedStagingPath(ORG, DRAFT, "connection.pdf"),
     `${ORG}/uploads/${DRAFT}/connection.pdf`,
   );
+});
+
+// ── Phase 2: attachments-copy pure helpers ──────────────────────────
+//
+// These cover the submit-time verify+copy planning surface (the impure
+// storage orchestration in lib/storage.ts builds on these). The
+// mapDbAttachmentsToParentPayload vectors are the §3b regression guard: a
+// replayed/cloned attachment-bearing run must carry its parent's files
+// (the CRITICAL the S102 Phase-1 Gemini-grounded review flagged).
+
+const META_A: AttachmentMeta = {
+  originalName: "Brief A.pdf",
+  storedName: "brief-a.pdf",
+  sizeBytes: 1234,
+  contentType: "application/pdf",
+  uploadedAt: "2026-06-10T12:00:00.000Z",
+};
+const META_B: AttachmentMeta = {
+  originalName: "notes.md",
+  storedName: "notes.md",
+  sizeBytes: 88,
+  contentType: "text/markdown",
+  uploadedAt: "2026-06-10T12:01:00.000Z",
+};
+
+test("mapDbAttachmentsToParentPayload: null/empty → []", () => {
+  assert.deepEqual(mapDbAttachmentsToParentPayload(null), []);
+  assert.deepEqual(mapDbAttachmentsToParentPayload(undefined), []);
+  assert.deepEqual(mapDbAttachmentsToParentPayload([]), []);
+});
+
+test("mapDbAttachmentsToParentPayload: tags origin:parent, preserves every field (§3b)", () => {
+  const out = mapDbAttachmentsToParentPayload([META_A, META_B]);
+  assert.equal(out.length, 2);
+  for (const item of out) assert.equal(item.origin, "parent");
+  // Field-for-field carry — a dropped field here is a silently-lost attachment.
+  assert.deepEqual(out[0], { ...META_A, origin: "parent" });
+  assert.deepEqual(out[1], { ...META_B, origin: "parent" });
+  // The mapped payload must itself satisfy the payload schema.
+  assert.doesNotThrow(() => attachmentPayloadItemSchema.parse(out[0]));
+});
+
+test("partitionByOrigin: splits staging vs parent, preserves order", () => {
+  const s1 = { ...META_A, origin: "staging" as const };
+  const p1 = { ...META_B, origin: "parent" as const };
+  const s2 = { ...META_A, storedName: "brief-a-1.pdf", origin: "staging" as const };
+  const { staging, parent } = partitionByOrigin([s1, p1, s2]);
+  assert.deepEqual(staging, [s1, s2]);
+  assert.deepEqual(parent, [p1]);
+});
+
+test("stripOrigin: drops the payload-only origin field", () => {
+  const stripped = stripOrigin([
+    { ...META_A, origin: "staging" },
+    { ...META_B, origin: "parent" },
+  ]);
+  assert.deepEqual(stripped, [META_A, META_B]);
+  assert.ok(!("origin" in stripped[0]));
+});
+
+test("buildCopyPlan: staging item resolves uploads→sources paths", () => {
+  const plan = buildCopyPlan({
+    orgId: ORG,
+    newSlug: SLUG,
+    draftId: DRAFT,
+    items: [{ ...META_A, origin: "staging" }],
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].fromPath, `${ORG}/uploads/${DRAFT}/brief-a.pdf`);
+  assert.equal(plan[0].toPath, `${ORG}/${SLUG}/sources/brief-a.pdf`);
+  assert.equal(plan[0].sizeBytes, META_A.sizeBytes);
+  assert.equal(plan[0].origin, "staging");
+});
+
+test("buildCopyPlan: parent item resolves parentSources→sources paths", () => {
+  const plan = buildCopyPlan({
+    orgId: ORG,
+    newSlug: SLUG,
+    parentSlug: "parent-run-1a2b3c4d",
+    items: [{ ...META_B, origin: "parent" }],
+  });
+  assert.equal(plan[0].fromPath, `${ORG}/parent-run-1a2b3c4d/sources/notes.md`);
+  assert.equal(plan[0].toPath, `${ORG}/${SLUG}/sources/notes.md`);
+});
+
+test("buildCopyPlan: throws when a staging item has no draftId", () => {
+  assert.throws(() =>
+    buildCopyPlan({
+      orgId: ORG,
+      newSlug: SLUG,
+      draftId: null,
+      items: [{ ...META_A, origin: "staging" }],
+    }),
+  );
+});
+
+test("buildCopyPlan: throws when a parent item has no parentSlug", () => {
+  assert.throws(() =>
+    buildCopyPlan({
+      orgId: ORG,
+      newSlug: SLUG,
+      parentSlug: null,
+      items: [{ ...META_B, origin: "parent" }],
+    }),
+  );
+});
+
+test("buildCopyPlan: throws on duplicate storedName across origins (Codex BLOCKING)", () => {
+  // A clone carries parent attachment "brief-a.pdf" while a freshly-staged
+  // upload also resolved to "brief-a.pdf": both map to the SAME destination
+  // toPath. The plan must reject this LOUDLY rather than silently clobbering
+  // one file and persisting a row that claims two attachments.
+  assert.throws(
+    () =>
+      buildCopyPlan({
+        orgId: ORG,
+        newSlug: SLUG,
+        draftId: DRAFT,
+        parentSlug: "parent-run-1a2b3c4d",
+        items: [
+          { ...META_A, origin: "staging" },
+          { ...META_A, origin: "parent" }, // same storedName as the staging item
+        ],
+      }),
+    /duplicate storedName/,
+  );
+});
+
+test("buildCopyPlan: distinct storedNames across origins are allowed", () => {
+  const plan = buildCopyPlan({
+    orgId: ORG,
+    newSlug: SLUG,
+    draftId: DRAFT,
+    parentSlug: "parent-run-1a2b3c4d",
+    items: [
+      { ...META_A, origin: "staging" },
+      { ...META_B, origin: "parent" },
+    ],
+  });
+  assert.equal(plan.length, 2);
+  assert.equal(plan[0].toPath, `${ORG}/${SLUG}/sources/brief-a.pdf`);
+  assert.equal(plan[1].toPath, `${ORG}/${SLUG}/sources/notes.md`);
 });

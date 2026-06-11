@@ -36,6 +36,7 @@ import {
   NOTIFY_THRESHOLD,
 } from "./lib/preflight-backoff.js";
 import { sendPreflightBackoffEmail } from "./lib/notify.js";
+import { maybeRunStagingSweep } from "./lib/staging-sweep.js";
 import type { ResearchJob } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -239,6 +240,12 @@ async function poll(): Promise<void> {
 
     if (!job) {
       log("No pending jobs");
+      // S106 Phase 3 — opportunistic staging-TTL sweep, only on idle ticks so
+      // it never delays a claimed job. Internally gated to ~once per 24h via
+      // a file-backed marker (.staging-sweep-last); best-effort, never throws.
+      if (!DRY_RUN) {
+        await maybeRunStagingSweep({ logFn: (m) => log(m) });
+      }
       return;
     }
 

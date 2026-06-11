@@ -24,6 +24,15 @@ function normalizeUrl(url: string): string {
   return `https://${url}`;
 }
 
+// S102 file-upload — human-readable byte size for the Attached Files review row.
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+}
+
 // Path C (S29): "from topic" pill marks items that the LLM extracted from
 // the topic field, distinguishing them from items the user typed via dynamic
 // question answers. Helps the user spot misextractions before submission.
@@ -49,6 +58,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
   const userContext = watch("userContext");
   const extractedContext = watch("extractedContext");
   const pipelineMode = watch("pipelineMode") ?? "full";
+  const attachments = watch("attachments");
 
   const selectedProducts = Object.entries(products ?? {}).filter(([, v]) => v);
 
@@ -197,6 +207,32 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
           <p className="text-xs text-zinc-500 italic">Default settings</p>
         )}
       </div>
+
+      {/* S102 file-upload — Attached Files (only when at least one attached).
+          Items carried from a cloned parent run carry origin:"parent" and get
+          a "cloned from original run" badge. */}
+      {attachments && attachments.length > 0 && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-2">
+          <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-500 mb-2">Attached Files</h3>
+          <ul className="space-y-1.5">
+            {attachments.map((a, i) => (
+              <li key={a.storedName ?? i} className="flex items-center gap-2.5 text-sm text-zinc-300">
+                <FileText className="h-4 w-4 shrink-0 text-zinc-500" />
+                <span className="flex-1 min-w-0 truncate" title={a.originalName}>{a.originalName}</span>
+                {a.origin === "parent" && (
+                  <span
+                    className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[#c8a951]/10 border border-[#c8a951]/30 px-1.5 py-0.5 text-[10px] font-medium text-[#c8a951]"
+                    title="Carried over from the run you cloned."
+                  >
+                    <Repeat className="h-2.5 w-2.5" /> cloned from original run
+                  </span>
+                )}
+                <span className="shrink-0 text-xs text-zinc-600">{humanSize(a.sizeBytes)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* CE-3 — Pipeline mode (only shown when cloning). studio_only skips
           Claude + deep research; the worker spawns regenerate-studio-products

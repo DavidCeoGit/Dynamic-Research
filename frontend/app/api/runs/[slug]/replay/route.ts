@@ -24,8 +24,11 @@ import {
   generateSlug,
 } from "@/lib/validate";
 import { estimateMinutes } from "@/lib/estimates";
-import type { SelectedProducts } from "@/lib/types/queue";
+import type { SelectedProducts, AttachmentMeta } from "@/lib/types/queue";
 import { getOrgContextDualPath } from "@/lib/auth";
+import { verifyAndCopyAttachments, removeRunSources } from "@/lib/storage";
+import { mapDbAttachmentsToParentPayload } from "@/lib/attachments-copy";
+import { clientIp, checkRateLimit } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -40,6 +43,17 @@ export async function POST(
   { params }: { params: Promise<{ slug: string }> },
 ) {
   const { slug } = await params;
+
+  // Interim grounded-review #3 — replay mutates (insert) and fans out up to 5
+  // storage copies + audit inserts per call; throttle it per-IP like the mint
+  // route, so it can't be used as a free amplifier.
+  const rl = await checkRateLimit(clientIp(request));
+  if (!rl.allowed) {
+    return Response.json(
+      { error: "Rate limit exceeded", detail: `Try again in ${rl.retryAfterSec}s.` },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+    );
+  }
 
   const { orgId, source } = await getOrgContextDualPath();
   const orgHeaders = { "X-Org-Source": source };
@@ -78,7 +92,11 @@ export async function POST(
   const { data: parent, error: fetchErr } = await supabase
     .from("research_queue")
     .select(
-      "topic, user_context, vendor_evaluation, aji_dna_enabled, selected_products, customizations, notify_email",
+      // Codex MERGE-gate MINOR — select `id` HERE so the lineage FK comes from
+      // this single org-scoped, error-checked query. The prior code re-queried
+      // for `id` later and ignored that second query's error, so a transient
+      // failure there silently dropped lineage (parent_run_id → null).
+      "id, topic, user_context, vendor_evaluation, aji_dna_enabled, selected_products, customizations, notify_email, attachments",
     )
     .eq("topic_slug", slug)
     .eq("organization_id", orgId)
@@ -147,6 +165,13 @@ export async function POST(
     notifyEmail: (parent.notify_email as string | null) ?? "",
     parentSlug: slug,
     pipelineMode: "full" as const,
+    // §3b — carry the parent's attachments forward (origin:"parent"); the
+    // verify+copy below moves the bytes into the new run's sources/. Without
+    // this, replaying an attachment-bearing run silently drops its files.
+    attachments: mapDbAttachmentsToParentPayload(
+      parent.attachments as AttachmentMeta[] | null | undefined,
+    ),
+    attachmentsDraftId: null,
   };
 
   const parsed = researchJobPayloadSchema.safeParse(candidatePayload);
@@ -168,13 +193,38 @@ export async function POST(
     data.vendorEvaluation.enabled,
   );
 
-  const { data: parentRow } = await supabase
-    .from("research_queue")
-    .select("id")
-    .eq("topic_slug", slug)
-    .eq("organization_id", orgId)
-    .maybeSingle();
-  const parentRunId = parentRow?.id ?? null;
+  // Lineage FK reuses the `id` already fetched (+ org-scoped + error-checked)
+  // by the single parent query above (Codex MERGE-gate MINOR).
+  const parentRunId = (parent.id as string | null) ?? null;
+
+  // §3b — verify the parent's attachments still exist under its sources/ and
+  // copy them into the new run's sources/ BEFORE inserting the row (same
+  // submit-time verify+copy the /api/queue route uses). Session-required when
+  // attachments are present, mirroring submit. On any failure: no row inserted.
+  let verifiedAttachments: AttachmentMeta[] = [];
+  if (data.attachments.length > 0) {
+    if (source !== "session") {
+      return Response.json(
+        { error: "Authentication required to replay a run with attachments" },
+        { status: 401, headers: orgHeaders },
+      );
+    }
+    const copyResult = await verifyAndCopyAttachments({
+      orgId,
+      newSlug,
+      draftId: null,
+      parentSlug: slug,
+      items: data.attachments,
+      caller: "api/runs/replay",
+    });
+    if (!copyResult.ok) {
+      return Response.json(
+        { error: "Attachment processing failed", detail: copyResult.error },
+        { status: copyResult.status ?? 500, headers: orgHeaders },
+      );
+    }
+    verifiedAttachments = copyResult.verified ?? [];
+  }
 
   const { data: row, error: insertErr } = await supabase
     .from("research_queue")
@@ -191,11 +241,18 @@ export async function POST(
       estimated_minutes: estimate,
       parent_run_id: parentRunId,
       pipeline_mode: "full",
+      attachments: verifiedAttachments,
     })
     .select("id, topic_slug, estimated_minutes")
     .single();
 
   if (insertErr) {
+    // Gemini MERGE-gate MAJOR #3 — clean up the copies made above (the new slug
+    // is single-use; a failed insert would orphan them under the new run's
+    // sources/ permanently).
+    if (verifiedAttachments.length > 0) {
+      await removeRunSources(orgId, newSlug, verifiedAttachments.map((a) => a.storedName));
+    }
     return Response.json(
       { error: "Failed to create replay job", detail: insertErr.message },
       { status: 500, headers: orgHeaders },
