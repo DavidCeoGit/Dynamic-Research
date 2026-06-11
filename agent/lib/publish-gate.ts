@@ -64,6 +64,33 @@ export type JobPublishGateResult = PublishGateResult & {
 
 const LEG_NAMES = ["perplexity", "notebooklm", "claude"] as const;
 const CLAIM_PASS_VERDICTS = new Set(["verified", "verified_with_caveat"]);
+const SOURCE_QUALITY_CLASSES = new Set(["primary", "official", "reputable-secondary", "weak"]);
+
+/** Strict calendar-date check (S108 Codex C5): exact YYYY-MM-DD that
+ * round-trips through Date — "2026-99-99 junk" must not pass. */
+const isRealIsoDate = (s: string): boolean => {
+  const t = s.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) return false;
+  const d = new Date(`${t}T00:00:00.000Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === t;
+};
+
+const isHttpUrl = (s: string): boolean => {
+  if (typeof s !== "string" || !/^https?:\/\//i.test(s.trim())) return false;
+  try {
+    new URL(s.trim());
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Source dates allow annotations ("2026-01-15 (published)") but must contain
+ * a real calendar date. */
+const containsRealIsoDate = (s: string): boolean => {
+  const m = typeof s === "string" ? s.match(/\d{4}-\d{2}-\d{2}/) : null;
+  return m !== null && isRealIsoDate(m[0]);
+};
 /** Sanity bound — a manifest claiming more load-bearing claims than this is
  * pathological (inflated extraction) and blocks rather than soaking IO. */
 const MAX_CLAIMS = 500;
@@ -121,25 +148,31 @@ function validateClaim(claim: unknown, idx: number, reasons: string[]): void {
   if (typeof c.text !== "string" || c.text.trim().length === 0) {
     reasons.push(`${label} has no claim text`);
   }
-  if (typeof c.asOfDate !== "string" || !/^\d{4}-\d{2}-\d{2}/.test(c.asOfDate.trim())) {
-    reasons.push(`${label} missing temporal anchor (asOfDate must be an ISO date)`);
+  if (typeof c.asOfDate !== "string" || !isRealIsoDate(c.asOfDate)) {
+    reasons.push(
+      `${label} missing temporal anchor (asOfDate must be a real YYYY-MM-DD calendar date)`,
+    );
   }
   if (
     !Array.isArray(c.sourceUrls) ||
     c.sourceUrls.length === 0 ||
-    !c.sourceUrls.every((u) => typeof u === "string" && u.trim().length > 0)
+    !c.sourceUrls.every((u) => typeof u === "string" && isHttpUrl(u))
   ) {
-    reasons.push(`${label} has no source URLs — unsourced load-bearing claim`);
+    reasons.push(
+      `${label} has no parseable http(s) source URLs — unsourced load-bearing claim`,
+    );
   }
   if (
     !Array.isArray(c.sourceDates) ||
     c.sourceDates.length === 0 ||
-    !c.sourceDates.every((d) => typeof d === "string" && d.trim().length > 0)
+    !c.sourceDates.every((d) => typeof d === "string" && containsRealIsoDate(d))
   ) {
-    reasons.push(`${label} missing source publication/access dates`);
+    reasons.push(`${label} missing dated source publication/access entries (YYYY-MM-DD)`);
   }
-  if (typeof c.sourceQualityClass !== "string" || c.sourceQualityClass.trim().length === 0) {
-    reasons.push(`${label} missing source-quality class`);
+  if (typeof c.sourceQualityClass !== "string" || !SOURCE_QUALITY_CLASSES.has(c.sourceQualityClass.trim())) {
+    reasons.push(
+      `${label} sourceQualityClass "${truncate(String(c.sourceQualityClass))}" not in {primary, official, reputable-secondary, weak}`,
+    );
   }
   if (typeof c.upstreamIndependenceBasis !== "string" || c.upstreamIndependenceBasis.trim().length === 0) {
     reasons.push(
@@ -325,18 +358,23 @@ export async function readUrgentBypass(dir: string, jobId: string): Promise<Bypa
 }
 
 /**
- * The single call sites in executor.ts use: applicability check + bypass read
- * + gate evaluation in one step, fully unit-testable without spawning jobs.
+ * The executor call sites use: applicability check + gate evaluation in one
+ * step, fully unit-testable without spawning jobs.
+ *
+ * `bypassRead` is the PRE-SPAWN snapshot from readUrgentBypass (S108 Codex
+ * C3): the executor reads the sign-off file BEFORE the pipeline child starts
+ * and this function never re-reads the filesystem — so a sign-off the child
+ * forges mid-run (it knows its own job id from the manifest) arrives too late
+ * to be consumed. Human authorization must pre-date the spawn.
  */
-export async function evaluatePublishGateForJob(
+export function evaluatePublishGateForJob(
   job: Pick<ResearchJob, "id" | "user_context">,
   state: PipelineState | null | undefined,
-  bypassDir: string,
-): Promise<JobPublishGateResult> {
+  bypassRead: BypassReadResult,
+): JobPublishGateResult {
   if (!isPublishRequired(job, state)) {
     return { applicable: false, ok: true, bypassed: false, reasons: [] };
   }
-  const bypassRead = await readUrgentBypass(bypassDir, job.id);
   const bypass = bypassRead.present && bypassRead.valid ? { signoffLine: bypassRead.signoffLine } : null;
   const result = evaluatePublishGate(state, { bypass });
   if (bypassRead.present && !bypassRead.valid && !result.ok) {

@@ -242,7 +242,7 @@ test("claim-count sanity bound blocks pathological manifests", () => {
 // ── Per-claim field gating ──────────────────────────────────────────
 
 test("missing-anchor: claim without asOfDate blocks; non-ISO anchor blocks", () => {
-  for (const asOfDate of ["", "soon", "June 2026"]) {
+  for (const asOfDate of ["", "soon", "June 2026", "2026-99-99", "2026-02-30", "2026-06-10 plus junk"]) {
     const res = evaluatePublishGate(publishState(greenManifest({ claims: [greenClaim({ asOfDate })] })));
     assert.equal(res.ok, false, `asOfDate="${asOfDate}" should block`);
     assert.ok(res.reasons.some((r) => r.includes("temporal anchor")));
@@ -254,7 +254,7 @@ test("unsourced claim blocks: empty sourceUrls / sourceDates / quality / indepen
     { sourceUrls: [] },
     { sourceUrls: ["  "] },
     { sourceDates: [] },
-    { sourceQualityClass: "" },
+    { sourceQualityClass: "" as VerifiedClaim["sourceQualityClass"] },
     { upstreamIndependenceBasis: " " },
     { counterEvidenceNotes: "" },
     { text: "" },
@@ -262,6 +262,29 @@ test("unsourced claim blocks: empty sourceUrls / sourceDates / quality / indepen
   for (const c of cases) {
     const res = evaluatePublishGate(publishState(greenManifest({ claims: [greenClaim(c)] })));
     assert.equal(res.ok, false, `${JSON.stringify(c)} should block`);
+  }
+});
+
+test("junk source metadata blocks: non-URL sources, undated sources, free-form quality class (S108 Codex C5)", () => {
+  const cases: Array<Partial<VerifiedClaim>> = [
+    { sourceUrls: ["not a url"] },
+    { sourceUrls: ["ftp://example.com/x"] },
+    { sourceUrls: ["https://"] },
+    { sourceDates: ["recently"] },
+    { sourceDates: ["2026-99-99 (published)"] },
+    { sourceQualityClass: "made-up" as VerifiedClaim["sourceQualityClass"] },
+    { sourceQualityClass: "very reputable" as VerifiedClaim["sourceQualityClass"] },
+  ];
+  for (const c of cases) {
+    const res = evaluatePublishGate(publishState(greenManifest({ claims: [greenClaim(c)] })));
+    assert.equal(res.ok, false, `${JSON.stringify(c)} should block`);
+  }
+  // all four legitimate quality classes pass
+  for (const sourceQualityClass of ["primary", "official", "reputable-secondary", "weak"] as const) {
+    const res = evaluatePublishGate(
+      publishState(greenManifest({ claims: [greenClaim({ sourceQualityClass })] })),
+    );
+    assert.equal(res.ok, true, `${sourceQualityClass} should pass`);
   }
 });
 
@@ -328,13 +351,13 @@ test("readUrgentBypass: non-UUID job ids never touch the filesystem", async () =
 
 test("ForJob: non-publish job is not applicable and passes", async () => {
   const dir = await tmpBypassDir();
-  const res = await evaluatePublishGateForJob(jobWith(undefined), publishState(null, { publish_required: false }), dir);
+  const res = evaluatePublishGateForJob(jobWith(undefined), publishState(null, { publish_required: false }), await readUrgentBypass(dir, JOB_ID));
   assert.deepEqual(res, { applicable: false, ok: true, bypassed: false, reasons: [] });
 });
 
 test("ForJob: publish job with green manifest passes without bypass", async () => {
   const dir = await tmpBypassDir();
-  const res = await evaluatePublishGateForJob(jobWith(true), publishState(greenManifest()), dir);
+  const res = evaluatePublishGateForJob(jobWith(true), publishState(greenManifest()), await readUrgentBypass(dir, JOB_ID));
   assert.equal(res.applicable, true);
   assert.equal(res.ok, true);
   assert.equal(res.bypassed, false);
@@ -343,7 +366,7 @@ test("ForJob: publish job with green manifest passes without bypass", async () =
 test("URGENT-without-signoff: publish job with failing manifest and no sign-off blocks", async () => {
   const dir = await tmpBypassDir();
   const m = greenManifest({ verification_status: "failed" });
-  const res = await evaluatePublishGateForJob(jobWith(true), publishState(m), dir);
+  const res = evaluatePublishGateForJob(jobWith(true), publishState(m), await readUrgentBypass(dir, JOB_ID));
   assert.equal(res.ok, false);
   assert.equal(res.bypassed, false);
 });
@@ -352,7 +375,7 @@ test("ForJob: valid URGENT sign-off + >=1 live leg bypasses, preserving accepted
   const dir = await tmpBypassDir();
   await fs.writeFile(path.join(dir, `${JOB_ID}.txt`), VALID_SIGNOFF);
   const m = greenManifest({ verification_status: "failed" }); // legs still all ok
-  const res = await evaluatePublishGateForJob(jobWith(true), publishState(m), dir);
+  const res = evaluatePublishGateForJob(jobWith(true), publishState(m), await readUrgentBypass(dir, JOB_ID));
   assert.equal(res.ok, true);
   assert.equal(res.bypassed, true);
   assert.ok(res.reasons.length > 0);
@@ -370,7 +393,7 @@ test("ForJob: valid sign-off but ALL legs dead still blocks (one LIVE grounded p
       claude: { status: "skipped" },
     },
   });
-  const res = await evaluatePublishGateForJob(jobWith(true), publishState(m), dir);
+  const res = evaluatePublishGateForJob(jobWith(true), publishState(m), await readUrgentBypass(dir, JOB_ID));
   assert.equal(res.ok, false);
   assert.ok(res.reasons.some((r) => r.includes("LIVE grounded verification path")));
 });
@@ -378,14 +401,14 @@ test("ForJob: valid sign-off but ALL legs dead still blocks (one LIVE grounded p
 test("ForJob: malformed sign-off file is surfaced in the block reasons", async () => {
   const dir = await tmpBypassDir();
   await fs.writeFile(path.join(dir, `${JOB_ID}.txt`), "approved, go ahead");
-  const res = await evaluatePublishGateForJob(jobWith(true), publishState(null), dir);
+  const res = evaluatePublishGateForJob(jobWith(true), publishState(null), await readUrgentBypass(dir, JOB_ID));
   assert.equal(res.ok, false);
   assert.ok(res.reasons.some((r) => r.includes("risk-acceptance file rejected")));
 });
 
 test("ForJob: missing manifest on a publish job blocks (fail closed, e.g. studio_only without state)", async () => {
   const dir = await tmpBypassDir();
-  const res = await evaluatePublishGateForJob(jobWith(true), null, dir);
+  const res = evaluatePublishGateForJob(jobWith(true), null, await readUrgentBypass(dir, JOB_ID));
   assert.equal(res.applicable, true);
   assert.equal(res.ok, false);
 });

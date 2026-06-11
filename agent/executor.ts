@@ -48,7 +48,11 @@ import {
   classifyTerminalError,
   markPendingTerminalExit,
 } from "./lib/preflight-backoff.js";
-import { evaluatePublishGateForJob } from "./lib/publish-gate.js";
+import {
+  evaluatePublishGateForJob,
+  isPublishRequired,
+  readUrgentBypass,
+} from "./lib/publish-gate.js";
 import type { ResearchJob, PipelineState } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -499,7 +503,25 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     progress_pct: 2,
   });
 
+  // MRPF PUBLISH gate (S108 Codex C3): snapshot the operator sign-off BEFORE
+  // spawning the pipeline. The completion gate consumes THIS snapshot, never a
+  // post-run re-read — the spawned child (same OS user, has Write/Bash, knows
+  // its own job id from the manifest) could otherwise forge the sign-off file
+  // mid-run. A file that must pre-date the spawn cannot be child-authored.
+  const bypassSnapshot = await readUrgentBypass(PUBLISH_RISK_ACCEPT_DIR, job.id);
+
   if (DRY_RUN) {
+    // S108 Codex C4: DRY_RUN produces no content and writes no state file, so
+    // it can never satisfy the publish gate — completing it would mark a
+    // publish-required row "completed" without any verification. Fail closed.
+    if (isPublishRequired(job, null)) {
+      const reason =
+        "PUBLISH gate fail-closed (MRPF): DRY_RUN cannot publish-clear a publish-required job — unset publishRequired for dry runs";
+      log(job.id, reason);
+      await failJob(job.id, reason);
+      await notifyTerminal(job, "failed", reason);
+      throw new Error(reason);
+    }
     log(job.id, "[DRY RUN] Skipping Claude CLI execution");
     await simulateDryRun(job);
     return slug;
@@ -615,10 +637,10 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     // (silently-401'd Perplexity leg → WebSearch fallback → fabricated stats
     // shipped). See lib/publish-gate.ts + the design synthesis in
     // Documentation/mrpf-publish-gate-design-gate-peer-review.md.
-    const publishGate = await evaluatePublishGateForJob(
+    const publishGate = evaluatePublishGateForJob(
       job,
       verdict.state ?? null,
-      PUBLISH_RISK_ACCEPT_DIR,
+      bypassSnapshot,
     );
     if (publishGate.applicable) {
       if (!publishGate.ok) {
@@ -866,7 +888,21 @@ async function runStudioOnly(
     progress_pct: 10,
   });
 
+  // MRPF PUBLISH gate (S108 Codex C3): pre-spawn sign-off snapshot — same
+  // contract as the full-pipeline path; the regen child must not be able to
+  // author its own authorization.
+  const bypassSnapshot = await readUrgentBypass(PUBLISH_RISK_ACCEPT_DIR, job.id);
+
   if (DRY_RUN) {
+    // S108 Codex C4: same fail-closed rule as the full-pipeline DRY_RUN.
+    if (isPublishRequired(job, null)) {
+      const reason =
+        "PUBLISH gate fail-closed (MRPF, studio_only): DRY_RUN cannot publish-clear a publish-required job — unset publishRequired for dry runs";
+      log(job.id, reason);
+      await failJob(job.id, reason);
+      await notifyTerminal(job, "failed", reason);
+      throw new Error(reason);
+    }
     log(job.id, "[DRY RUN] Skipping regenerate-studio-products.ts execution");
     await completeJob(job.id, slug);
     await notifyTerminal(job, "completed");
@@ -916,7 +952,7 @@ async function runStudioOnly(
     );
     studioState = null;
   }
-  const publishGate = await evaluatePublishGateForJob(job, studioState, PUBLISH_RISK_ACCEPT_DIR);
+  const publishGate = evaluatePublishGateForJob(job, studioState, bypassSnapshot);
   if (publishGate.applicable && !publishGate.ok) {
     const reason =
       `PUBLISH gate fail-closed (MRPF, studio_only): ${publishGate.reasons.join("; ")}`.slice(0, 2000);

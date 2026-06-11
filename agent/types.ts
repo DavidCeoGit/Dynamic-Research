@@ -66,15 +66,18 @@ export interface PublishVendorLegs {
 
 export type ClaimVerdict = "verified" | "verified_with_caveat" | "refuted" | "unverifiable";
 
+export type SourceQualityClass = "primary" | "official" | "reputable-secondary" | "weak";
+
 export interface VerifiedClaim {
   text: string;
-  /** Temporal anchor — the ISO date the claim is asserted current as of. */
+  /** Temporal anchor — a real YYYY-MM-DD calendar date (strictly validated). */
   asOfDate: string;
+  /** Parseable http(s) URLs (strictly validated — S108 Codex C5). */
   sourceUrls: string[];
-  /** Publication or access date per source (parallel to sourceUrls). */
+  /** Publication or access date per source; each must contain a YYYY-MM-DD. */
   sourceDates: string[];
-  /** e.g. "primary" | "official" | "reputable-secondary" | "weak" */
-  sourceQualityClass: string;
+  /** Closed set — free-form classes are rejected by the gate (Codex C5). */
+  sourceQualityClass: SourceQualityClass;
   /** Why the corroborating sources do NOT trace to the same upstream. */
   upstreamIndependenceBasis: string;
   verdict: ClaimVerdict;

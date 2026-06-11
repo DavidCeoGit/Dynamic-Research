@@ -134,6 +134,10 @@ export async function POST(
       constraints: (uc.constraints as string[]) ?? [],
       additionalUrls: (uc.additionalUrls as string[]) ?? [],
       claimsToVerify: (uc.claimsToVerify as string[]) ?? [],
+      // MRPF PUBLISH gate (S108 Codex C2): a replay of a publish-bound run
+      // must stay publish-bound — omitting this let zod default it to false,
+      // silently downgrading the rerun out of the verification gate.
+      publishRequired: uc.publishRequired === true,
     },
     vendorEvaluation: {
       enabled: (ve.enabled as boolean) ?? false,
