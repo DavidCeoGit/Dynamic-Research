@@ -19,54 +19,60 @@
  *
  * Manual CLI wrapper: agent/scripts/cleanup-staging-uploads.ts.
  *
- * ── S111 sweep-hardening trio (+ MERGE-gate integrations) ────────────
- * Three coupled robustness fixes layered on the S106 base, refined by the
- * Gemini (holistic) + Codex (grounded) MERGE-gate review:
- *   1. Marker-write-failure → FAIL CLOSED. The 24h gate keyed solely on a
- *      file marker silently failed OPEN if the marker WRITE failed (ENOSPC,
- *      permissions): every idle tick re-swept, hammering storage. The durable
- *      marker is now CLAIMED (written) BEFORE the sweep, and if that write
- *      fails the sweep is SKIPPED — a GC backstop can wait until the disk is
- *      healthy, which is strictly better than re-sweeping on every worker
- *      respawn (Codex BLOCKING: an in-memory-only backoff resets on the
- *      cron-respawn PID rotation, so it can't restore the 24h guarantee on a
- *      broken disk). A module-level in-memory backoff additionally paces the
- *      gate within a single process so a broken disk doesn't trigger a
- *      claim-attempt every 30s tick.
- *   2. Marker-before-sweep. The marker is claimed BEFORE the sweep runs. A
- *      sweep that crashes the *process* (OOM on a huge listing — not
- *      JS-catchable, so the never-throws contract can't help) would otherwise
- *      crash-loop the worker on every idle tick and starve all job
- *      processing. Claiming the 24h window first trades that for an unfinished
- *      tail waiting ≤24h — the correct trade for a GC backstop. The marker is
- *      re-written AFTER the sweep with the COMPLETION timestamp + resume
- *      cursors (so a >24h sweep isn't immediately due again).
- *   3. MAX_PAGES stable-cursor (inherit + prune-on-full-pass). When a prefix
- *      exceeds the MAX_PAGES page cap, a resume offset is persisted in the
- *      marker; the next sweep continues from there, advancing and wrapping to
- *      a fresh full pass on exhaustion → bounded eventual coverage. Cursors
- *      are INHERITED across sweeps (Gemini BLOCKING #1): a nested prefix whose
- *      parent paginated past it this sweep keeps its saved cursor instead of
- *      being dropped, so deep tails aren't permanently starved. Orphaned
- *      cursors (for a deleted child folder) are PRUNED — but ONLY when a parent
- *      listing exhausts from offset 0, i.e. a COMPLETE pass that genuinely saw
- *      every child (Codex MAJOR closed the forever-leak; Codex QA BLOCKING then
- *      caught that pruning on a RESUMED-then-exhausted parent — which saw only
- *      the tail — would wrongly drop cursors for children before the resume
- *      offset, reintroducing starvation; hence the offset-0 guard).
+ * ── S111 sweep-hardening trio (carried forward) ──────────────────────
+ *   1. Marker-write-failure → FAIL CLOSED (the durable 24h marker is CLAIMED
+ *      before the sweep; a failed claim SKIPS rather than re-sweeping on every
+ *      respawn). A module-level in-memory backoff paces a single process.
+ *   2. Marker-before-sweep (claim the window first so a process-crashing OOM
+ *      sweep can't crash-loop the worker; re-stamp at COMPLETION).
+ *   3. Stable resume cursor for truncated listings.
  *
- * KNOWN LIMITATION (Gemini #2 / Codex MAJOR — deliberate follow-up): MAX_PAGES
- * caps per-PREFIX listing only. Total sweep work (one list() per org, per
- * draft) is NOT bounded, and the worker awaits the sweep on its idle tick, so
- * a pathological tree (e.g. one org with tens of thousands of abandoned
- * drafts) could delay job polling. At this system's realistic tenant/draft
- * scale (drafts cap at ATTACHMENT_MAX_FILES files; jobs run 30–50 min so a
- * sub-minute pickup delay is immaterial) this is a tail risk, and marker-
- * before-sweep already prevents a runaway sweep from crash-looping the worker.
- * A proper per-sweep request budget with TREE-POSITION resume is tracked as a
- * follow-up; it is deliberately NOT bolted on here because a naive budget that
- * aborts mid-tree without position resume would reintroduce the tail
- * starvation item 3 just fixed.
+ * ── S112 per-sweep budget + breadth-fair circular-ring resume ─────────
+ * The S111 KNOWN LIMITATION (Gemini #2 / Codex MAJOR, deferred by owner) is
+ * CLOSED here. Total sweep work is now bounded so the GC walk can never delay
+ * the worker's idle-tick job polling on a pathological tree (one org with tens
+ * of thousands of abandoned drafts). Design + dual-reviewer gate:
+ * Documentation/sweep-fanout-budget-design-gate{,-peer-review}.md.
+ *
+ * Model (replaces the S111 per-prefix `Record<prefix,offset>` map):
+ *   - ONE PAGE PER REQUEST. Each list() pulls a single LIST_LIMIT page; the
+ *     walk descends/continues page by page. No multi-page accumulation (the old
+ *     MAX_PAGES loop, under a request budget, re-fetched discarded pages — a
+ *     thrash; Gemini #2). Memory is O(page × depth).
+ *   - BUDGET counted at EVERY list level (root, uploads/, per-draft files):
+ *     a global request cap (maxRequests) + wall-clock cap (maxMillis) bound the
+ *     whole sweep; a per-org cap (maxRequestsPerOrg) bounds any single tenant so
+ *     a giant org yields and other orgs are still serviced this sweep (Codex #3:
+ *     the cap MUST count file-list calls — a 50k-draft org is 50k file lists).
+ *   - BREADTH-FAIR CIRCULAR RING over orgs (Gemini #1 fairness; Codex #1/#2):
+ *     `rootOffset` is a raw root-listing position that advances past EVERY root
+ *     page (incl. org-less ones) and WRAPS to 0 at root EOF from ANY start —
+ *     so no tenant is starved and the pointer can't strand past the end. Per-org
+ *     in-progress position lives in `orgResume[orgId] = {draftOffset,fileOffset}`.
+ *   - RAW-OFFSET resume (Codex #4): resume offsets index the unfiltered listing
+ *     position (junk/non-UUID entries occupy a raw index), never the filtered
+ *     array index — otherwise resume steps backward / loops.
+ *   - ORPHAN PRUNE (Codex #5) only after a COMPLETE offset-0 → all-pages-EOF
+ *     root pass with no error and no budget stop (a partial view must not drop a
+ *     live org's resume entry).
+ *   - SAFETY FLOOR (Codex-confirmed): the destructive core (UUID org/draft
+ *     filters, `uploads` staging prefix, metadata-file filter, stampMs < cutoff)
+ *     is UNCHANGED, so a resume-math bug is at worst a transient miss reclaimed
+ *     on the next ring wrap — never an over-delete of a live file.
+ *   - DELETE-SHIFT CONVERGENCE (MERGE-gate Codex BLOCKING): a remove() shrinks
+ *     the listing (Supabase folders are virtual — a draft/org folder vanishes when
+ *     its last object is deleted), so a forward resume offset persisted across a
+ *     delete can land PAST the survivors that shifted left → that one sweep
+ *     under-deletes and the orgResume entry clears on the false-EOF. The NEXT
+ *     from-0 visit re-lists the shifted-left survivors and reclaims them; each
+ *     ring with survivors deletes >=1, so the worker provably DRAINS EVERY expired
+ *     file over successive 24h sweeps (verified to 50k drafts in the suite — see
+ *     "WORKER converges" test). It is bounded EVENTUAL coverage, not single-pass:
+ *     a pathological tenant drains slowly (fairness + tick-protection > drain
+ *     speed; raise the caps if faster reclamation is ever needed). The MANUAL CLI
+ *     (cleanup-staging-uploads.ts) therefore loops until a COMPLETE RING deletes
+ *     nothing (per-ring, not per-chunk) so a delete-shift mid-ring EOF cannot make
+ *     it report a false "drained."
  */
 
 import * as fs from "node:fs/promises";
@@ -78,18 +84,32 @@ import { ATTACHMENTS, BUCKET } from "./conventions.js";
 const UUID_SHAPE_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Supabase storage list() page size. listPrefix paginates with an offset
-// loop (S106 Gemini finding 3: a fixed single page starves old drafts once
-// an org accumulates >1000 — name-sorted UUIDs carry no age correlation, so
-// the expired tail would never be reached). MAX_PAGES bounds a runaway
-// prefix; hitting it sets stats.truncated AND records a resume cursor
-// (S111 item 3) so the deferred tail is reached on a later sweep rather
-// than restarting at offset 0 every time.
+// Supabase storage list() page size. The walk lists exactly ONE page per
+// request (S112) — name-sorted UUIDs carry no age correlation, so a fixed
+// single page once a prefix exceeds 1000 would starve the tail; the budgeted
+// ring instead pages through everything across sweeps via the resume cursor.
 const LIST_LIMIT = 1000;
-const MAX_PAGES = 20;
 // Bulk-delete batch size (single DELETE calls 400 on empty-body+JSON CT —
 // always use the bulk endpoint; see feedback_supabase_storage_bulk_delete).
 const DELETE_BATCH = 100;
+
+// ── Per-sweep budget defaults (S112) ─────────────────────────────────
+// maxMillis is the PRIMARY tick-delay guard (bounds wall-clock to well under
+// the 30s poll interval). maxRequests is a deterministic backup bound.
+// maxRequestsPerOrg enforces multi-tenant fairness (a giant org yields after
+// this many list calls so other orgs are serviced). At realistic scale a sweep
+// finishes far below any cap and behaves exactly as before. See design §5.
+//
+// SAFE FLOORS (MERGE-gate Codex MINOR): the worker + CLI always use these
+// defaults. A 3-level tree needs >=3 list calls (root + uploads + files) to reach
+// a leaf, so maxRequests<3 / maxRequestsPerOrg<2 cannot make leaf progress and are
+// UNSAFE — they exist only for unit tests that exercise the cursor mechanics on
+// sub-budget slices (the prod callers never pass sub-floor values). maxMillis must
+// be > 0. These are not clamped (clamping would defeat those mechanics tests); they
+// are simply never supplied below the floor by any production path.
+const MAX_REQUESTS = 300;
+const MAX_REQUESTS_PER_ORG = 50;
+const MAX_MILLIS = 15_000;
 
 interface ListedObject {
   name: string;
@@ -118,8 +138,27 @@ export interface StorageSweepClientLike {
   };
 }
 
-/** Per-prefix resume offsets for truncated listings (S111 item 3). */
-export type SweepCursors = Record<string, number>;
+/** Per-org in-progress walk position (raw offsets), set when an org is not
+ *  fully drained in a sweep; cleared when it drains completely. */
+export interface OrgResume {
+  draftOffset: number;
+  fileOffset: number;
+}
+
+/**
+ * Resume state persisted in the marker between sweeps (S112). Replaces the
+ * S111 `SweepCursors = Record<prefix, offset>` map.
+ *   - rootOffset: raw root-listing position where the next sweep resumes
+ *     scanning org folders. Circular — advances per root page (incl. org-less
+ *     pages) and wraps to 0 at root EOF from any start.
+ *   - orgResume: per-org {draftOffset, fileOffset} for orgs truncated this
+ *     sweep. Keyed by org id; cardinality ≈ tenant count. Pruned (orphan org
+ *     folders) only after a complete offset-0 all-pages-EOF root pass.
+ */
+export interface WalkCursor {
+  rootOffset: number;
+  orgResume: Record<string, OrgResume>;
+}
 
 export interface SweepStats {
   orgsScanned: number;
@@ -129,25 +168,12 @@ export interface SweepStats {
   deleted: number;
   /** Accumulated non-fatal errors (list/remove failures). */
   errors: string[];
-  /** True if a prefix exceeded the MAX_PAGES pagination cap — remainder deferred. */
-  truncated: boolean;
-  /**
-   * Resume offsets to persist for the NEXT sweep, keyed by prefix. Seeded
-   * from the incoming cursors and adjusted per prefix VISITED this sweep:
-   *   - truncated this sweep → offset advanced to the resume point;
-   *   - exhausted this sweep  → entry cleared (wraps to a fresh pass);
-   *   - errored this sweep    → entry left as-is (retry same region);
-   *   - NOT visited (parent paginated past it) → inherited entry kept.
-   * Keeping inherited entries is the Gemini S111 BLOCKING #1 fix: an empty-
-   * by-default map silently dropped cursors for nested prefixes skipped under
-   * a paginating ancestor, permanently starving their tails. To stop a deleted
-   * child's cursor from then leaking forever (Codex MAJOR), orphaned
-   * descendant cursors are pruned — but ONLY after a COMPLETE (offset-0)
-   * parent pass that exhausts, since a resumed-then-exhausted parent saw only
-   * its tail and must not drop cursors for children before the resume offset
-   * (Codex QA BLOCKING).
-   */
-  nextCursors: SweepCursors;
+  /** Storage list() calls issued this sweep (the budgeted unit). */
+  requestsUsed: number;
+  /** True if the GLOBAL budget (maxRequests/maxMillis) tripped this sweep. */
+  budgetExhausted: boolean;
+  /** Resume cursor to persist for the NEXT sweep (circular ring + per-org). */
+  nextCursor: WalkCursor;
   /** Populated in dryRun mode with the paths that WOULD be deleted. */
   wouldDelete: string[];
 }
@@ -157,77 +183,199 @@ export interface SweepOptions {
   now?: Date;
   dryRun?: boolean;
   logFn?: (msg: string) => void;
-  /**
-   * Incoming resume offsets (from the prior sweep's nextCursors). A prefix
-   * present here is listed starting at its saved offset instead of 0.
-   */
-  cursors?: SweepCursors;
+  /** Global per-sweep request cap (default MAX_REQUESTS). */
+  maxRequests?: number;
+  /** Per-org request cap for fairness (default MAX_REQUESTS_PER_ORG). */
+  maxRequestsPerOrg?: number;
+  /** Global wall-clock cap in ms (default MAX_MILLIS). */
+  maxMillis?: number;
+  /** Injectable clock for the elapsed/maxMillis check (defaults to `now` or wall-clock). */
+  clockFn?: () => Date;
+  /** Resume cursor from the prior sweep's nextCursor. */
+  startCursor?: WalkCursor;
 }
 
-/**
- * Outcome of paginating a single prefix. Three states drive cursor handling:
- *   - exhausted: reached the end this pass → cursor cleared (wrap). If the pass
- *                also started at offset 0 the COMPLETE child set is known, so
- *                orphan cursors can be pruned (see sweepStagingUploads).
- *   - truncated: hit MAX_PAGES, more remains → cursor advances to resumeOffset;
- *                child set is INCOMPLETE, so no pruning.
- *   - error:     list failed → cursor left untouched so the same region is
- *                retried next sweep (deletes are idempotent); no pruning.
- */
-type ListResult =
-  | { items: ListedObject[]; status: "exhausted" }
-  | { items: ListedObject[]; status: "truncated"; resumeOffset: number }
-  | { items: ListedObject[]; status: "error" };
+type DrainReason = "GLOBAL" | "PER_ORG" | "ERROR" | "DONE";
 
-async function listPrefix(
-  sb: StorageSweepClientLike,
-  prefix: string,
-  stats: SweepStats,
-  startOffset: number,
-): Promise<ListResult> {
-  const all: ListedObject[] = [];
-  for (let page = 0; page < MAX_PAGES; page++) {
-    // Offset-based resume. Note (Gemini S111 #3): if a prior sweep deleted
-    // entries before this offset the listing shifts left, so a resumed offset
-    // can step over a few not-yet-seen entries — but the cursor eventually
-    // exhausts and wraps to 0, so nothing is PERMANENTLY skipped; the misses
-    // are transient and reclaimed on the next full pass. Acceptable for a
-    // daily GC backstop.
-    const offset = startOffset + page * LIST_LIMIT;
-    // try/catch in addition to {error} inspection: a REJECTED list()
-    // (network throw, client bug) must also degrade to a recorded error —
-    // never escape the sweep's never-throws contract (S106 Codex MAJOR #3).
-    let items: ListedObject[];
-    try {
-      const { data, error } = await sb.storage.from(BUCKET).list(prefix, {
-        limit: LIST_LIMIT,
-        offset,
-        sortBy: { column: "name", order: "asc" },
-      });
-      if (error) throw new Error(error.message);
-      items = data ?? [];
-    } catch (err) {
-      stats.errors.push(
-        `list(${prefix || "<root>"}) failed: ${(err as Error).message}`,
-      );
-      return { items: all, status: "error" };
-    }
-    all.push(...items);
-    if (items.length < LIST_LIMIT) return { items: all, status: "exhausted" };
-  }
-  // MAX_PAGES full pages — more remain; persist where to resume next sweep.
-  const resumeOffset = startOffset + MAX_PAGES * LIST_LIMIT;
-  stats.truncated = true;
-  stats.errors.push(
-    `list(${prefix || "<root>"}) hit page cap at offset ${resumeOffset} — remainder deferred to next sweep (resume cursor saved)`,
+/** Shared mutable walk context — threaded through the ring + drain helpers. */
+interface SweepCtx {
+  sb: StorageSweepClientLike;
+  cutoffMs: number;
+  maxRequests: number;
+  maxRequestsPerOrg: number;
+  maxMillis: number;
+  clock: () => Date;
+  t0: number;
+  stats: SweepStats;
+  cursor: WalkCursor;
+  expiredPaths: string[];
+  /** List calls spent on the CURRENT org (reset at each org entry). */
+  perOrg: number;
+}
+
+/** Global budget predicate — request count OR wall-clock. */
+function overGlobalBudget(ctx: SweepCtx): boolean {
+  return (
+    ctx.stats.requestsUsed >= ctx.maxRequests ||
+    ctx.clock().getTime() - ctx.t0 >= ctx.maxMillis
   );
-  return { items: all, status: "truncated", resumeOffset };
+}
+
+/** Reject `p` if it doesn't settle within `ms` (timer unref'd + cleared). */
+function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(msg)), ms);
+    // unref so a pending storage call can't keep the worker process alive.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
 }
 
 /**
- * Delete staged attachment files older than the TTL. Best-effort: list and
- * remove failures accumulate in stats.errors; the sweep continues. Never
- * throws on storage-layer failures.
+ * List exactly one page. Increments the global request counter (the single
+ * place a list is counted — a thrown/timed-out list still consumes a budget
+ * unit BY DESIGN, so an error storm can't spin a prefix for free; the worker
+ * just waits for the next 24h sweep). Never throws (S106 Codex MAJOR #3): a
+ * resolved {error}, a rejected promise, AND a wall-clock timeout all degrade to
+ * {error:true} + a recorded stats.errors entry; the caller then leaves the
+ * relevant cursor UNTOUCHED so the same region is retried next sweep (deletes
+ * are idempotent).
+ *
+ * The per-call timeout (breadth-review F1) bounds a SINGLE hung list() to the
+ * remaining wall-clock budget — maxMillis is otherwise only sampled BETWEEN
+ * calls, so without this one stalled storage call (up to the HTTP client's own
+ * long default timeout) could delay the worker's idle tick past maxMillis,
+ * defeating the headline tick-protection guarantee. Tests resolve list()
+ * synchronously, so the timer never fires.
+ */
+async function listPage(
+  ctx: SweepCtx,
+  prefix: string,
+  offset: number,
+): Promise<{ items: ListedObject[]; eof: boolean; error: boolean }> {
+  ctx.stats.requestsUsed += 1;
+  const remainingMs = ctx.maxMillis - (ctx.clock().getTime() - ctx.t0);
+  try {
+    const listCall = ctx.sb.storage.from(BUCKET).list(prefix, {
+      limit: LIST_LIMIT,
+      offset,
+      sortBy: { column: "name", order: "asc" },
+    });
+    const { data, error } =
+      remainingMs > 0
+        ? await withTimeout(listCall, remainingMs, `list exceeded maxMillis budget (${remainingMs}ms left)`)
+        : await listCall;
+    if (error) throw new Error(error.message);
+    const items = data ?? [];
+    return { items, eof: items.length < LIST_LIMIT, error: false };
+  } catch (err) {
+    ctx.stats.errors.push(
+      `list(${prefix || "<root>"}@${offset}) failed: ${(err as Error).message}`,
+    );
+    return { items: [], eof: false, error: true };
+  }
+}
+
+/** Collect expired file paths from a draft's listed objects (predicate UNCHANGED). */
+function collectExpired(
+  ctx: SweepCtx,
+  draftPrefix: string,
+  files: ListedObject[],
+): void {
+  for (const file of files) {
+    ctx.stats.filesScanned += 1;
+    const stamp = file.created_at ?? file.updated_at ?? null;
+    const stampMs = stamp ? Date.parse(stamp) : NaN;
+    if (Number.isNaN(stampMs)) {
+      // Unknown age — leave it; better an orphan than deleting a file some
+      // live draft is about to submit.
+      ctx.stats.errors.push(
+        `${draftPrefix}/${file.name}: unparseable created_at, left in place`,
+      );
+      continue;
+    }
+    if (stampMs < ctx.cutoffMs) {
+      ctx.stats.expired += 1;
+      ctx.expiredPaths.push(`${draftPrefix}/${file.name}`);
+    }
+  }
+}
+
+/** Page a single draft's files from fileStart; counts each list at global+per-org. */
+async function drainDraftFiles(
+  ctx: SweepCtx,
+  draftPrefix: string,
+  fileStart: number,
+): Promise<{ complete: boolean; fileOffset: number; files: ListedObject[]; reason: DrainReason }> {
+  const files: ListedObject[] = [];
+  let fileOffset = fileStart;
+  for (;;) {
+    if (overGlobalBudget(ctx))
+      return { complete: false, fileOffset, files, reason: "GLOBAL" };
+    if (ctx.perOrg >= ctx.maxRequestsPerOrg)
+      return { complete: false, fileOffset, files, reason: "PER_ORG" };
+    const page = await listPage(ctx, draftPrefix, fileOffset);
+    ctx.perOrg += 1;
+    if (page.error)
+      return { complete: false, fileOffset, files, reason: "ERROR" };
+    for (const e of page.items) if (e.metadata !== null) files.push(e);
+    if (page.eof) return { complete: true, fileOffset: 0, files, reason: "DONE" };
+    fileOffset += page.items.length;
+  }
+}
+
+/** Bounded two-level walk of one org (drafts → files) from its resume position. */
+async function drainOrg(
+  ctx: SweepCtx,
+  orgId: string,
+  resume: OrgResume,
+): Promise<{ complete: boolean; resume: OrgResume; reason: DrainReason }> {
+  const stagingRoot = `${orgId}/${ATTACHMENTS.staging_prefix}`;
+  let draftOffset = resume.draftOffset;
+  let firstDraft = true;
+  for (;;) {
+    if (overGlobalBudget(ctx))
+      return { complete: false, resume: { draftOffset, fileOffset: 0 }, reason: "GLOBAL" };
+    if (ctx.perOrg >= ctx.maxRequestsPerOrg)
+      return { complete: false, resume: { draftOffset, fileOffset: 0 }, reason: "PER_ORG" };
+    const page = await listPage(ctx, stagingRoot, draftOffset);
+    ctx.perOrg += 1;
+    if (page.error)
+      return { complete: false, resume: { draftOffset, fileOffset: 0 }, reason: "ERROR" };
+    for (let rawIdx = 0; rawIdx < page.items.length; rawIdx++) {
+      const entry = page.items[rawIdx];
+      if (!(entry.metadata === null && UUID_SHAPE_REGEX.test(entry.name))) continue;
+      ctx.stats.draftsScanned += 1;
+      const draftPrefix = `${stagingRoot}/${entry.name}`;
+      const fileStart = firstDraft ? resume.fileOffset : 0;
+      firstDraft = false;
+      const f = await drainDraftFiles(ctx, draftPrefix, fileStart);
+      // Files seen this call are real candidates already listed; collect them.
+      // On resume we continue past f.fileOffset, so there is no double-collect.
+      collectExpired(ctx, draftPrefix, f.files);
+      if (!f.complete) {
+        // Re-list THIS draft's raw offset next time; resume its files at f.fileOffset.
+        return {
+          complete: false,
+          resume: { draftOffset: draftOffset + rawIdx, fileOffset: f.fileOffset },
+          reason: f.reason,
+        };
+      }
+    }
+    if (page.eof)
+      return { complete: true, resume: { draftOffset: 0, fileOffset: 0 }, reason: "DONE" };
+    draftOffset += page.items.length;
+  }
+}
+
+/**
+ * Delete staged attachment files older than the TTL, bounded by a per-sweep
+ * budget with breadth-fair circular-ring resume (S112). Best-effort: list and
+ * remove failures accumulate in stats.errors; the sweep continues. Never throws
+ * on storage-layer failures.
  */
 export async function sweepStagingUploads(
   sb: StorageSweepClientLike,
@@ -237,8 +385,14 @@ export async function sweepStagingUploads(
   const now = opts.now ?? new Date();
   const dryRun = opts.dryRun ?? false;
   const logFn = opts.logFn ?? (() => {});
-  const inCursors = opts.cursors ?? {};
+  const clock = opts.clockFn ?? (opts.now ? () => now : () => new Date());
+  const maxRequests = opts.maxRequests ?? MAX_REQUESTS;
+  const maxRequestsPerOrg = opts.maxRequestsPerOrg ?? MAX_REQUESTS_PER_ORG;
+  const maxMillis = opts.maxMillis ?? MAX_MILLIS;
   const cutoffMs = now.getTime() - ttlHours * 3_600_000;
+
+  const startRootOffset = opts.startCursor?.rootOffset ?? 0;
+  const startOrgResume = opts.startCursor?.orgResume ?? {};
 
   const stats: SweepStats = {
     orgsScanned: 0,
@@ -247,103 +401,102 @@ export async function sweepStagingUploads(
     expired: 0,
     deleted: 0,
     errors: [],
-    truncated: false,
-    // Seed from incoming cursors so prefixes NOT visited this sweep keep their
-    // saved offset (Gemini S111 BLOCKING #1). record() + pruneOrphans() mutate.
-    nextCursors: { ...inCursors },
+    requestsUsed: 0,
+    budgetExhausted: false,
+    // The cursor is mutated in place as orgs drain/truncate; rootOffset is
+    // finalized at the end. Seeded from the incoming cursor.
+    nextCursor: { rootOffset: startRootOffset, orgResume: { ...startOrgResume } },
     wouldDelete: [],
   };
 
-  const record = (prefix: string, res: ListResult): ListResult => {
-    if (res.status === "truncated") {
-      stats.nextCursors[prefix] = res.resumeOffset;
-    } else if (res.status === "exhausted") {
-      delete stats.nextCursors[prefix];
-    }
-    // status === "error": leave the inherited cursor untouched.
-    return res;
+  const ctx: SweepCtx = {
+    sb,
+    cutoffMs,
+    maxRequests,
+    maxRequestsPerOrg,
+    maxMillis,
+    clock,
+    t0: clock().getTime(),
+    stats,
+    cursor: stats.nextCursor,
+    expiredPaths: [],
+    perOrg: 0,
   };
 
-  // Prune inherited descendant cursors whose top path segment is absent from a
-  // parent's COMPLETE child listing (Codex MAJOR — a deleted child's cursor
-  // would otherwise leak forever). Caller MUST only invoke this for a parent
-  // that exhausted FROM OFFSET 0 (a full pass): a resumed-then-exhausted parent
-  // saw only its tail, and pruning then would drop cursors for children before
-  // the resume offset, reintroducing the Gemini #1 starvation (Codex QA).
-  const pruneOrphans = (parentPrefix: string, presentChildren: Set<string>) => {
-    const base = parentPrefix === "" ? "" : `${parentPrefix}/`;
-    for (const key of Object.keys(stats.nextCursors)) {
-      if (key === parentPrefix || !key.startsWith(base)) continue;
-      const childSeg = key.slice(base.length).split("/")[0];
-      if (!presentChildren.has(childSeg)) delete stats.nextCursors[key];
+  const cursor = stats.nextCursor;
+  const startedAt0 = startRootOffset === 0;
+  let rootOffset = startRootOffset;
+  const seenOrgIds = new Set<string>();
+  let rootEOF = false;
+
+  // ── Circular-ring root scan, one page per request ──────────────────
+  rootLoop: for (;;) {
+    if (overGlobalBudget(ctx)) {
+      // Tripped between root pages → resume at the next unscanned page.
+      cursor.rootOffset = rootOffset;
+      stats.budgetExhausted = true;
+      break;
     }
-  };
-
-  const expiredPaths: string[] = [];
-
-  const rootStart = inCursors[""] ?? 0;
-  const rootRes = record("", await listPrefix(sb, "", stats, rootStart));
-  if (rootRes.status === "exhausted" && rootStart === 0) {
-    pruneOrphans("", new Set(rootRes.items.map((e) => e.name)));
-  }
-  const orgFolders = rootRes.items.filter(
-    (e) => e.metadata === null && UUID_SHAPE_REGEX.test(e.name),
-  );
-
-  // Fan-out note (Gemini #2 / Codex MAJOR — see module KNOWN LIMITATION): this
-  // nested walk issues one list() per org, per draft — bounded by MAX_PAGES PER
-  // PREFIX but NOT in total, and the worker awaits it on the idle tick. Bounded
-  // per-sweep work with tree-position resume is a deliberate follow-up.
-  for (const org of orgFolders) {
-    stats.orgsScanned += 1;
-    const stagingRoot = `${org.name}/${ATTACHMENTS.staging_prefix}`;
-    const draftStart = inCursors[stagingRoot] ?? 0;
-    const draftRes = record(
-      stagingRoot,
-      await listPrefix(sb, stagingRoot, stats, draftStart),
-    );
-    if (draftRes.status === "exhausted" && draftStart === 0) {
-      pruneOrphans(stagingRoot, new Set(draftRes.items.map((e) => e.name)));
+    const page = await listPage(ctx, "", rootOffset);
+    if (page.error) {
+      // Retry this same root page next sweep; keep progress on earlier pages.
+      cursor.rootOffset = rootOffset;
+      break;
     }
-    const draftFolders = draftRes.items.filter(
-      (e) => e.metadata === null && UUID_SHAPE_REGEX.test(e.name),
-    );
-
-    for (const draft of draftFolders) {
-      stats.draftsScanned += 1;
-      const draftPrefix = `${stagingRoot}/${draft.name}`;
-      const fileRes = record(
-        draftPrefix,
-        await listPrefix(sb, draftPrefix, stats, inCursors[draftPrefix] ?? 0),
-      );
-      const files = fileRes.items.filter((e) => e.metadata !== null);
-
-      for (const file of files) {
-        stats.filesScanned += 1;
-        const stamp = file.created_at ?? file.updated_at ?? null;
-        const stampMs = stamp ? Date.parse(stamp) : NaN;
-        if (Number.isNaN(stampMs)) {
-          // Unknown age — leave it; better an orphan than deleting a
-          // file some live draft is about to submit.
-          stats.errors.push(`${draftPrefix}/${file.name}: unparseable created_at, left in place`);
-          continue;
+    for (let rawIdx = 0; rawIdx < page.items.length; rawIdx++) {
+      const entry = page.items[rawIdx];
+      if (!(entry.metadata === null && UUID_SHAPE_REGEX.test(entry.name))) continue;
+      const orgId = entry.name;
+      stats.orgsScanned += 1;
+      seenOrgIds.add(orgId);
+      ctx.perOrg = 0;
+      const resume = cursor.orgResume[orgId] ?? { draftOffset: 0, fileOffset: 0 };
+      const r = await drainOrg(ctx, orgId, resume);
+      if (r.complete) {
+        delete cursor.orgResume[orgId];
+      } else {
+        cursor.orgResume[orgId] = r.resume;
+        if (r.reason === "GLOBAL") {
+          // Global budget tripped inside this org → re-list THIS root page and
+          // re-find the org by id next sweep; its draft/file progress is saved.
+          cursor.rootOffset = rootOffset + rawIdx;
+          stats.budgetExhausted = true;
+          break rootLoop;
         }
-        if (stampMs < cutoffMs) {
-          stats.expired += 1;
-          expiredPaths.push(`${draftPrefix}/${file.name}`);
-        }
+        // PER_ORG or ERROR: this org yields; continue to the next org in page.
       }
     }
+    if (page.eof) {
+      rootEOF = true;
+      break;
+    }
+    // Advance past the WHOLE raw page (incl. org-less / junk pages) so a long
+    // run of non-UUID root entries can never re-fetch forever (Codex #2).
+    rootOffset += page.items.length;
+  }
+
+  if (rootEOF) {
+    // Completed the root ring this sweep. Prune orphan org cursors ONLY after a
+    // true offset-0 → all-pages-EOF pass with no error/budget-stop (Codex #5):
+    // a partial view must not drop a live org's resume entry.
+    if (startedAt0 && !stats.budgetExhausted) {
+      for (const key of Object.keys(cursor.orgResume)) {
+        if (!seenOrgIds.has(key)) delete cursor.orgResume[key];
+      }
+    }
+    // Circular wrap from ANY start so the pointer can never strand past the
+    // end (Codex #1). Independent of whether any org remains truncated.
+    cursor.rootOffset = 0;
   }
 
   if (dryRun) {
-    stats.wouldDelete = expiredPaths;
-    for (const p of expiredPaths) logFn(`[staging-sweep] WOULD DELETE: ${p}`);
+    stats.wouldDelete = ctx.expiredPaths;
+    for (const p of ctx.expiredPaths) logFn(`[staging-sweep] WOULD DELETE: ${p}`);
     return stats;
   }
 
-  for (let i = 0; i < expiredPaths.length; i += DELETE_BATCH) {
-    const batch = expiredPaths.slice(i, i + DELETE_BATCH);
+  for (let i = 0; i < ctx.expiredPaths.length; i += DELETE_BATCH) {
+    const batch = ctx.expiredPaths.slice(i, i + DELETE_BATCH);
     try {
       // remove() RESOLVES { error } rather than rejecting — inspect it
       // (feedback_supabase_remove_resolves_error_not_throws).
@@ -368,8 +521,8 @@ const SWEEP_INTERVAL_HOURS = 24;
 
 interface SweepMarker {
   lastRunAt: string;
-  /** Per-prefix resume offsets carried to the next sweep (S111 item 3). */
-  cursors?: SweepCursors;
+  /** Circular-ring resume cursor carried to the next sweep (S112). */
+  walkCursor?: WalkCursor;
 }
 
 /** Mutable in-memory backoff holder (S111 item 1). Injectable for tests. */
@@ -393,8 +546,8 @@ export interface MaybeSweepOptions {
   /** Fixed clock (start === completion). Prefer clockFn for advancing time. */
   now?: Date;
   /**
-   * Injectable clock, called once for the start timestamp and once for the
-   * completion timestamp. Lets tests prove the post-sweep marker records
+   * Injectable clock, called for the start timestamp, the sweep elapsed check,
+   * and the completion timestamp. Lets tests prove the post-sweep marker records
    * COMPLETION, not start. Defaults to the fixed `now` (if given) or wall-clock.
    */
   clockFn?: () => Date;
@@ -402,6 +555,33 @@ export interface MaybeSweepOptions {
   sb?: StorageSweepClientLike;
   /** Injected in-memory backoff holder (tests). Defaults to the module singleton. */
   backoffState?: SweepBackoffState;
+}
+
+/** A valid resume offset is a non-negative integer (breadth-review F6: a
+ *  hand-corrupted marker like `rootOffset:-5` would otherwise reach list()). */
+const isValidOffset = (n: unknown): n is number =>
+  typeof n === "number" && Number.isInteger(n) && n >= 0;
+
+/** Read + validate a WalkCursor from a parsed marker; undefined if absent/legacy/corrupt. */
+function readWalkCursor(marker: SweepMarker): WalkCursor | undefined {
+  const wc = marker.walkCursor;
+  if (!wc || typeof wc !== "object" || !isValidOffset(wc.rootOffset)) {
+    return undefined;
+  }
+  const orgResume: Record<string, OrgResume> = {};
+  if (wc.orgResume && typeof wc.orgResume === "object") {
+    for (const [k, v] of Object.entries(wc.orgResume)) {
+      if (
+        v &&
+        typeof v === "object" &&
+        isValidOffset((v as OrgResume).draftOffset) &&
+        isValidOffset((v as OrgResume).fileOffset)
+      ) {
+        orgResume[k] = { draftOffset: (v as OrgResume).draftOffset, fileOffset: (v as OrgResume).fileOffset };
+      }
+    }
+  }
+  return { rootOffset: wc.rootOffset, orgResume };
 }
 
 /** Write the marker; returns true on success, false (logged) on failure. */
@@ -429,11 +609,11 @@ async function writeMarker(
  * the max of the two).
  *
  * The durable marker is CLAIMED before the sweep runs (S111 item 2): if the
- * claim write fails we SKIP (fail closed — Codex BLOCKING — rather than sweep
- * without a durable cadence record and re-sweep on the next respawn). After a
- * successful sweep the marker is re-written with the COMPLETION timestamp +
- * resume cursors (S111 item 3 + Codex clock-at-completion). Best-effort
- * throughout: never throws, never blocks job processing on failure.
+ * claim write fails we SKIP (fail closed — Codex BLOCKING). The pre-write keeps
+ * the INCOMING walkCursor so a crash mid-sweep resumes idempotently (S112,
+ * Gemini Q5). After a successful sweep the marker is re-written with the
+ * COMPLETION timestamp + the advanced walkCursor. Best-effort throughout:
+ * never throws, never blocks job processing on failure.
  */
 export async function maybeRunStagingSweep(
   opts: MaybeSweepOptions = {},
@@ -451,14 +631,15 @@ export async function maybeRunStagingSweep(
     const nowMs = now.getTime();
 
     let fileLastMs = 0;
-    let cursors: SweepCursors = {};
+    let cursor: WalkCursor | undefined;
     try {
       const raw = await fs.readFile(markerPath, "utf-8");
       const marker = JSON.parse(raw) as SweepMarker;
       fileLastMs = Date.parse(marker.lastRunAt) || 0;
-      if (marker.cursors && typeof marker.cursors === "object") {
-        cursors = marker.cursors;
-      }
+      // Legacy S111 markers carry `cursors` (the prefix map) and no walkCursor
+      // → cursor stays undefined → fresh ring (a one-time progress reset; never
+      // over-deletes, restarts from 0).
+      cursor = readWalkCursor(marker);
     } catch {
       // Missing or corrupt marker → due now (subject to in-memory backoff).
     }
@@ -486,14 +667,12 @@ export async function maybeRunStagingSweep(
     // ── Claim the 24h window BEFORE sweeping (items 1 + 2) ─────────────
     // In-memory first so a broken disk doesn't re-attempt the claim every 30s
     // tick. Then the DURABLE marker: if it can't be written we FAIL CLOSED and
-    // skip — a GC backstop can wait for a healthy disk, and skipping beats
-    // re-sweeping on every worker respawn (Codex BLOCKING). The pre-write keeps
-    // the OLD cursors so a crash mid-sweep resumes from the same point next
-    // time (idempotent).
+    // skip (Codex BLOCKING). The pre-write keeps the INCOMING cursor so a crash
+    // mid-sweep resumes from the same point next time (idempotent).
     backoff.lastRunMs = nowMs;
     const claimed = await writeMarker(
       markerPath,
-      { lastRunAt: now.toISOString(), cursors },
+      { lastRunAt: now.toISOString(), walkCursor: cursor },
       logFn,
     );
     if (!claimed) {
@@ -504,11 +683,17 @@ export async function maybeRunStagingSweep(
     }
 
     logFn("[staging-sweep] due — sweeping expired staging uploads");
-    const stats = await sweepStagingUploads(sb, { logFn, now, cursors });
+    const stats = await sweepStagingUploads(sb, {
+      logFn,
+      now,
+      clockFn: readClock,
+      startCursor: cursor,
+    });
     logFn(
       `[staging-sweep] done: orgs=${stats.orgsScanned} drafts=${stats.draftsScanned} ` +
         `files=${stats.filesScanned} expired=${stats.expired} deleted=${stats.deleted} ` +
-        `errors=${stats.errors.length}${stats.truncated ? " TRUNCATED" : ""}`,
+        `requests=${stats.requestsUsed} errors=${stats.errors.length}` +
+        `${stats.budgetExhausted ? " BUDGET-EXHAUSTED" : ""}`,
     );
     for (const e of stats.errors.slice(0, 10)) {
       logFn(`[staging-sweep] error: ${e}`);
@@ -516,14 +701,16 @@ export async function maybeRunStagingSweep(
 
     // Re-stamp at COMPLETION so the 24h clock starts when the sweep finishes,
     // not when it began (Codex MAJOR — a >24h sweep would otherwise be due
-    // again immediately). Best-effort: the durable window was already claimed
-    // by the pre-write, so a failed post-write only loses cursor advancement
-    // (next sweep re-resumes from the old cursors — idempotent).
-    const finishedAt = readClock();
-    backoff.lastRunMs = finishedAt.getTime();
+    // again immediately). Clamp to >= the claim time (breadth-review F4) so a
+    // BACKWARD wall-clock step (NTP/VM correction) between claim and completion
+    // can't stamp an EARLIER time and shorten the 24h gate. Best-effort: the
+    // durable window was already claimed by the pre-write, so a failed post-write
+    // only loses cursor advancement (next sweep re-resumes from the old cursor).
+    const completedMs = Math.max(nowMs, readClock().getTime());
+    backoff.lastRunMs = completedMs;
     await writeMarker(
       markerPath,
-      { lastRunAt: finishedAt.toISOString(), cursors: stats.nextCursors },
+      { lastRunAt: new Date(completedMs).toISOString(), walkCursor: stats.nextCursor },
       logFn,
     );
 
