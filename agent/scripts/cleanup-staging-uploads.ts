@@ -17,13 +17,14 @@
  *      candidates — deliverables and sources/ are structurally out of scope.
  *   4. Files with unparseable timestamps are left in place (logged).
  *
- * S112 — the worker sweep is per-tick budget-bounded (so the GC walk can't
- * delay job polling). A human-invoked CLI run wants ONE complete pass, so this
+ * S112/S113 — the worker sweep is per-tick budget-bounded (so the GC walk can't
+ * delay job polling). A human-invoked CLI run wants ONE complete drain, so this
  * wrapper LOOPS the bounded sweep, feeding each chunk's nextCursor into the
- * next, until a full circular-ring pass completes (rootOffset back to 0 with no
- * org left truncated). A small inter-chunk sleep paces the storage API
- * (Gemini Q4 — an unbounded single pass risks rate-limit / memory on a massive
- * tree).
+ * next. Ring completion is detected by the cursor's GENERATION advancing
+ * (ringGen increments at every root-EOF wrap); quiescence = a complete ring
+ * with zero deletes AND zero errors. A small inter-chunk sleep paces the
+ * storage API (Gemini Q4 — an unbounded single pass risks rate-limit / memory
+ * on a massive tree).
  *
  * Usage:
  *   node --env-file=.env --import=tsx scripts/cleanup-staging-uploads.ts [--confirm] [--ttl-hours=N]
@@ -91,8 +92,21 @@ const MAX_ERROR_STREAK = 5;
 // would recur, and the ring loop would grind without deleting.
 const CLI_DELETE_WINDOW_MS = 120_000;
 
-function ringComplete(cursor: WalkCursor): boolean {
-  return cursor.rootOffset === 0 && Object.keys(cursor.orgResume).length === 0;
+/**
+ * Traversal-position shape for the stuck-loop check, with the volatile
+ * generation fields STRIPPED (v3, Gemini gate BLOCKING): ringGen increments at
+ * every ring EOF and entry gens re-stamp on every org visit, so a raw cursor
+ * compare reads "progress" on every chunk even when the walk is going nowhere
+ * — which would defeat the error-streak backstop forever.
+ */
+function traversalShape(c: WalkCursor | undefined): string {
+  if (!c) return "null";
+  const orgResume: Record<string, { draftOffset: number; fileOffset: number }> = {};
+  for (const k of Object.keys(c.orgResume).sort()) {
+    const v = c.orgResume[k];
+    orgResume[k] = { draftOffset: v.draftOffset, fileOffset: v.fileOffset };
+  }
+  return JSON.stringify({ rootOffset: c.rootOffset, orgResume });
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -117,15 +131,18 @@ async function main(): Promise<void> {
 
   let cursor: WalkCursor | undefined;
   let lastErrors: string[] = [];
-  // Per-RING accumulated deletions (a "ring" = the chunks from rootOffset 0 back
-  // to 0). Quiescence = a COMPLETE ring that deleted NOTHING. Tracking per-ring
-  // (not per-chunk) is required because deletes shrink the listing: a forward
-  // resume offset can land past delete-shifted survivors, so a single chunk may
-  // delete 0 mid-ring while files remain. A full from-0 ring that deletes 0 is the
-  // only correct "drained" signal (MERGE-gate Codex BLOCKING — the CLI must not
-  // false-complete on a delete-shift mid-ring EOF). Convergence is guaranteed:
-  // every ring with survivors deletes >=1, and the total is finite.
+  // Per-RING accumulated deletions + errors. A "ring" is detected by the
+  // GENERATION ADVANCING (cursor.ringGen increments at every root-EOF wrap) —
+  // NOT by orgResume emptying (v3, Gemini gate BLOCKING: a persistently-errored
+  // org keeps an orgResume entry forever, so the old emptiness test never fired
+  // and the loop spun toward the chunk cap). Quiescence = a COMPLETE ring with
+  // ZERO deletes AND ZERO errors. Per-ring (not per-chunk) tracking is required
+  // because deletes shrink the listing: a delete-shift can make a single
+  // mid-ring chunk delete 0 while files remain (MERGE-gate Codex BLOCKING). A
+  // ring that deleted nothing but HAD errors is a loud stop (exit 1), never a
+  // false "Sweep complete."
   let ringDeleted = 0;
+  let ringErrors = 0;
   let errorStreak = 0;
   let stopped = "";
 
@@ -151,37 +168,57 @@ async function main(): Promise<void> {
     const prevCursor = cursor;
     cursor = stats.nextCursor;
     ringDeleted += stats.deleted;
+    ringErrors += stats.errors.length;
     const hadErrors = stats.errors.length > 0;
-    // Forward progress = a delete OR the cursor moved (listing advanced). Using
-    // `deleted===0` alone as the no-progress signal was wrong (QA MAJOR): a chunk
-    // can scan fresh/unparseable files or advance the ring without deleting.
-    const movedCursor = JSON.stringify(prevCursor ?? null) !== JSON.stringify(cursor);
+    // Forward progress = a delete OR the TRAVERSAL position moved. The compare
+    // strips the volatile generation fields (see traversalShape) so gen churn
+    // cannot mask a genuinely stuck loop. Using `deleted===0` alone was wrong
+    // (S112 QA MAJOR): a chunk can advance the ring without deleting.
+    const movedCursor = traversalShape(prevCursor) !== traversalShape(cursor);
     const madeProgress = stats.deleted > 0 || movedCursor;
 
-    // On an errored chunk, a list failure leaves the cursor UNTOUCHED, so a
-    // transient root error at {rootOffset:0, orgResume:{}} would make
-    // ringComplete() true on cursor SHAPE alone and falsely "complete" the drain
-    // (QA MAJOR). So: never treat an errored chunk as terminal; instead retry,
-    // and only abort if errors RECUR with no forward progress.
-    if (hadErrors) {
-      if (!madeProgress) {
-        if (++errorStreak >= MAX_ERROR_STREAK) {
-          stopped = `stopped after ${errorStreak} consecutive error chunks with no progress — investigate + re-run`;
+    // Recurring errors with NO forward progress (e.g. a persistent ROOT list
+    // failure pins the cursor in place) abort fast instead of retrying to the
+    // chunk cap (S112 Codex MAJOR).
+    if (hadErrors && !madeProgress) {
+      if (++errorStreak >= MAX_ERROR_STREAK) {
+        stopped = `stopped after ${errorStreak} consecutive error chunks with no progress — investigate + re-run`;
+        break;
+      }
+    } else {
+      errorStreak = 0;
+    }
+
+    // Ring boundary = the generation advanced (root-EOF wrap; a transient root
+    // error leaving the cursor at its seeded shape does not advance the gen —
+    // no false-complete, S112 QA MAJOR). Two distinct checks at a wrap:
+    //  - LOUD STOP: a whole accumulation window with errors and zero deletes —
+    //    a persistently-failing prefix keeps its orgResume entry forever, so
+    //    waiting for an "empty" evaluation point would spin to the chunk cap
+    //    (v3 Gemini BLOCKING). Exit 1 via the summary's error count.
+    //  - EVALUATION POINT: a wrap with NO org mid-drain. Only here do the
+    //    per-window accumulators reset, and only here can the drain succeed:
+    //    a wrap with in-flight orgResume entries (tight budgets) or a window
+    //    whose deletes happened before a delete-shift cleared entries at a
+    //    false-EOF must keep accumulating — resetting at every wrap was the
+    //    v3b false-drain (210/240 in the suite's delete-shift replication).
+    const ringWrapped = (cursor.ringGen ?? 0) > (prevCursor?.ringGen ?? 0);
+    if (ringWrapped) {
+      if (ringDeleted === 0 && ringErrors > 0) {
+        stopped = `completed a full ring with ${ringErrors} error(s) and no deletes — investigate + re-run`;
+        break;
+      }
+      if (Object.keys(cursor.orgResume).length === 0) {
+        if (ringDeleted === 0 && ringErrors === 0) {
+          // True drain: an error-free window reclaimed nothing and no org is
+          // mid-drain. (dry-run never deletes, so its first error-free
+          // in-progress-free ring — a full listing — ends here.)
           break;
         }
-      } else {
-        errorStreak = 0;
+        ringDeleted = 0; // evaluation point → next window (delete-shift may hide survivors)
+        ringErrors = 0;
       }
-      if (chunk + 1 < MAX_CHUNKS) await new Promise((r) => setTimeout(r, SLEEP_MS));
-      continue; // do NOT evaluate ringComplete on an errored chunk
-    }
-    errorStreak = 0;
-
-    if (ringComplete(cursor)) {
-      // dry-run never deletes, so one full clean ring lists the whole tree → done.
-      // confirm-mode: stop only when a full ring deleted nothing (true drain).
-      if (!CONFIRM || ringDeleted === 0) break;
-      ringDeleted = 0; // ring deleted something → run another ring (delete-shift may hide survivors)
+      // wrap with in-flight orgs → keep accumulating, no reset
     }
     if (chunk + 1 >= MAX_CHUNKS) {
       stopped = `chunk cap (${MAX_CHUNKS}) reached — re-run to continue`;

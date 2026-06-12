@@ -423,15 +423,22 @@ async function drainOrg(
   const stagingRoot = `${orgId}/${ATTACHMENTS.staging_prefix}`;
   let draftOffset = resume.draftOffset;
   let firstDraft = true;
+  // While we have not advanced past the FIRST draft, the incoming
+  // resume.fileOffset still belongs to the draft at draftOffset — an early
+  // yield (budget at entry, uploads list error) must PRESERVE it, not zero it
+  // (v3, Gemini gate MAJOR: zeroing destroyed multi-page file progress for a
+  // huge draft whenever the budget happened to trip at org entry, forcing a
+  // from-0 rescan every visit — starvation on large trees).
+  const keptFileOffset = () => (firstDraft ? resume.fileOffset : 0);
   for (;;) {
     if (overGlobalBudget(ctx))
-      return { complete: false, resume: { draftOffset, fileOffset: 0 }, reason: "GLOBAL" };
+      return { complete: false, resume: { draftOffset, fileOffset: keptFileOffset() }, reason: "GLOBAL" };
     if (ctx.perOrg >= ctx.maxRequestsPerOrg)
-      return { complete: false, resume: { draftOffset, fileOffset: 0 }, reason: "PER_ORG" };
+      return { complete: false, resume: { draftOffset, fileOffset: keptFileOffset() }, reason: "PER_ORG" };
     const page = await listPage(ctx, stagingRoot, draftOffset);
     ctx.perOrg += 1;
     if (page.error)
-      return { complete: false, resume: { draftOffset, fileOffset: 0 }, reason: "ERROR" };
+      return { complete: false, resume: { draftOffset, fileOffset: keptFileOffset() }, reason: "ERROR" };
     for (let rawIdx = 0; rawIdx < page.items.length; rawIdx++) {
       const entry = page.items[rawIdx];
       if (!(entry.metadata === null && UUID_SHAPE_REGEX.test(entry.name))) continue;

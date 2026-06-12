@@ -754,13 +754,15 @@ test("sweep: drain-to-quiescence loop (CLI contract) reaches zero remaining unde
   const sb = mutatingMockSb(tree);
   let cursor: WalkCursor | undefined;
   let guard = 0;
-  // Quiescence = a COMPLETE RING (rootOffset 0→0, orgResume empty) that deleted
-  // NOTHING. Tracking per-RING (not per-chunk) is required: a delete-shift can make
-  // a single mid-ring chunk delete 0 while survivors remain, so a per-chunk
-  // deleted==0 check would false-complete (the CLI bug Codex flagged).
+  // Quiescence (the v3 CLI contract): a ring is complete when the GENERATION
+  // advances (ringGen increments at every root-EOF wrap); a drain is a complete
+  // ring with ZERO deletes (and zero errors — none occur here). Per-RING (not
+  // per-chunk) tracking is required: a delete-shift can make a single mid-ring
+  // chunk delete 0 while survivors remain (the CLI bug Codex flagged).
   let ringDeleted = 0;
   for (;;) {
     if (guard++ > 8000) throw new Error("did not reach quiescence — possible non-convergence");
+    const prev = cursor;
     const stats = await sweepStagingUploads(sb, {
       now: NOW,
       maxRequests: 6,
@@ -769,13 +771,96 @@ test("sweep: drain-to-quiescence loop (CLI contract) reaches zero remaining unde
     });
     cursor = stats.nextCursor;
     ringDeleted += stats.deleted;
-    if (cursor.rootOffset === 0 && Object.keys(cursor.orgResume).length === 0) {
-      if (ringDeleted === 0) break; // a full ring deleted nothing → truly drained
-      ringDeleted = 0; // ring deleted something → run another ring
+    // v3 CLI contract: accumulators reset (and success evaluates) ONLY at an
+    // EVALUATION POINT — a gen wrap with no org mid-drain. A wrap with
+    // in-flight orgResume entries keeps accumulating: resetting at every wrap
+    // let a delete-shift clearing entries at a false-EOF read as a 0-delete
+    // "ring" and false-drain (the v3b 210/240 bug this loop replicates).
+    if (
+      (cursor.ringGen ?? 0) > (prev?.ringGen ?? 0) &&
+      Object.keys(cursor.orgResume).length === 0
+    ) {
+      if (ringDeleted === 0) break; // error-free window reclaimed nothing → drained
+      ringDeleted = 0; // evaluation point → next window
     }
   }
   assert.equal(sb.removedCount(), expected, "drain-to-quiescence deletes every expired file");
   assert.equal(tree[""].length, 0, "all org folders collapsed away — nothing left in staging");
+});
+
+test("sweep: early drainOrg yield PRESERVES the saved fileOffset of the first draft (v3 Gemini MAJOR)", async () => {
+  // An org resumed with multi-page file progress (fileOffset 7) hits the
+  // global budget AT ORG ENTRY (before its first draft is touched). v2 zeroed
+  // the saved fileOffset on that path, forcing huge drafts to rescan from 0 on
+  // every budget-tripped visit — starvation. v3 must preserve it.
+  const tree = baseTree([{ name: "old.pdf", created_at: OLD, metadata: { size: 5 } }]);
+  const sb = mockSweepSb(tree);
+  const s1 = await sweepStagingUploads(sb, {
+    now: NOW,
+    maxRequests: 1, // sub-floor on purpose: root page consumes it → budget trips at org entry
+    startCursor: {
+      rootOffset: 0,
+      ringGen: 1,
+      orgResume: { [ORG]: { draftOffset: 0, fileOffset: 7, gen: 1 } },
+    },
+  });
+  assert.deepEqual(
+    s1.nextCursor.orgResume[ORG],
+    { draftOffset: 0, fileOffset: 7, gen: 1 },
+    "budget trip at org entry must not destroy the first draft's saved file progress",
+  );
+  // Same invariant when the uploads listing itself errors at entry.
+  const sbErr = mockSweepSb(tree, { throwOnPrefix: `${ORG}/uploads` });
+  const s2 = await sweepStagingUploads(sbErr, {
+    now: NOW,
+    startCursor: {
+      rootOffset: 0,
+      ringGen: 1,
+      orgResume: { [ORG]: { draftOffset: 0, fileOffset: 7, gen: 1 } },
+    },
+  });
+  assert.deepEqual(
+    s2.nextCursor.orgResume[ORG],
+    { draftOffset: 0, fileOffset: 7, gen: 1 },
+    "an uploads list error at org entry must not destroy the saved file progress",
+  );
+});
+
+test("sweep: CLI-contract loop stops LOUDLY (bounded) on a persistently-errored org — gen-based ring detection (v3 Gemini BLOCKING)", async () => {
+  // A draft whose file listing ALWAYS fails keeps an orgResume entry forever.
+  // The old CLI ring test (`orgResume` empty) could NEVER fire, and the v2
+  // cursor's gen churn made every chunk look like progress, defeating the
+  // error-streak backstop — the loop would spin to the 200k chunk cap. The v3
+  // contract: ring completion = ringGen advanced; a completed ring with zero
+  // deletes and >0 errors stops loudly on the FIRST such ring.
+  const draftPrefix = `${ORG}/uploads/${DRAFT}`;
+  const sb = mockSweepSb(
+    baseTree([{ name: "old.pdf", created_at: OLD, metadata: { size: 5 } }]),
+    { throwOnPrefix: draftPrefix },
+  );
+  let cursor: WalkCursor | undefined;
+  let chunks = 0;
+  let stoppedLoudly = false;
+  let ringDeleted = 0;
+  let ringErrors = 0;
+  for (; chunks < 50; chunks++) {
+    const prev = cursor;
+    const stats = await sweepStagingUploads(sb, { now: NOW, startCursor: cursor });
+    cursor = stats.nextCursor;
+    ringDeleted += stats.deleted;
+    ringErrors += stats.errors.length;
+    if ((cursor.ringGen ?? 0) > (prev?.ringGen ?? 0)) {
+      if (ringDeleted === 0) {
+        if (ringErrors > 0) stoppedLoudly = true;
+        break;
+      }
+      ringDeleted = 0;
+      ringErrors = 0;
+    }
+  }
+  assert.equal(stoppedLoudly, true, "an errored zero-delete ring is a LOUD stop, not a silent success");
+  assert.ok(chunks < 5, `bounded: stopped after ${chunks + 1} chunk(s), not the chunk cap`);
+  assert.ok(cursor!.orgResume[ORG], "the errored org's resume entry is (correctly) still present");
 });
 
 test("maybeRunStagingSweep: legacy S111 marker (cursors map, no walkCursor) → fresh ring, never throws (Codex #7)", async () => {
