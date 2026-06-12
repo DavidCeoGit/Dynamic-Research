@@ -37,7 +37,7 @@ GitHub remote: `origin` = `DavidCeoGit/Dynamic-Research` (the WHOLE project — 
 
 **(Historical footgun, RESOLVED S90)** Pre-S90 the git repo was the PARENT `Anti Gravity/` shared across ~34 projects, causing branch-contention + a concurrent force-push that erased DR commits from the shared remote. Gone — DR owns its history now. The `feedback_shared_monorepo_concurrency_stash_hazard` + `feedback_pushclone_divergence_reconcile` patterns no longer apply to DR.
 
-**DR-dev linked worktree (added S109 2026-06-11):** `Anti Gravity/DR-dev/` is a `git worktree` of this same repo, checked out on the `dev` branch. It is NOT a separate project — same `.git` database, same history. Purpose: `Dynamic Research/` stays permanently on `main` (Vercel SoT, always clean), while `DR-dev/` is where feature branches are created and worked on. Workflow: create branch in DR-dev → sandbox+promote edits → commit → `gh pr create --base main` → merge → fast-forward `dev` to `main`. DR-dev's `.claude/settings.json` has `additionalDirectories` pointing back to this folder + shared memory, so a Claude Code session opened in DR-dev can read memory and CLAUDE.md from both trees. The enforce-sandbox hook applies equally to both worktrees.
+**Branch work happens in this folder directly** — the `DR-dev` linked worktree (added S109, retired S114) has been removed. Feature branches are created and worked on in `Dynamic Research/` itself. The load-bearing constraint (the cron task respawning the worker from whatever branch this folder has checked out) is solved by a **dedicated deploy-only clone** at `C:\Users\ceo\Projects\DR-Deploy\` — the `DynamicResearchWorker` scheduled task points to that clone's `worker-start.bat`, so dev branches checked out here never reach the prod Supabase worker. Workflow: create branch → sandbox+promote edits → commit → `gh pr create --base main` → merge → pull DR-Deploy + restart worker (see §4 and §6).
 
 ---
 
@@ -45,12 +45,21 @@ GitHub remote: `origin` = `DavidCeoGit/Dynamic-Research` (the WHOLE project — 
 
 **The SoT is `Dynamic Research/frontend/` and Vercel deploys it directly.** Vercel project `dynamic-research` builds from GitHub `DavidCeoGit/Dynamic-Research` with **Root Directory = `frontend/`** (set via the project's settings; the whole project lives in the repo, the Next app is the `frontend/` subdir).
 
-**Deploy flow (now trivial):**
-1. Edit files in `frontend/` (SoT).
+**Deploy flow:**
+1. Edit files in `frontend/` or `agent/` (SoT).
 2. `git add . && git commit && git push origin main`.
 3. Vercel auto-builds (`cd frontend` → `pnpm install` → `next build`) and deploys to `dynamic-research.vercel.app`.
+4. **For `agent/` changes only** — pull to the worker deploy clone and restart:
+   ```
+   git -C "C:\Users\ceo\Projects\DR-Deploy" pull origin main
+   Stop-ScheduledTask -TaskName DynamicResearchWorker
+   Start-ScheduledTask -TaskName DynamicResearchWorker
+   ```
+   Skip step 4 for frontend-only merges. Verify new worker PID via `worker.log` in `DR-Deploy/agent/`.
 
-**No more push-clone, no sync script, no 3-way diff.** The old `c:/tmp/Dynamic-Research` push-clone is RETIRED (kept on disk as a cold rollback backup until S91 confirms the new pipeline stable, then deletable). The `feedback_pushclone_divergence_reconcile` footgun no longer applies.
+**Worker deploy clone:** `C:\Users\ceo\Projects\DR-Deploy\` is a permanent, main-only mirror — never branch or edit there. Its `agent/.env` must be kept in sync manually whenever env vars change (it is not tracked by git).
+
+**No more push-clone, no sync script, no 3-way diff.** The old `c:/tmp/Dynamic-Research` push-clone is RETIRED. The `feedback_pushclone_divergence_reconcile` footgun no longer applies.
 
 **Sandbox writes are required for `frontend/` edits** — see §5.
 
