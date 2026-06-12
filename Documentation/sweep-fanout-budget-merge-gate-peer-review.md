@@ -148,3 +148,132 @@ reclaimed on the next ring wrap. This is what makes the DATA blast radius accept
 **Gate status:** Codex **ENDORSE** (QA-verify) + breadth **ENDORSE** (F1 resolved). No open
 BLOCKING/MAJOR. ⚠️ The REAL Gemini holistic MERGE pass remains **OWED** (<24h follow-up) — the
 interim Claude breadth substitute de-risked the merge but does not discharge the Gemini leg.
+
+
+---
+---
+
+# S113 — The OWED real-Gemini pass + the follow-up MERGE gate (PR #11)
+
+The ⚠️ OWED FOLLOW-UP above is **DISCHARGED** (2026-06-12, S113, <24h after the S112 merge). The
+real Gemini holistic-adversarial pass ran against the SHIPPED code (aeea43d) and returned **BLOCK**
+with three findings **no prior reviewer caught** (three Codex grounded passes + the Claude breadth
+interim all missed them) — the strongest validation of the cross-vendor thesis this project has
+produced. The fixes shipped as PR #11 (`fix/sweep-delete-budget-ring-prune`) through a full
+five-round gate recorded below.
+
+**Transport note (new Gemini CLI failure-mode cure):** the S112 silent hang reproduced for large
+STDIN pipes, but the `@file` include transport (`gemini -p "Read and follow the instructions in
+@<file>"`) completed in ~2 min every time. Caveat: gemini's `read_file` honors ignore patterns —
+a prompt file under the gitignored `sandbox/` is REJECTED (`is ignored by configured ignore
+patterns`); run from `c:/tmp` with the prompt there. Memory updated:
+`feedback_gemini_cli_silent_hang_failure_mode`.
+
+## Reviewer roster + what each saw
+
+- **Gemini 3.1 Pro (holistic-adversarial, breadth)** — THREE passes via @file transport:
+  1. The OWED pass on shipped aeea43d (module + CLI + this gate record) → **BLOCK** (1 BLOCKING +
+     1 MAJOR + 1 MINOR).
+  2. MERGE review of the integrated v2 branch (full diff + final files) → **BLOCK** (1 BLOCKING +
+     1 MAJOR).
+  3. Fidelity QA of v3–v5 → **ENDORSE** ("the fidelity check is clean").
+- **Codex (grounded-adversarial, depth)** — `codex exec -s read-only`, file:line against the
+  branch + worker call site. THREE passes:
+  1. MERGE review of v3 → **BLOCK** (1 MAJOR + 1 MINOR); explicitly confirmed NO over-delete.
+  2. QA of v4 → **BLOCK** (1 residual: seeding-side validation incomplete).
+  3. QA-verify of v5 → **ENDORSE** ("Findings: none.").
+- **Claude adversarial verify round (between Gemini-1 and Gemini-2)** — 7 /code-review-high finder
+  angles + a 3-lens refuter workflow (convergence / availability / data-safety) with RUNNABLE
+  repros written to c:/tmp. The availability lens **REFUTED** v1's headline bound with a proven
+  unbounded-stall repro; three findings were independently triple-confirmed across finders.
+
+## Round chronology (5 versions, every BLOCKING/MAJOR integrated + re-verified)
+
+### Gemini OWED pass on shipped aeea43d — verdict **BLOCK** (verbatim summary)
+1. **[BLOCKING] Unbounded delete phase violates the 15s wall-clock guarantee** — the post-walk
+   `remove()` loop ran unbudgeted and untimed; ~298k expired finds → ~2,980 sequential removes
+   (~150s at 50ms each) blowing past maxMillis; a single hung remove() could stall the worker
+   indefinitely (worker awaits the sweep inline at worker.ts:247).
+2. **[MAJOR] Orphan `orgResume` prune mathematically unreachable on multi-sweep rings** — the
+   `startedAt0 && !budgetExhausted` gate requires a single-sweep 0→EOF pass; on trees whose rings
+   span sweeps, deleted orgs' cursor entries leak forever.
+3. **[MINOR] `stats.deleted` overcounts partial remove successes** — Supabase reports the actually
+   deleted objects in `data`; the code counted `batch.length`.
+
+### v1 (6b463f4) → adversarial verify round → v2 (a0f0841)
+v1 implemented the three fixes directly (maxDeleteMillis window + withTimeout on remove; ringSeen
+org-id array accumulated across the ring; data[].length count). The verify round then found, with
+repros:
+- **ringSeen write/read size asymmetry** (3 independent finders + 2 refuters, repro at the exact
+  10,000/10,001 boundary): above 10k orgs every marker round-trip silently dropped ringSeen →
+  prune permanently disabled at exactly the scale that needs it.
+- **Truthful-count fail-silent regression** (3 finders + 2 refuters, repro): a remove() resolving
+  `data:[] error:null` let the CLI print "Sweep complete." exit 0 with expired files remaining
+  (pre-S113 the inflated count failed loudly).
+- **[REFUTED] v1 headline bound** — listPage's `remainingMs<=0` raw-await branch (pre-existing
+  S112 edge) hangs the worker poll chain unboundedly at the budget boundary; repro'd both ways.
+- **Backward-clock window inflation** (repro: 41× blowout) + live-org prune on a single
+  delete-shift + deleteBudgetStopped unset on final-batch timeout + altitude finding: a per-entry
+  ring-generation stamp strictly dominates the ringSeen array.
+
+v2 = ring-gen redesign (`cursor.ringGen` + per-entry `gen`, PRUNE_GRACE_RINGS=2 — structurally
+kills the size asymmetry, the marker bloat, and the one-shift live-org prune), shortfall→
+stats.errors, monotonic budget clock (monoNowMs running-max), listPage always timed (1ms floor),
+flag-on-final-batch-timeout, gate-before-cursor-parse, CLI maxDeleteMillis=120s.
+
+### Gemini on v2 — verdict **BLOCK** (verbatim summary)
+1. **[BLOCKING] CLI infinite loop on persistent list errors** — `ringComplete()` (orgResume empty)
+   never fires with a persistently-errored org, AND v2's gen churn mutates the cursor every chunk,
+   defeating the error-streak backstop (raw JSON compare reads "progress" forever) → spin to the
+   200k chunk cap.
+2. **[MAJOR] `drainOrg` early yields destroy saved fileOffset** — budget/error yields before the
+   first draft hardcoded `fileOffset: 0`, wiping a resumed org's multi-page file progress
+   (pre-existing since S112; starvation on large drafts).
+
+### v3 (9dbe6b1)
+CLI ring boundary = ringGen advance; `traversalShape()` strips gen fields from the stuck-loop
+compare; errored zero-delete window stops LOUDLY; success only at an evaluation point (gen wrap
+with EMPTY orgResume) where accumulators reset — the first cut reset at every wrap and
+false-drained the suite's delete-shift replication at 210/240, caught in-suite before commit.
+`keptFileOffset()` preserves the first draft's saved offset on GLOBAL/PER_ORG/ERROR yields.
+
+### Codex on v3 — verdict **BLOCK** (verbatim summary)
+1. **[MAJOR] CLI chunk-cap exit reports success** — `stopped` set at the cap but exit code 0 when
+   `agg.errors===0`, violating the "success only at an evaluation point" contract.
+2. **[MINOR] Unsafe `ringGen` freezes generation aging** — `isValidOffset` accepted any
+   non-negative integer; `ringGen: 2^53` makes `ringGen + 1` a no-op → prune disabled forever.
+Plus: **"No over-delete counterexample found in the destructive predicate"** — root org UUID
+filter, uploads prefix, draft UUID filter, metadata!==null, stampMs<cutoff all intact; the
+preserved fileOffset path constructs paths only from the currently listed draft prefix.
+
+### v4 (5d1ae85) → Codex QA — **BLOCK** (1 residual) → v5 (443d6c6) → Codex QA-verify — **ENDORSE**
+v4: any premature stop exits 1; `isValidOffset` requires `Number.isSafeInteger`. QA residual: the
+sweep's own seeding still trusted direct `startCursor` numbers (the CLI bypasses readWalkCursor).
+v5: seeding validates rootOffset (unsafe → fresh ring) and DROPS entries with invalid offsets
+(resume-position loss only). QA-verify: "Findings: none... no over-delete path or new defect."
+
+### Gemini fidelity QA of v3–v5 — **ENDORSE** (verbatim)
+"Both findings from the previous QA round have been correctly and robustly implemented. No new
+system-level defects were observed... The fidelity check is clean."
+
+## Synthesis
+
+**Final state: Gemini ENDORSE + Codex ENDORSE. No open BLOCKING/MAJOR. Suite 446 (381 agent + 65
+frontend), staging-sweep tests 29 → 40, tsc strict clean, EXIT 0.**
+
+The round again proved lens complementarity, in BOTH directions this time:
+- The **real Gemini holistic pass caught what three Codex passes + a Claude breadth interim all
+  missed** (the unbudgeted delete phase — a system-level availability hole in the very guarantee
+  the merge headlined). The interim substitute de-risked the S112 merge but demonstrably did NOT
+  replace the cross-vendor leg.
+- The **Claude adversarial verify round between vendor passes materially raised the bar** — its
+  refuters produced runnable repros (raw-await stall, 41× clock inflation, the 10,001-org
+  boundary) that reshaped v1's ringSeen into the strictly-better ring-gen design BEFORE the
+  second vendor round, and its in-suite replication caught the v3b false-drain before commit.
+- **Codex's grounded passes closed the loop** on exit-code contracts and integer-safety edges and
+  re-confirmed the over-delete safety floor at every step.
+
+**Confirmed safety floor (all reviewers, all rounds):** the destructive predicate + scope guard
+are UNCHANGED across v1–v5; every defect found was availability / convergence / telemetry /
+cursor-hygiene. Worst case of any cursor bug remains a transient miss or resume-position loss
+reclaimed on a later ring — never an over-delete of a live file.
