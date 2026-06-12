@@ -114,6 +114,21 @@ test("prompt: PUBLISH block present and contract-faithful when publishRequired=t
   assert.ok(p.includes("refuted"), "missing refuted-claim handling");
   assert.ok(p.includes("unverifiable"), "missing unverifiable-claim handling");
   assert.ok(/claim verification failed/i.test(p), "missing fail-closed claim-verification exit path");
+  // S116: job 9a1b7b30 re-run drift — the model dated one source "2022-09"
+  // (month only); the gate's containsRealIsoDate (/\d{4}-\d{2}-\d{2}/ + real-
+  // calendar validation) rejects it as "missing dated source publication/access
+  // entries". The brief must require a FULL YYYY-MM-DD per sourceDates entry,
+  // forbid month/year-only, AND — per the S116 Gemini BLOCK — preserve source
+  // quality (never drop/swap a strong source to satisfy the format; access date
+  // keeps the original). These assertions scope to tokens UNIQUE to the new
+  // directive (S116 Codex test nit: plain includes("YYYY-MM-DD") was already
+  // true from the schema example and pinned nothing).
+  assert.ok(/EVERY entry in each claim's `sourceDates` array MUST contain a FULL calendar date/.test(p), "missing full-date sourceDates directive");
+  assert.ok(p.includes("2022-09"), "missing month-only rejected example");
+  assert.ok(p.includes('annotated "(accessed)"'), "missing access-date fallback (quality-preserving path)");
+  assert.ok(/NEVER drop or swap a stronger source for a weaker one/.test(p), "missing anti-source-downgrade guardrail (Gemini BLOCK fix)");
+  assert.ok(/NEVER fabricate or guess a day/.test(p), "missing anti-fabrication guardrail");
+  assert.ok(/validates it as a REAL calendar date/.test(p), "missing real-calendar-date fidelity (Codex nit: 2026-13-40 must not pass)");
 });
 
 test("prompt: PUBLISH block absent for a non-publish job (default)", () => {
