@@ -14,6 +14,7 @@ import {
   Loader2,
   RefreshCw,
   AlertCircle,
+  AlertTriangle,
   Copy,
   Repeat,
   X,
@@ -273,6 +274,32 @@ export default function RunDetailPage({
           planReviewError={review.plan_review_error}
           nextAttemptAt={review.plan_review_next_attempt_at}
         />
+      )}
+
+      {/* ── A5: all-attachments-skipped banner ─────────────── */}
+      {state.userContext.allAttachmentsSkipped && (
+        <div
+          className="mt-4 flex items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
+          role="alert"
+        >
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+          <div className="flex-1">
+            <p className="font-medium text-amber-200">Attached files could not be used</p>
+            <p className="mt-0.5 text-xs opacity-90">
+              {state.userContext.attachmentsSkipped?.length ?? 0} file
+              {(state.userContext.attachmentsSkipped?.length ?? 0) === 1 ? "" : "s"} were
+              submitted but skipped by the worker. Common causes: Windows-1252 or UTF-16
+              encoding (re-save as UTF-8), or unsupported binary content in a text file.
+              {state.userContext.attachmentsSkipped &&
+                state.userContext.attachmentsSkipped.length > 0 && (
+                  <span>
+                    {" "}Affected:{" "}
+                    {state.userContext.attachmentsSkipped.map((s) => s.originalName).join(", ")}.
+                  </span>
+                )}
+            </p>
+          </div>
+        </div>
       )}
 
       {/* ── Phase timeline stepper ─────────────────────────── */}
