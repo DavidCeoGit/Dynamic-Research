@@ -486,7 +486,15 @@ export async function sweepStagingUploads(
   const maxDeleteMillis = opts.maxDeleteMillis ?? MAX_DELETE_MILLIS;
   const cutoffMs = now.getTime() - ttlHours * 3_600_000;
 
-  const startRootOffset = opts.startCursor?.rootOffset ?? 0;
+  // Seeding validates EVERY incoming cursor number itself (v5, Codex QA) —
+  // readWalkCursor guards the worker's marker path, but sweepStagingUploads is
+  // a public entry point and the CLI feeds cursors straight through; an unsafe
+  // or negative offset must never reach list(). Invalid rootOffset → fresh
+  // ring; an entry with invalid offsets is DROPPED (its org re-walks from 0 on
+  // its next visit — resume-position loss only, never an over-delete).
+  const startRootOffset = isValidOffset(opts.startCursor?.rootOffset)
+    ? (opts.startCursor!.rootOffset as number)
+    : 0;
   const startOrgResume = opts.startCursor?.orgResume ?? {};
   // Ring generation (S113): one int, incremented at every ring EOF. Incoming
   // entries lacking a valid gen (legacy marker) — or claiming a gen from the
@@ -496,6 +504,7 @@ export async function sweepStagingUploads(
     : 0;
   const seededOrgResume: Record<string, OrgResume> = {};
   for (const [k, v] of Object.entries(startOrgResume)) {
+    if (!v || !isValidOffset(v.draftOffset) || !isValidOffset(v.fileOffset)) continue;
     const gen = isValidOffset(v.gen) && v.gen <= ringGen ? v.gen : ringGen;
     seededOrgResume[k] = { draftOffset: v.draftOffset, fileOffset: v.fileOffset, gen };
   }

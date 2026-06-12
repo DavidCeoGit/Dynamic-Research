@@ -1123,6 +1123,38 @@ test("maybeRunStagingSweep: corrupt ringGen / future entry gen are clamped via t
   assert.equal(marker2.walkCursor!.orgResume[goneOrg]?.gen, 0, "unsafe entry gen re-stamped at current");
 });
 
+test("sweep: SEEDING validates direct startCursor numbers — unsafe rootOffset → fresh ring; corrupt entry offsets DROPPED (v5 Codex QA)", async () => {
+  // sweepStagingUploads is a public entry point (the CLI feeds cursors
+  // straight through, bypassing readWalkCursor) — an unsafe/negative offset
+  // must never reach list().
+  const sb = mockSweepSb(
+    baseTree([{ name: "old.pdf", created_at: OLD, metadata: { size: 5 } }]),
+  );
+  const corruptOrg = "ffffffff-0000-4000-8000-000000000000";
+  const stats = await sweepStagingUploads(sb, {
+    now: NOW,
+    startCursor: {
+      rootOffset: 2 ** 53, // unsafe → treated as 0 (fresh ring)
+      ringGen: 0,
+      orgResume: { [corruptOrg]: { draftOffset: -7, fileOffset: 2 ** 53, gen: 0 } },
+    },
+  });
+  assert.ok(
+    sb.listCalls.some((c) => c.prefix === "" && c.offset === 0),
+    "unsafe rootOffset reset to 0 — the root was listed from the start, not at 2^53",
+  );
+  assert.ok(
+    sb.listCalls.every((c) => Number.isSafeInteger(c.offset) && c.offset >= 0),
+    "no unsafe offset ever reached list()",
+  );
+  assert.equal(stats.deleted, 1, "the fresh ring reclaimed the expired file normally");
+  assert.equal(
+    stats.nextCursor.orgResume[corruptOrg],
+    undefined,
+    "the corrupt entry was dropped at seeding (its org re-walks from 0 next visit)",
+  );
+});
+
 test("sweep: a BACKWARD clock step cannot inflate the per-call delete timeout past the window (verify round, monotonic clock)", async () => {
   // 150 expired files = 2 batches, window 80ms. Batch 1 succeeds and a -50s
   // NTP-style correction lands during it; batch 2 hangs. A raw wall-clock
