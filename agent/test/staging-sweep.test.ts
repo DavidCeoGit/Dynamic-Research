@@ -18,12 +18,17 @@
  *   - all-pages-EOF orphan prune; resumed/mid-ring passes never prune (Codex #5)
  *   - global request + wall-clock budget; legacy-marker one-time reset (Codex #7)
  *
- * S113 — real-Gemini holistic OWED-leg findings (see the "S113" test section):
+ * S113 — real-Gemini holistic OWED-leg findings + adversarial-verify round
+ * (see the "S113" test section):
  *   - delete-phase window: partial delete + deleteBudgetStopped + reclaim;
- *     a HUNG remove() is bounded (Gemini BLOCKING)
- *   - ringSeen accumulates across budget-bounded sweeps → multi-sweep ring EOF
- *     prunes orphans; unknown history skips; corrupt ringSeen rejected (MAJOR)
- *   - stats.deleted counts what remove() REPORTS deleted (Gemini MINOR)
+ *     a HUNG remove() is bounded + flagged (Gemini BLOCKING)
+ *   - ring-generation orphan prune: entries age across rings, prune after
+ *     PRUNE_GRACE_RINGS unseen; legacy/corrupt gens clamped (Gemini MAJOR,
+ *     redesigned from the v1 ringSeen array in the verify round)
+ *   - stats.deleted counts what remove() REPORTS deleted + shortfall is a
+ *     recorded ERROR (Gemini MINOR + verify-round fail-loud)
+ *   - monotonic budget clock: a backward wall-clock step cannot extend the
+ *     delete window; listPage is always timed, even at the budget boundary
  *
  * Run: pnpm -C agent exec node --import=tsx --test "test/staging-sweep.test.ts"
  */
@@ -338,46 +343,56 @@ test("sweep: resume offset indexes the RAW listing position, not the filtered in
 
 // ── S112 — orphan prune airtight gate (Codex #5) ────────────────────
 
-test("sweep: complete offset-0 EOF root pass PRUNES an absent org's resume entry (Codex #5)", async () => {
+test("sweep: ring EOF prunes an orphan entry whose gen has aged past the grace (Codex #5 → S113 ring-gen)", async () => {
   const goneOrg = "ffffffff-0000-4000-8000-000000000000";
   const sb = mockSweepSb(
     baseTree([{ name: "old.pdf", created_at: OLD, metadata: { size: 5 } }]),
   );
+  // Entry last refreshed at ring 0; current ring is 2 → unseen for
+  // PRUNE_GRACE_RINGS (2) full rings → pruned at this ring's EOF.
   const stats = await sweepStagingUploads(sb, {
     now: NOW,
-    startCursor: { rootOffset: 0, orgResume: { [goneOrg]: { draftOffset: 50, fileOffset: 0 } } },
+    startCursor: {
+      rootOffset: 0,
+      ringGen: 2,
+      orgResume: { [goneOrg]: { draftOffset: 50, fileOffset: 0, gen: 0 } },
+    },
   });
   assert.equal(
     stats.nextCursor.orgResume[goneOrg],
     undefined,
-    "an org absent from the COMPLETE offset-0 root listing is pruned",
+    "an entry unseen for the full grace window is pruned at ring EOF",
   );
+  assert.equal(stats.nextCursor.ringGen, 3, "ring EOF increments the generation");
 });
 
-test("sweep: a resumed (non-zero) EOF root pass does NOT prune sibling resume entries (Codex #5)", async () => {
+test("sweep: an entry within the grace window is NOT pruned, even on a complete pass (Codex #5 → S113 ring-gen)", async () => {
   const otherOrg = "ffffffff-0000-4000-8000-000000000000";
   const sb = mockSweepSb(
     baseTree([{ name: "old.pdf", created_at: OLD, metadata: { size: 5 } }]),
   );
-  // Start at offset 1 (non-zero) → only the tail seen, not the full org set →
-  // pruning must be SUPPRESSED (would reintroduce starvation).
+  // Entry without a gen (legacy shape) is stamped the CURRENT ring gen on
+  // seeding — it ages from now, so this ring's EOF must keep it. This is the
+  // S112 "incomplete view must not prune" invariant, strengthened: even a
+  // COMPLETE pass keeps an entry until it has been unseen for the full grace.
   const stats = await sweepStagingUploads(sb, {
     now: NOW,
     startCursor: { rootOffset: 1, orgResume: { [otherOrg]: { draftOffset: 50, fileOffset: 0 } } },
   });
   assert.deepEqual(
     stats.nextCursor.orgResume[otherOrg],
-    { draftOffset: 50, fileOffset: 0 },
-    "a resumed-then-exhausted parent must not prune sibling cursors (incomplete view)",
+    { draftOffset: 50, fileOffset: 0, gen: 0 },
+    "a legacy entry is stamped the current gen and kept through the grace window",
   );
 });
 
-test("sweep: orphan prune uses the union of orgs across ALL root pages (Codex #5)", async () => {
-  // Root paginates: 1001 junk entries on page 1, then the real org on page 2.
-  // A full 0→all-pages-EOF pass must KEEP the live org (seen on page 2) and only
-  // prune the truly-absent one.
+test("sweep: a live org's entry is re-stamped when visited, an aged orphan is pruned, across paginated root (Codex #5 → S113 ring-gen)", async () => {
+  // Root paginates: 1001 junk entries on page 1, then the real org on page 2
+  // (junk named to sort FIRST under the real API's name-asc order: digits+dash
+  // prefix sorts before the org UUID's hex). A full 0→all-pages-EOF pass must
+  // re-stamp the live org (seen on page 2) and prune only the aged orphan.
   const root: Entry[] = [];
-  for (let i = 0; i < 1001; i++) root.push({ name: `junk-${String(i).padStart(5, "0")}`, metadata: null });
+  for (let i = 0; i < 1001; i++) root.push({ name: `0000-junk-${String(i).padStart(5, "0")}`, metadata: null });
   root.push({ name: ORG, metadata: null });
   const tree: Record<string, Entry[]> = {
     "": root,
@@ -386,26 +401,29 @@ test("sweep: orphan prune uses the union of orgs across ALL root pages (Codex #5
   };
   const goneOrg = "ffffffff-0000-4000-8000-000000000000";
   const sb = mockSweepSb(tree);
-  // maxRequestsPerOrg=1 → ORG (on root page 2) is SEEN but truncated, so it KEEPS
-  // a resume entry. The prune must keep ORG (seen via the page-2 union) and drop
-  // only the truly-absent goneOrg — proving seenOrgIds unions across all pages.
+  // maxRequestsPerOrg=1 → ORG (on root page 2) is SEEN but truncated, so it
+  // keeps a resume entry — re-stamped to the CURRENT gen (2). The aged orphan
+  // (gen 0, unseen for 2 rings) is pruned at the same EOF.
   const stats = await sweepStagingUploads(sb, {
     now: NOW,
     maxRequestsPerOrg: 1,
     startCursor: {
       rootOffset: 0,
+      ringGen: 2,
       orgResume: {
-        [ORG]: { draftOffset: 0, fileOffset: 0 }, // live (on page 2) — must be KEPT
-        [goneOrg]: { draftOffset: 9, fileOffset: 0 }, // absent — must be pruned
+        [ORG]: { draftOffset: 0, fileOffset: 0, gen: 1 }, // live — must be KEPT + re-stamped
+        [goneOrg]: { draftOffset: 9, fileOffset: 0, gen: 0 }, // aged orphan — pruned
       },
     },
   });
-  assert.equal(stats.nextCursor.orgResume[goneOrg], undefined, "absent org pruned");
-  assert.ok(
-    stats.nextCursor.orgResume[ORG] !== undefined,
-    "live org seen only on root page 2 is KEPT (union across all root pages, Codex #5)",
+  assert.equal(stats.nextCursor.orgResume[goneOrg], undefined, "aged orphan pruned");
+  assert.equal(
+    stats.nextCursor.orgResume[ORG]?.gen,
+    2,
+    "live org visited this ring is re-stamped to the current generation",
   );
   assert.equal(stats.nextCursor.rootOffset, 0, "completed ring wraps to 0");
+  assert.equal(stats.nextCursor.ringGen, 3, "generation advances at ring EOF");
 });
 
 // ── S112 — wall-clock budget + resume continuity + tolerance ────────
@@ -857,6 +875,11 @@ test("sweep: a HUNG remove() is bounded by the delete window — degrades to err
     "the hung remove() degraded to a recorded error",
   );
   assert.equal(stats.deleted, 0, "nothing counted deleted when remove() never settled");
+  assert.equal(
+    stats.deleteBudgetStopped,
+    true,
+    "a window timeout on the FINAL batch still reports the closed window (verify round)",
+  );
 });
 
 test("sweep: stats.deleted counts what remove() REPORTS deleted, not the batch size (Gemini MINOR)", async () => {
@@ -885,16 +908,22 @@ test("sweep: stats.deleted counts what remove() REPORTS deleted, not the batch s
   const stats = await sweepStagingUploads(sb, { now: NOW });
   assert.equal(stats.expired, 5, "all five collected as expired");
   assert.equal(stats.deleted, 3, "deleted counts the REPORTED deletions (3), not the batch (5)");
+  assert.ok(
+    stats.errors.some((e) => /shortfall: 3\/5/.test(e)),
+    "the shortfall is a recorded ERROR (verify round fail-loud) — a 'successful' remove that deleted " +
+      "less than asked must not let the CLI declare a false drain or the worker rot silently",
+  );
 });
 
-test("sweep: ringSeen accumulates across budget-bounded sweeps → multi-sweep ring EOF prunes the orphan (Gemini MAJOR)", async () => {
-  // Root spans 2 pages (1001 junk + ORG on page 2). With maxRequests=3 no single
-  // sweep covers 0→EOF, so the OLD single-sweep prune gate never fired and a
-  // gone org's resume entry leaked forever. ringSeen carries the seen-set across
-  // the sweeps of one ring; the EOF-reaching sweep prunes against the union.
+test("sweep: ring spanning multiple budget-bounded sweeps — orphan pruned at the EOF-reaching sweep, live org re-stamped (Gemini MAJOR)", async () => {
+  // Root spans 2 pages (1001 junk + ORG on page 2; junk named to sort first
+  // under real name-asc order). With maxRequests=3 no single sweep covers
+  // 0→EOF, so the OLD single-sweep prune gate never fired and a gone org's
+  // resume entry leaked forever. The ring-gen prune needs no seen-set: the
+  // EOF-reaching sweep prunes entries whose gen aged past the grace.
   const goneOrg = "ffffffff-0000-4000-8000-000000000000";
   const root: Entry[] = [];
-  for (let i = 0; i < 1001; i++) root.push({ name: `junk-${String(i).padStart(5, "0")}`, metadata: null });
+  for (let i = 0; i < 1001; i++) root.push({ name: `0000-junk-${String(i).padStart(5, "0")}`, metadata: null });
   root.push({ name: ORG, metadata: null });
   const tree: Record<string, Entry[]> = {
     "": root,
@@ -903,62 +932,75 @@ test("sweep: ringSeen accumulates across budget-bounded sweeps → multi-sweep r
   };
   const sb = mockSweepSb(tree);
   // Sweep 1: page 1 (junk) + page 2 (sees ORG) then GLOBAL trips inside ORG →
-  // mid-ring stop. ringSeen must carry ORG; goneOrg must NOT be pruned yet.
+  // mid-ring stop. No prune mid-ring; ORG re-stamped to the current gen.
   const s1 = await sweepStagingUploads(sb, {
     now: NOW,
     maxRequests: 3,
-    startCursor: { rootOffset: 0, orgResume: { [goneOrg]: { draftOffset: 9, fileOffset: 0 } } },
+    startCursor: {
+      rootOffset: 0,
+      ringGen: 2,
+      orgResume: { [goneOrg]: { draftOffset: 9, fileOffset: 0, gen: 0 } },
+    },
   });
   assert.equal(s1.budgetExhausted, true, "sweep 1 stopped mid-ring on the global budget");
-  assert.ok(s1.nextCursor.orgResume[goneOrg], "NO prune mid-ring (incomplete view)");
-  assert.deepEqual(s1.nextCursor.ringSeen, [ORG], "ringSeen accumulated the org seen on page 2");
+  assert.deepEqual(
+    s1.nextCursor.orgResume[goneOrg],
+    { draftOffset: 9, fileOffset: 0, gen: 0 },
+    "NO prune mid-ring; the aged entry survives until a ring EOF",
+  );
+  assert.equal(s1.nextCursor.orgResume[ORG]?.gen, 2, "live org visited on page 2 is stamped the current gen");
   assert.ok(s1.nextCursor.rootOffset > 0, "sweep 1 did not complete the ring");
-  // Sweep 2 resumes mid-ring and reaches EOF → prune fires against the
-  // ring-accumulated union even though THIS sweep did not start at 0.
+  assert.equal(s1.nextCursor.ringGen, 2, "generation unchanged mid-ring");
+  // Sweep 2 resumes mid-ring and reaches EOF → the gen prune fires even though
+  // THIS sweep did not start at 0 (the multi-sweep-ring case the v1 gate missed).
   const s2 = await sweepStagingUploads(sb, { now: NOW, maxRequests: 3, startCursor: s1.nextCursor });
-  assert.equal(s2.nextCursor.orgResume[goneOrg], undefined, "orphan pruned at multi-sweep ring EOF (the S113 fix)");
+  assert.equal(s2.nextCursor.orgResume[goneOrg], undefined, "aged orphan pruned at multi-sweep ring EOF (the S113 fix)");
+  assert.equal(s2.nextCursor.orgResume[ORG], undefined, "live org fully drained → entry cleared");
   assert.equal(s2.nextCursor.rootOffset, 0, "ring wrapped to 0");
-  assert.deepEqual(s2.nextCursor.ringSeen, [], "a new ring starts with KNOWN-empty history");
+  assert.equal(s2.nextCursor.ringGen, 3, "generation advances at ring EOF");
   assert.ok(
     sb.removed.flat().includes(`${ORG}/uploads/${DRAFT}/old.pdf`),
     "the live org's expired file was still reclaimed across the ring",
   );
 });
 
-test("sweep: UNKNOWN ring history (mid-ring cursor without ringSeen) → EOF skips the prune; the NEXT ring prunes (Gemini MAJOR)", async () => {
+test("sweep: legacy entries (no gen) age from NOW — kept for the full grace, pruned after (Gemini MAJOR + grace)", async () => {
   const goneOrg = "ffffffff-0000-4000-8000-000000000000";
   const sb = mockSweepSb(
     baseTree([{ name: "old.pdf", created_at: OLD, metadata: { size: 5 } }]),
   );
-  // Mid-ring start with NO ringSeen (legacy/corrupt marker shape) → this ring's
-  // EOF must NOT prune (the view is genuinely partial — same invariant as the
-  // S112 "resumed pass never prunes" test, now expressed via ring history).
+  // Ring 0: legacy entry stamped gen 0 → kept (unseen 0 rings).
   const s1 = await sweepStagingUploads(sb, {
     now: NOW,
-    startCursor: { rootOffset: 1, orgResume: { [goneOrg]: { draftOffset: 9, fileOffset: 0 } } },
+    startCursor: { rootOffset: 0, orgResume: { [goneOrg]: { draftOffset: 9, fileOffset: 0 } } },
   });
-  assert.ok(s1.nextCursor.orgResume[goneOrg], "unknown history → EOF does not prune");
-  assert.deepEqual(s1.nextCursor.ringSeen, [], "the wrap starts a fresh KNOWN ring");
-  // The next ring is a fresh 0→EOF pass with known history → prunes the orphan.
+  assert.deepEqual(s1.nextCursor.orgResume[goneOrg], { draftOffset: 9, fileOffset: 0, gen: 0 });
+  assert.equal(s1.nextCursor.ringGen, 1);
+  // Ring 1: unseen 1 ring → still inside the grace → kept.
   const s2 = await sweepStagingUploads(sb, { now: NOW, startCursor: s1.nextCursor });
-  assert.equal(s2.nextCursor.orgResume[goneOrg], undefined, "next (known) ring prunes the orphan");
+  assert.ok(s2.nextCursor.orgResume[goneOrg], "one unseen ring is within the grace window");
+  assert.equal(s2.nextCursor.ringGen, 2);
+  // Ring 2: unseen 2 rings → grace exhausted → pruned.
+  const s3 = await sweepStagingUploads(sb, { now: NOW, startCursor: s2.nextCursor });
+  assert.equal(s3.nextCursor.orgResume[goneOrg], undefined, "pruned after PRUNE_GRACE_RINGS unseen rings");
 });
 
-test("maybeRunStagingSweep: corrupt ringSeen in the marker is rejected → ring history unknown, no prune (S113 validation)", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sweep-ringseen-"));
+test("maybeRunStagingSweep: corrupt ringGen / future entry gen are clamped via the marker round-trip (S113 validation)", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sweep-ringgen-"));
   const markerPath = path.join(dir, ".staging-sweep-last");
   const goneOrg = "ffffffff-0000-4000-8000-000000000000";
   const stale = new Date(NOW.getTime() - 3 * 24 * 3_600_000).toISOString();
-  // Mid-ring marker with JUNK ringSeen entries (not UUID-shaped): validation
-  // must DROP ringSeen (unknown history) so this ring's EOF cannot prune.
+  // ringGen corrupt (negative) → read as 0; entry gen 999 is FROM THE FUTURE
+  // relative to ringGen 0 → clamped to the current gen, so it ages from now
+  // (a corrupt marker can never enable an early prune).
   await fs.writeFile(
     markerPath,
     JSON.stringify({
       lastRunAt: stale,
       walkCursor: {
         rootOffset: 1,
-        orgResume: { [goneOrg]: { draftOffset: 9, fileOffset: 0 } },
-        ringSeen: ["not-a-uuid", 42],
+        orgResume: { [goneOrg]: { draftOffset: 9, fileOffset: 0, gen: 999 } },
+        ringGen: -5,
       },
     }),
   );
@@ -968,9 +1010,91 @@ test("maybeRunStagingSweep: corrupt ringSeen in the marker is rejected → ring 
   const r = await maybeRunStagingSweep({ markerPath, now: NOW, sb, backoffState: { lastRunMs: 0 } });
   assert.equal(r.ran, true);
   const marker = JSON.parse(await fs.readFile(markerPath, "utf-8")) as { walkCursor?: WalkCursor };
-  assert.ok(
+  assert.deepEqual(
     marker.walkCursor!.orgResume[goneOrg],
-    "junk ringSeen rejected → history unknown → EOF did NOT prune the entry",
+    { draftOffset: 9, fileOffset: 0, gen: 0 },
+    "future gen clamped to the (validated) current generation — entry kept, ages from now",
   );
-  assert.deepEqual(marker.walkCursor!.ringSeen, [], "marker carries a fresh known-empty ring after the wrap");
+  assert.equal(marker.walkCursor!.ringGen, 1, "corrupt ringGen read as 0, advanced to 1 at the ring EOF");
+});
+
+test("sweep: a BACKWARD clock step cannot inflate the per-call delete timeout past the window (verify round, monotonic clock)", async () => {
+  // 150 expired files = 2 batches, window 80ms. Batch 1 succeeds and a -50s
+  // NTP-style correction lands during it; batch 2 hangs. A raw wall-clock
+  // would grant batch 2 a ~50080ms timeout (window + step — the refuter-proven
+  // inflation); the monotonic running-max basis must grant at most the window
+  // (80ms), provable from the timeout's own error message.
+  const tree: Record<string, Entry[]> = {
+    "": [{ name: ORG, metadata: null }],
+    [`${ORG}/uploads`]: [{ name: DRAFT, metadata: null }],
+    [`${ORG}/uploads/${DRAFT}`]: [],
+  };
+  for (let i = 0; i < 150; i++) {
+    tree[`${ORG}/uploads/${DRAFT}`].push({
+      name: `f${String(i).padStart(4, "0")}.pdf`,
+      created_at: OLD,
+      metadata: { size: 1 },
+    });
+  }
+  let virtualNow = NOW.getTime();
+  let removes = 0;
+  const sb: StorageSweepClientLike = {
+    storage: {
+      from() {
+        return {
+          async list(prefix: string, o: { limit: number; offset?: number }) {
+            const off = o.offset ?? 0;
+            return { data: (tree[prefix] ?? []).slice(off, off + o.limit), error: null };
+          },
+          remove() {
+            removes += 1;
+            if (removes === 1) {
+              virtualNow -= 50_000; // backward correction during batch 1
+              return Promise.resolve({ data: null, error: null });
+            }
+            return new Promise<never>(() => {}); // batch 2 hangs
+          },
+        };
+      },
+    },
+  };
+  const clockFn = () => new Date(virtualNow);
+  const stats = await sweepStagingUploads(sb, { now: NOW, clockFn, maxDeleteMillis: 80 });
+  assert.equal(stats.deleted, 100, "batch 1 deleted");
+  assert.ok(
+    stats.errors.some((e) => /remove exceeded delete window \(80ms left\)/.test(e)),
+    `batch 2's timeout grant stayed clamped to the 80ms window (raw clock would grant ~50080ms); errors: ${stats.errors.join(" | ")}`,
+  );
+  assert.equal(stats.deleteBudgetStopped, true, "final-batch window timeout sets the flag");
+});
+
+test("sweep: listPage is ALWAYS timed — a hung list() at the exact budget boundary cannot raw-await (verify round)", async () => {
+  // Clock sequence engineered so the overGlobalBudget gate passes (99 < 100)
+  // but the remainingMs computation lands exactly AT the boundary (100-100=0).
+  // v1 raw-awaited the hung call in that branch (refuter-proven unbounded
+  // stall); v2 clamps the timeout to a 1ms floor — this test COMPLETING is the
+  // proof. Sequence: t0=0, gate=99, remaining=100 → max(1, 0) → 1ms timeout.
+  const reads = [0, 99, 100];
+  let i = 0;
+  const clockFn = () => new Date(NOW.getTime() + (reads[Math.min(i++, reads.length - 1)] ?? 100));
+  const sb: StorageSweepClientLike = {
+    storage: {
+      from() {
+        return {
+          list() {
+            return new Promise<never>(() => {}); // root list hangs forever
+          },
+          async remove() {
+            return { data: null, error: null };
+          },
+        };
+      },
+    },
+  };
+  const stats = await sweepStagingUploads(sb, { now: NOW, clockFn, maxMillis: 100 });
+  assert.ok(
+    stats.errors.some((e) => /exceeded maxMillis budget \(1ms left\)/.test(e)),
+    "the boundary-landing hung list() was bounded by the 1ms floor timeout",
+  );
+  assert.equal(stats.deleted, 0);
 });

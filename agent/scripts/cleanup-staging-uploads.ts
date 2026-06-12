@@ -83,6 +83,13 @@ const SLEEP_MS = 200;
 // AND recorded errors — a persistent list failure must not retry to the chunk cap
 // (MERGE-gate Codex MAJOR). Transient single-chunk errors are tolerated.
 const MAX_ERROR_STREAK = 5;
+// Delete-phase window per chunk (S113). The WORKER uses the module's 10s
+// default because it must protect its 30s poll tick; a manual CLI run has no
+// tick to protect, so slow-but-working remove() batches (large trees, slow
+// networks) get 2 minutes per chunk before the per-call timeout treats them
+// as hung — without this, every chunk on a slow link would time out, errors
+// would recur, and the ring loop would grind without deleting.
+const CLI_DELETE_WINDOW_MS = 120_000;
 
 function ringComplete(cursor: WalkCursor): boolean {
   return cursor.rootOffset === 0 && Object.keys(cursor.orgResume).length === 0;
@@ -128,6 +135,7 @@ async function main(): Promise<void> {
       dryRun: !CONFIRM,
       logFn: (m) => console.log(m),
       startCursor: cursor,
+      maxDeleteMillis: CLI_DELETE_WINDOW_MS,
     });
     agg.chunks += 1;
     agg.orgsScanned += stats.orgsScanned;

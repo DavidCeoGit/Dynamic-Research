@@ -74,30 +74,43 @@
  *     nothing (per-ring, not per-chunk) so a delete-shift mid-ring EOF cannot make
  *     it report a false "drained."
  *
- * ── S113 post-merge real-Gemini holistic findings (OWED-leg pass) ──────
+ * ── S113 post-merge real-Gemini holistic findings (OWED-leg pass) + the
+ *    adversarial-verify integration round ──────────────────────────────
  *   - DELETE-PHASE BUDGET (Gemini BLOCKING): the post-walk remove() loop runs in
- *     its OWN bounded window (maxDeleteMillis, default 10s), with every remove()
- *     racing the remaining window via withTimeout. The window is deliberately
- *     SEPARATE from the walk budget — if deletes shared maxMillis, a tree whose
- *     walk always exhausts the budget would never delete anything (convergence
- *     broken). Worst-case sweep wall-clock ≈ maxMillis + maxDeleteMillis
- *     (default ~25s), still under the worker's 30s poll tick. Paths found but
- *     not deleted when the window closes are NOT persisted — the next ring
- *     visit re-lists and reclaims them (idempotent).
- *   - RING-ACCUMULATED ORPHAN PRUNE (Gemini MAJOR): orphan pruning keys on
- *     ringSeen — org ids accumulated across ALL the sweeps of the current root
- *     ring — so the prune fires at every ring EOF even when the ring spans many
- *     budget-bounded sweeps. The old single-sweep offset-0→EOF gate was
- *     unreachable on large trees, leaking deleted orgs' cursor entries forever.
- *     If ring history is UNKNOWN (legacy/corrupt marker found mid-ring) the
- *     prune is skipped for that ring; the next ring (fresh from 0) prunes. A
- *     wrongly-pruned LIVE org (delete-shift moving its root entry across an
- *     already-listed page boundary) only loses resume position — next visit
- *     re-walks it from 0; never an over-delete (safety floor unchanged).
- *   - TRUTHFUL deleted-COUNT (Gemini MINOR): stats.deleted counts what Supabase
- *     remove() REPORTS deleted (data[].length — partial success omits objects),
- *     not the batch length; clients/mocks resolving data:null fall back to
- *     batch length for back-compat.
+ *     its OWN bounded window (maxDeleteMillis, worker default 10s), with every
+ *     remove() racing the remaining window via withTimeout. The window is
+ *     deliberately SEPARATE from the walk budget — if deletes shared maxMillis,
+ *     a tree whose walk always exhausts the budget would never delete anything
+ *     (convergence broken). Worst-case sweep wall-clock ≈ maxMillis +
+ *     maxDeleteMillis (worker default ~25s), under the worker's 30s poll tick.
+ *     Paths found but not deleted when the window closes are NOT persisted —
+ *     the next ring visit re-lists and reclaims them (idempotent). The manual
+ *     CLI passes a much larger window (no tick to protect — see the script).
+ *   - RING-GENERATION ORPHAN PRUNE (Gemini MAJOR, redesigned in verify round):
+ *     the cursor carries ringGen (incremented at every root-ring EOF) and each
+ *     orgResume entry carries the gen at which its org was last VISITED at
+ *     root. At ring EOF, entries not refreshed for PRUNE_GRACE_RINGS (2) full
+ *     rings are pruned. This replaces the v1 ringSeen org-id array, which had a
+ *     write/read size asymmetry that silently disabled pruning above 10k orgs,
+ *     bloated the marker O(tenants), and pruned a LIVE org after a single
+ *     delete-shift across a mid-ring boundary. With the grace, a one-ring miss
+ *     (delete-shift) is harmless; only entries unseen for two consecutive full
+ *     rings prune. Legacy/corrupt entries are stamped the current gen on read —
+ *     they age from now (conservative; never an over-delete, safety floor
+ *     unchanged; worst case for a wrongly-pruned live org remains resume-
+ *     position loss only).
+ *   - TRUTHFUL deleted-COUNT (Gemini MINOR) + FAIL-LOUD SHORTFALL (verify
+ *     round): stats.deleted counts what Supabase remove() REPORTS deleted
+ *     (data[].length — partial success omits objects; data:null mocks/clients
+ *     fall back to batch length), AND any shortfall is pushed to stats.errors —
+ *     a remove() that "succeeds" while deleting nothing must not let the CLI
+ *     declare a false drain or the worker rot silently.
+ *   - MONOTONIC BUDGET CLOCK (verify round): both budget windows measure
+ *     elapsed time through a running-max wrapper over the injected clock, so a
+ *     BACKWARD wall-clock step (NTP/VM correction) during the sweep cannot
+ *     extend a window. listPage is ALWAYS timed (timeout floor 1ms) — the v1
+ *     remainingMs<=0 raw-await branch could hang the worker poll chain
+ *     unboundedly at the exact budget boundary (refuter-proven repro).
  */
 
 import * as fs from "node:fs/promises";
@@ -137,12 +150,16 @@ const MAX_REQUESTS = 300;
 const MAX_REQUESTS_PER_ORG = 50;
 const MAX_MILLIS = 15_000;
 // Delete-phase window (S113) — separate from the walk budget BY DESIGN (see
-// header). maxMillis + MAX_DELETE_MILLIS must stay comfortably under the
-// worker's 30s poll interval.
+// header). COUPLING INVARIANT: maxMillis + MAX_DELETE_MILLIS must stay
+// comfortably under the worker's 30s poll interval — anyone raising either
+// cap must re-check the sum (there is no structural assert; the worker's
+// POLL_INTERVAL lives in worker.ts and importing it here would invert deps).
 const MAX_DELETE_MILLIS = 10_000;
-// Guard against a corrupt/hostile marker inflating the ring-seen set (S113);
-// real cardinality ≈ tenant count. Oversize → ring history treated as unknown.
-const RING_SEEN_MAX = 10_000;
+// An orgResume entry is pruned at ring EOF when its org has not been visited
+// for this many CONSECUTIVE full root rings (S113 verify round). 2 = one full
+// 0→EOF pass of grace, so a single delete-shift moving a live org across an
+// already-listed mid-ring boundary can never cost it its resume entry.
+const PRUNE_GRACE_RINGS = 2;
 
 interface ListedObject {
   name: string;
@@ -176,6 +193,11 @@ export interface StorageSweepClientLike {
 export interface OrgResume {
   draftOffset: number;
   fileOffset: number;
+  /** Ring generation at which this org was last VISITED at root (S113).
+   *  Entries not refreshed for PRUNE_GRACE_RINGS full rings are orphans
+   *  (their org folder no longer lists) and are pruned at ring EOF.
+   *  Absent (legacy marker) → stamped the current gen on read. */
+  gen?: number;
 }
 
 /**
@@ -184,18 +206,17 @@ export interface OrgResume {
  *   - rootOffset: raw root-listing position where the next sweep resumes
  *     scanning org folders. Circular — advances per root page (incl. org-less
  *     pages) and wraps to 0 at root EOF from any start.
- *   - orgResume: per-org {draftOffset, fileOffset} for orgs truncated this
- *     sweep. Keyed by org id; cardinality ≈ tenant count. Pruned (orphan org
- *     folders) at ring EOF against the ring-accumulated ringSeen set (S113).
- *   - ringSeen: org ids seen at root since the current ring started at 0,
- *     accumulated ACROSS sweeps (a ring can span many budget-bounded sweeps).
- *     Cleared at every ring EOF (after the prune). ABSENT = ring history
- *     unknown (legacy/corrupt marker) → that ring's EOF skips the prune.
+ *   - orgResume: per-org {draftOffset, fileOffset, gen} for orgs truncated in
+ *     some sweep. Keyed by org id; cardinality ≈ truncated-org count. Entries
+ *     whose gen has not been refreshed for PRUNE_GRACE_RINGS full rings are
+ *     pruned at ring EOF (S113 ring-generation prune).
+ *   - ringGen: the current root-ring generation, incremented at every ring
+ *     EOF (wrap). One small int — replaces the v1 ringSeen org-id array.
  */
 export interface WalkCursor {
   rootOffset: number;
   orgResume: Record<string, OrgResume>;
-  ringSeen?: string[];
+  ringGen?: number;
 }
 
 export interface SweepStats {
@@ -255,13 +276,27 @@ interface SweepCtx {
   expiredPaths: string[];
   /** List calls spent on the CURRENT org (reset at each org entry). */
   perOrg: number;
+  /** Running max of clock reads — monotonic elapsed basis (verify round). */
+  lastClockMs: number;
+}
+
+/**
+ * Monotonic "now" for BUDGET math (verify round): a running max over the
+ * injected clock, so a BACKWARD wall-clock step (NTP/VM correction) during the
+ * sweep can never extend a budget window. Wall-clock proper is still used for
+ * the TTL cutoff and marker timestamps (where calendar time is the point).
+ */
+function monoNowMs(ctx: SweepCtx): number {
+  const t = ctx.clock().getTime();
+  if (t > ctx.lastClockMs) ctx.lastClockMs = t;
+  return ctx.lastClockMs;
 }
 
 /** Global budget predicate — request count OR wall-clock. */
 function overGlobalBudget(ctx: SweepCtx): boolean {
   return (
     ctx.stats.requestsUsed >= ctx.maxRequests ||
-    ctx.clock().getTime() - ctx.t0 >= ctx.maxMillis
+    monoNowMs(ctx) - ctx.t0 >= ctx.maxMillis
   );
 }
 
@@ -301,17 +336,25 @@ async function listPage(
   offset: number,
 ): Promise<{ items: ListedObject[]; eof: boolean; error: boolean }> {
   ctx.stats.requestsUsed += 1;
-  const remainingMs = ctx.maxMillis - (ctx.clock().getTime() - ctx.t0);
+  // ALWAYS timed (verify round, refuter-proven): clamping the timeout to a 1ms
+  // floor removes the v1 remainingMs<=0 raw-await branch, which could hang the
+  // worker poll chain unboundedly when the clock crossed the budget boundary
+  // between the overGlobalBudget gate and this computation.
+  const remainingMs = Math.max(
+    1,
+    ctx.maxMillis - (monoNowMs(ctx) - ctx.t0),
+  );
   try {
     const listCall = ctx.sb.storage.from(BUCKET).list(prefix, {
       limit: LIST_LIMIT,
       offset,
       sortBy: { column: "name", order: "asc" },
     });
-    const { data, error } =
-      remainingMs > 0
-        ? await withTimeout(listCall, remainingMs, `list exceeded maxMillis budget (${remainingMs}ms left)`)
-        : await listCall;
+    const { data, error } = await withTimeout(
+      listCall,
+      remainingMs,
+      `list exceeded maxMillis budget (${remainingMs}ms left)`,
+    );
     if (error) throw new Error(error.message);
     const items = data ?? [];
     return { items, eof: items.length < LIST_LIMIT, error: false };
@@ -438,12 +481,17 @@ export async function sweepStagingUploads(
 
   const startRootOffset = opts.startCursor?.rootOffset ?? 0;
   const startOrgResume = opts.startCursor?.orgResume ?? {};
-  const startedAt0 = startRootOffset === 0;
-  // Ring history (S113): starting at 0 BEGINS a ring (known-empty history,
-  // regardless of any stale incoming ringSeen); mid-ring, the incoming set is
-  // the history — absent = unknown (legacy/corrupt marker) → no prune this ring.
-  const ringHistory = startedAt0 ? [] : opts.startCursor?.ringSeen;
-  const ringKnown = ringHistory !== undefined;
+  // Ring generation (S113): one int, incremented at every ring EOF. Incoming
+  // entries lacking a valid gen (legacy marker) — or claiming a gen from the
+  // future (corrupt) — are stamped the CURRENT gen, so they age from now.
+  const ringGen = isValidOffset(opts.startCursor?.ringGen)
+    ? (opts.startCursor!.ringGen as number)
+    : 0;
+  const seededOrgResume: Record<string, OrgResume> = {};
+  for (const [k, v] of Object.entries(startOrgResume)) {
+    const gen = isValidOffset(v.gen) && v.gen <= ringGen ? v.gen : ringGen;
+    seededOrgResume[k] = { draftOffset: v.draftOffset, fileOffset: v.fileOffset, gen };
+  }
 
   const stats: SweepStats = {
     orgsScanned: 0,
@@ -457,10 +505,11 @@ export async function sweepStagingUploads(
     deleteBudgetStopped: false,
     // The cursor is mutated in place as orgs drain/truncate; rootOffset is
     // finalized at the end. Seeded from the incoming cursor.
-    nextCursor: { rootOffset: startRootOffset, orgResume: { ...startOrgResume } },
+    nextCursor: { rootOffset: startRootOffset, orgResume: seededOrgResume, ringGen },
     wouldDelete: [],
   };
 
+  const t0 = clock().getTime();
   const ctx: SweepCtx = {
     sb,
     cutoffMs,
@@ -468,16 +517,16 @@ export async function sweepStagingUploads(
     maxRequestsPerOrg,
     maxMillis,
     clock,
-    t0: clock().getTime(),
+    t0,
     stats,
     cursor: stats.nextCursor,
     expiredPaths: [],
     perOrg: 0,
+    lastClockMs: t0,
   };
 
   const cursor = stats.nextCursor;
   let rootOffset = startRootOffset;
-  const seenOrgIds = new Set<string>();
   let rootEOF = false;
 
   // ── Circular-ring root scan, one page per request ──────────────────
@@ -499,14 +548,15 @@ export async function sweepStagingUploads(
       if (!(entry.metadata === null && UUID_SHAPE_REGEX.test(entry.name))) continue;
       const orgId = entry.name;
       stats.orgsScanned += 1;
-      seenOrgIds.add(orgId);
       ctx.perOrg = 0;
       const resume = cursor.orgResume[orgId] ?? { draftOffset: 0, fileOffset: 0 };
       const r = await drainOrg(ctx, orgId, resume);
       if (r.complete) {
         delete cursor.orgResume[orgId];
       } else {
-        cursor.orgResume[orgId] = r.resume;
+        // Stamp the CURRENT ring generation: this org was visited at root this
+        // ring, so its entry is fresh (S113 ring-generation prune).
+        cursor.orgResume[orgId] = { ...r.resume, gen: ringGen };
         if (r.reason === "GLOBAL") {
           // Global budget tripped inside this org → re-list THIS root page and
           // re-find the org by id next sweep; its draft/file progress is saved.
@@ -527,34 +577,24 @@ export async function sweepStagingUploads(
   }
 
   if (rootEOF) {
-    // Completed the root ring. Prune orphan org cursors against the
-    // RING-accumulated org set — ringHistory (prior sweeps of this ring) ∪
-    // this sweep's seenOrgIds (S113, replaces the single-sweep offset-0 gate
-    // that was unreachable on large multi-sweep rings; Codex #5's
-    // partial-view concern is honored by ring CONTINUITY: rootOffset only
-    // advances past listed pages, an errored page is retried at the same
-    // offset, so a known ring covers every root page 0→EOF). Unknown history
-    // (legacy/corrupt marker found mid-ring) → skip; next ring prunes.
-    if (ringKnown) {
-      const ringOrgs = new Set([...ringHistory, ...seenOrgIds]);
-      for (const key of Object.keys(cursor.orgResume)) {
-        if (!ringOrgs.has(key)) delete cursor.orgResume[key];
+    // Completed the root ring. Prune orgResume entries whose org has not been
+    // VISITED at root for PRUNE_GRACE_RINGS full rings (S113 ring-generation
+    // prune — replaces the single-sweep offset-0 gate that was unreachable on
+    // multi-sweep rings, and the v1 ringSeen array that broke above its size
+    // cap). Ring continuity guarantees every live org is listed once per full
+    // ring, so a live org's entry is re-stamped at least once per ring; the
+    // 2-ring grace means even an org a delete-shift hid for one whole ring
+    // survives (Codex #5's partial-view concern, strengthened).
+    for (const [key, entry] of Object.entries(cursor.orgResume)) {
+      if (ringGen - (entry.gen ?? ringGen) >= PRUNE_GRACE_RINGS) {
+        delete cursor.orgResume[key];
       }
     }
     // Circular wrap from ANY start so the pointer can never strand past the
     // end (Codex #1). Independent of whether any org remains truncated.
     cursor.rootOffset = 0;
-    // A new ring begins with KNOWN-empty history.
-    cursor.ringSeen = [];
-  } else {
-    // Mid-ring stop (budget / root error): persist the accumulated ring
-    // history so the EOF-reaching sweep of this ring can prune; stays
-    // unknown if it was unknown coming in.
-    if (ringKnown) {
-      cursor.ringSeen = [...new Set([...ringHistory, ...seenOrgIds])];
-    } else {
-      delete cursor.ringSeen;
-    }
+    // The next ring is a new generation.
+    cursor.ringGen = ringGen + 1;
   }
 
   if (dryRun) {
@@ -570,9 +610,9 @@ export async function sweepStagingUploads(
   // races the remaining window; a hung call cannot stall the worker tick.
   // Paths left when the window closes are dropped — the next ring visit
   // re-lists and reclaims them (deletes are idempotent).
-  const deleteT0 = clock().getTime();
+  const deleteT0 = monoNowMs(ctx);
   for (let i = 0; i < ctx.expiredPaths.length; i += DELETE_BATCH) {
-    const remainingDeleteMs = maxDeleteMillis - (clock().getTime() - deleteT0);
+    const remainingDeleteMs = maxDeleteMillis - (monoNowMs(ctx) - deleteT0);
     if (remainingDeleteMs <= 0) {
       stats.deleteBudgetStopped = true;
       logFn(
@@ -596,18 +636,25 @@ export async function sweepStagingUploads(
       }
       // Count what the API REPORTS deleted (S113 MINOR — a partial success
       // omits objects from data); data:null (mocks/older clients) falls back
-      // to the batch length.
+      // to the batch length. A SHORTFALL is a recorded ERROR (verify round):
+      // a remove() that "succeeds" while deleting less than asked must stay
+      // fail-loud, or the CLI's ring-quiescence check could declare a false
+      // drain and the worker would rot silently (refuter-proven repro).
       const removedCount = Array.isArray(data) ? data.length : batch.length;
       stats.deleted += removedCount;
       if (removedCount === batch.length) {
         for (const p of batch) logFn(`[staging-sweep] deleted ${p}`);
       } else {
-        logFn(
-          `[staging-sweep] remove batch partial: ${removedCount}/${batch.length} reported deleted`,
+        stats.errors.push(
+          `remove batch shortfall: ${removedCount}/${batch.length} reported deleted (no error from API)`,
         );
       }
     } catch (err) {
-      stats.errors.push(`remove batch threw: ${(err as Error).message}`);
+      const msg = (err as Error).message;
+      // A window timeout on the FINAL batch would otherwise leave the flag
+      // unset (the loop exits before the next top-of-loop check).
+      if (msg.includes("exceeded delete window")) stats.deleteBudgetStopped = true;
+      stats.errors.push(`remove batch threw: ${msg}`);
     }
   }
 
@@ -667,6 +714,10 @@ function readWalkCursor(marker: SweepMarker): WalkCursor | undefined {
   if (!wc || typeof wc !== "object" || !isValidOffset(wc.rootOffset)) {
     return undefined;
   }
+  // ringGen (S113): a non-negative int, else 0. Per-entry gen is validated and
+  // CLAMPED to ringGen in the sweep's own seeding (a future/corrupt gen ages
+  // from now — conservative, never enables an early prune).
+  const ringGen = isValidOffset(wc.ringGen) ? wc.ringGen : 0;
   const orgResume: Record<string, OrgResume> = {};
   if (wc.orgResume && typeof wc.orgResume === "object") {
     for (const [k, v] of Object.entries(wc.orgResume)) {
@@ -676,22 +727,17 @@ function readWalkCursor(marker: SweepMarker): WalkCursor | undefined {
         isValidOffset((v as OrgResume).draftOffset) &&
         isValidOffset((v as OrgResume).fileOffset)
       ) {
-        orgResume[k] = { draftOffset: (v as OrgResume).draftOffset, fileOffset: (v as OrgResume).fileOffset };
+        const entry: OrgResume = {
+          draftOffset: (v as OrgResume).draftOffset,
+          fileOffset: (v as OrgResume).fileOffset,
+        };
+        const gen = (v as OrgResume).gen;
+        if (isValidOffset(gen)) entry.gen = gen;
+        orgResume[k] = entry;
       }
     }
   }
-  // ringSeen (S113): only a bounded array of UUID-shaped org ids is trusted;
-  // anything else (junk entries, oversize, absent) → ring history UNKNOWN,
-  // which safely skips the next ring-EOF prune.
-  const rs = wc.ringSeen;
-  if (
-    Array.isArray(rs) &&
-    rs.length <= RING_SEEN_MAX &&
-    rs.every((s) => typeof s === "string" && UUID_SHAPE_REGEX.test(s))
-  ) {
-    return { rootOffset: wc.rootOffset, orgResume, ringSeen: rs };
-  }
-  return { rootOffset: wc.rootOffset, orgResume };
+  return { rootOffset: wc.rootOffset, orgResume, ringGen };
 }
 
 /** Write the marker; returns true on success, false (logged) on failure. */
@@ -741,25 +787,28 @@ export async function maybeRunStagingSweep(
     const nowMs = now.getTime();
 
     let fileLastMs = 0;
-    let cursor: WalkCursor | undefined;
+    let parsedMarker: SweepMarker | undefined;
     try {
       const raw = await fs.readFile(markerPath, "utf-8");
-      const marker = JSON.parse(raw) as SweepMarker;
-      fileLastMs = Date.parse(marker.lastRunAt) || 0;
-      // Legacy S111 markers carry `cursors` (the prefix map) and no walkCursor
-      // → cursor stays undefined → fresh ring (a one-time progress reset; never
-      // over-deletes, restarts from 0).
-      cursor = readWalkCursor(marker);
+      parsedMarker = JSON.parse(raw) as SweepMarker;
+      fileLastMs = Date.parse(parsedMarker.lastRunAt) || 0;
     } catch {
       // Missing or corrupt marker → due now (subject to in-memory backoff).
     }
 
     // Gate on the MAX of file + in-memory backoff (item 1): a stale file
     // marker (write previously failed) is still paced by the live process.
+    // Checked BEFORE cursor validation (verify round) — 2879 of 2880 daily
+    // 30s ticks return here, so the cursor work would be thrown away.
     const effectiveLastMs = Math.max(fileLastMs, backoff.lastRunMs);
     if (nowMs - effectiveLastMs < SWEEP_INTERVAL_HOURS * 3_600_000) {
       return { ran: false };
     }
+
+    // Legacy S111 markers carry `cursors` (the prefix map) and no walkCursor
+    // → cursor stays undefined → fresh ring (a one-time progress reset; never
+    // over-deletes, restarts from 0).
+    const cursor = parsedMarker ? readWalkCursor(parsedMarker) : undefined;
 
     let sb = opts.sb;
     if (!sb) {
