@@ -59,6 +59,20 @@
  *     filters, `uploads` staging prefix, metadata-file filter, stampMs < cutoff)
  *     is UNCHANGED, so a resume-math bug is at worst a transient miss reclaimed
  *     on the next ring wrap — never an over-delete of a live file.
+ *   - DELETE-SHIFT CONVERGENCE (MERGE-gate Codex BLOCKING): a remove() shrinks
+ *     the listing (Supabase folders are virtual — a draft/org folder vanishes when
+ *     its last object is deleted), so a forward resume offset persisted across a
+ *     delete can land PAST the survivors that shifted left → that one sweep
+ *     under-deletes and the orgResume entry clears on the false-EOF. The NEXT
+ *     from-0 visit re-lists the shifted-left survivors and reclaims them; each
+ *     ring with survivors deletes >=1, so the worker provably DRAINS EVERY expired
+ *     file over successive 24h sweeps (verified to 50k drafts in the suite — see
+ *     "WORKER converges" test). It is bounded EVENTUAL coverage, not single-pass:
+ *     a pathological tenant drains slowly (fairness + tick-protection > drain
+ *     speed; raise the caps if faster reclamation is ever needed). The MANUAL CLI
+ *     (cleanup-staging-uploads.ts) therefore loops until a COMPLETE RING deletes
+ *     nothing (per-ring, not per-chunk) so a delete-shift mid-ring EOF cannot make
+ *     it report a false "drained."
  */
 
 import * as fs from "node:fs/promises";
@@ -85,6 +99,14 @@ const DELETE_BATCH = 100;
 // maxRequestsPerOrg enforces multi-tenant fairness (a giant org yields after
 // this many list calls so other orgs are serviced). At realistic scale a sweep
 // finishes far below any cap and behaves exactly as before. See design §5.
+//
+// SAFE FLOORS (MERGE-gate Codex MINOR): the worker + CLI always use these
+// defaults. A 3-level tree needs >=3 list calls (root + uploads + files) to reach
+// a leaf, so maxRequests<3 / maxRequestsPerOrg<2 cannot make leaf progress and are
+// UNSAFE — they exist only for unit tests that exercise the cursor mechanics on
+// sub-budget slices (the prod callers never pass sub-floor values). maxMillis must
+// be > 0. These are not clamped (clamping would defeat those mechanics tests); they
+// are simply never supplied below the floor by any production path.
 const MAX_REQUESTS = 300;
 const MAX_REQUESTS_PER_ORG = 50;
 const MAX_MILLIS = 15_000;

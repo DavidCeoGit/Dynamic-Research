@@ -77,15 +77,15 @@ const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
 // (rootOffset wraps to 0 and orgResume empties on a full pass), but a very large
 // tree at the default per-sweep budget could take many chunks. This cap prevents
 // an unbounded loop if a bug ever broke termination; it is far above any real need.
-const MAX_CHUNKS = 100_000;
+const MAX_CHUNKS = 200_000;
 const SLEEP_MS = 200;
+// Stop the loop after this many CONSECUTIVE chunks that made no delete progress
+// AND recorded errors — a persistent list failure must not retry to the chunk cap
+// (MERGE-gate Codex MAJOR). Transient single-chunk errors are tolerated.
+const MAX_ERROR_STREAK = 5;
 
-function hasPendingWork(cursor: WalkCursor, budgetExhausted: boolean): boolean {
-  return (
-    budgetExhausted ||
-    cursor.rootOffset !== 0 ||
-    Object.keys(cursor.orgResume).length > 0
-  );
+function ringComplete(cursor: WalkCursor): boolean {
+  return cursor.rootOffset === 0 && Object.keys(cursor.orgResume).length === 0;
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -110,6 +110,17 @@ async function main(): Promise<void> {
 
   let cursor: WalkCursor | undefined;
   let lastErrors: string[] = [];
+  // Per-RING accumulated deletions (a "ring" = the chunks from rootOffset 0 back
+  // to 0). Quiescence = a COMPLETE ring that deleted NOTHING. Tracking per-ring
+  // (not per-chunk) is required because deletes shrink the listing: a forward
+  // resume offset can land past delete-shifted survivors, so a single chunk may
+  // delete 0 mid-ring while files remain. A full from-0 ring that deletes 0 is the
+  // only correct "drained" signal (MERGE-gate Codex BLOCKING — the CLI must not
+  // false-complete on a delete-shift mid-ring EOF). Convergence is guaranteed:
+  // every ring with survivors deletes >=1, and the total is finite.
+  let ringDeleted = 0;
+  let errorStreak = 0;
+  let stopped = "";
 
   for (let chunk = 0; chunk < MAX_CHUNKS; chunk++) {
     const stats = await sweepStagingUploads(sb, {
@@ -130,9 +141,26 @@ async function main(): Promise<void> {
     lastErrors = stats.errors;
 
     cursor = stats.nextCursor;
-    if (!hasPendingWork(cursor, stats.budgetExhausted)) break;
+    ringDeleted += stats.deleted;
+
+    // Persistent-error guard: stop if no delete progress + errors recur.
+    if (stats.errors.length > 0 && stats.deleted === 0) {
+      if (++errorStreak >= MAX_ERROR_STREAK) {
+        stopped = `stopped after ${errorStreak} consecutive error chunks with no progress — investigate + re-run`;
+        break;
+      }
+    } else {
+      errorStreak = 0;
+    }
+
+    if (ringComplete(cursor)) {
+      // dry-run never deletes, so one full ring lists the whole tree → done.
+      // confirm-mode: stop only when a full ring deleted nothing (true drain).
+      if (!CONFIRM || ringDeleted === 0) break;
+      ringDeleted = 0; // ring deleted something → run another ring (delete-shift may hide survivors)
+    }
     if (chunk + 1 >= MAX_CHUNKS) {
-      console.log(`  ⚠ chunk cap (${MAX_CHUNKS}) reached — re-run to continue.`);
+      stopped = `chunk cap (${MAX_CHUNKS}) reached — re-run to continue`;
       break;
     }
     await new Promise((r) => setTimeout(r, SLEEP_MS));
@@ -152,6 +180,7 @@ async function main(): Promise<void> {
     console.log(`  deleted:         ${agg.deleted}`);
   }
   console.log(`  errors:          ${agg.errors}`);
+  if (stopped) console.log(`  ⚠ ${stopped}`);
 
   if (agg.errors > 0) {
     console.log("");

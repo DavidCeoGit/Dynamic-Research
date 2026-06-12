@@ -593,6 +593,135 @@ test("maybeRunStagingSweep: post-sweep marker stamps COMPLETION time + walkCurso
   assert.equal(marker.walkCursor!.rootOffset, 0, "completed small-tree sweep wrapped the ring to 0");
 });
 
+// ── S112 MERGE-gate (Codex BLOCKING) — DELETE-SHIFT convergence ──────
+// A mutating mock: remove() actually splices paths out of the tree and collapses
+// emptied folders (Supabase storage folders are virtual — they vanish when their
+// last object is deleted). This reproduces the offset-shift Codex flagged: deletes
+// before a saved offset shrink the listing. The worker must still EVENTUALLY drain
+// every expired file (eventual coverage), and a drain-to-quiescence loop (the CLI's
+// contract) must reach zero remaining.
+
+function mutatingMockSb(tree: Record<string, Entry[]>): StorageSweepClientLike & {
+  removedCount: () => number;
+} {
+  let removed = 0;
+  // Structure-aware collapse for the EXACT staging layout. The listing keys are
+  // "" (root → orgs), "<org>/uploads" (→ drafts), "<org>/uploads/<draft>" (→ files).
+  // A draft folder vanishes when its last file is removed; an org folder (an entry
+  // in the root listing keyed "") vanishes when its uploads listing empties. NOTE
+  // the parent of "<org>/uploads" is the ROOT key "" — NOT a "<org>" key (there is
+  // no such key) — so generic "slice before last /" collapse is WRONG here.
+  return {
+    removedCount: () => removed,
+    storage: {
+      from() {
+        return {
+          async list(prefix: string, o: { limit: number; offset?: number }) {
+            const off = o.offset ?? 0;
+            return { data: (tree[prefix] ?? []).slice(off, off + o.limit), error: null };
+          },
+          async remove(paths: string[]) {
+            for (const p of paths) {
+              const parts = p.split("/"); // [org, "uploads", draft, file]
+              const org = parts[0];
+              const draft = parts[2];
+              const file = parts[3];
+              const draftKey = `${org}/uploads/${draft}`;
+              const uploadsKey = `${org}/uploads`;
+              const files = tree[draftKey];
+              if (!files) continue;
+              const fi = files.findIndex((e) => e.name === file);
+              if (fi < 0) continue;
+              files.splice(fi, 1);
+              removed += 1;
+              if (files.length === 0) {
+                delete tree[draftKey];
+                const drafts = tree[uploadsKey];
+                if (drafts) {
+                  const di = drafts.findIndex((e) => e.name === draft);
+                  if (di >= 0) drafts.splice(di, 1);
+                  if (drafts.length === 0) {
+                    delete tree[uploadsKey];
+                    const root = tree[""];
+                    const oi = root.findIndex((e) => e.name === org);
+                    if (oi >= 0) root.splice(oi, 1);
+                  }
+                }
+              }
+            }
+            return { data: null, error: null };
+          },
+        };
+      },
+    },
+  };
+}
+
+test("sweep: WORKER converges — delete-shift drains ALL expired files across repeated sweeps (Codex BLOCKING)", async () => {
+  const tree: Record<string, Entry[]> = { "": [{ name: ORG, metadata: null }], [`${ORG}/uploads`]: [] };
+  for (let i = 0; i < 600; i++) {
+    const d = `${String(i).padStart(8, "0")}-2222-4333-8444-555555555555`;
+    tree[`${ORG}/uploads`].push({ name: d, metadata: null });
+    tree[`${ORG}/uploads/${d}`] = [{ name: "old.pdf", created_at: OLD, metadata: { size: 1 } }];
+  }
+  const sb = mutatingMockSb(tree);
+  let cursor: WalkCursor | undefined;
+  let sweeps = 0;
+  // Each sweep deletes a per-org-bounded slice; deletion shifts the listing.
+  // Convergence must hold despite the shift (no permanent skip).
+  for (; sweeps < 500; sweeps++) {
+    const stats = await sweepStagingUploads(sb, { now: NOW, maxRequestsPerOrg: 20, startCursor: cursor });
+    cursor = stats.nextCursor;
+    if (sb.removedCount() === 600) break;
+  }
+  assert.equal(sb.removedCount(), 600, "every expired file is eventually deleted despite delete-shift");
+  assert.equal(tree[`${ORG}/uploads`]?.length ?? 0, 0, "the org's drafts all collapsed away");
+  assert.ok(sweeps < 200, `converged in a bounded number of sweeps (was ${sweeps})`);
+});
+
+test("sweep: drain-to-quiescence loop (CLI contract) reaches zero remaining under delete-shift", async () => {
+  // The CLI loops until a COMPLETE ring deletes nothing — it must NOT stop early on
+  // a delete-shift false-EOF (the Codex BLOCKING for the CLI). Two orgs + a tight
+  // budget force many chunks.
+  const tree: Record<string, Entry[]> = { "": [] };
+  let expected = 0;
+  for (const orgId of [ORG, ORG2]) {
+    tree[""].push({ name: orgId, metadata: null });
+    tree[`${orgId}/uploads`] = [];
+    for (let i = 0; i < 120; i++) {
+      const d = `${String(i).padStart(8, "0")}-2222-4333-8444-5555555555${orgId === ORG ? "55" : "66"}`;
+      tree[`${orgId}/uploads`].push({ name: d, metadata: null });
+      tree[`${orgId}/uploads/${d}`] = [{ name: "old.pdf", created_at: OLD, metadata: { size: 1 } }];
+      expected += 1;
+    }
+  }
+  const sb = mutatingMockSb(tree);
+  let cursor: WalkCursor | undefined;
+  let guard = 0;
+  // Quiescence = a COMPLETE RING (rootOffset 0→0, orgResume empty) that deleted
+  // NOTHING. Tracking per-RING (not per-chunk) is required: a delete-shift can make
+  // a single mid-ring chunk delete 0 while survivors remain, so a per-chunk
+  // deleted==0 check would false-complete (the CLI bug Codex flagged).
+  let ringDeleted = 0;
+  for (;;) {
+    if (guard++ > 8000) throw new Error("did not reach quiescence — possible non-convergence");
+    const stats = await sweepStagingUploads(sb, {
+      now: NOW,
+      maxRequests: 6,
+      maxRequestsPerOrg: 3,
+      startCursor: cursor,
+    });
+    cursor = stats.nextCursor;
+    ringDeleted += stats.deleted;
+    if (cursor.rootOffset === 0 && Object.keys(cursor.orgResume).length === 0) {
+      if (ringDeleted === 0) break; // a full ring deleted nothing → truly drained
+      ringDeleted = 0; // ring deleted something → run another ring
+    }
+  }
+  assert.equal(sb.removedCount(), expected, "drain-to-quiescence deletes every expired file");
+  assert.equal(tree[""].length, 0, "all org folders collapsed away — nothing left in staging");
+});
+
 test("maybeRunStagingSweep: legacy S111 marker (cursors map, no walkCursor) → fresh ring, never throws (Codex #7)", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sweep-legacy-"));
   const markerPath = path.join(dir, ".staging-sweep-last");
