@@ -478,6 +478,37 @@ test("sweep: resuming with an org cursor beyond the (shrunk) listing → no cras
   assert.equal(stats.errors.length, 0, "no crash / no error from the stale offset");
 });
 
+test("sweep: a HUNG list() is bounded by maxMillis — per-call timeout degrades to error, no hang (breadth F1)", async () => {
+  // A single storage list() that never resolves must not delay the sweep past
+  // maxMillis. The per-call timeout (real wall-clock) fires and degrades to a
+  // recorded error; the sweep returns instead of hanging the worker tick.
+  const tree = baseTree([{ name: "old.pdf", created_at: OLD, metadata: { size: 5 } }]);
+  const sb: StorageSweepClientLike = {
+    storage: {
+      from() {
+        return {
+          async list(prefix: string, o: { limit: number; offset?: number }) {
+            if (prefix === "") return new Promise<never>(() => {}); // root list hangs forever
+            const off = o.offset ?? 0;
+            return { data: (tree[prefix] ?? []).slice(off, off + o.limit), error: null };
+          },
+          async remove() {
+            return { data: null, error: null };
+          },
+        };
+      },
+    },
+  };
+  // Real 60ms wall-clock budget; the hung root list() is aborted after ~60ms.
+  // (No `now`/`clockFn` → real clock, so elapsed advances and remainingMs is finite.)
+  const stats = await sweepStagingUploads(sb, { maxMillis: 60 });
+  assert.ok(
+    stats.errors.some((e) => /exceeded maxMillis budget/.test(e)),
+    "the hung list() is bounded by the per-call timeout and recorded as an error",
+  );
+  assert.equal(stats.deleted, 0, "no delete when the root list never returns");
+});
+
 test("sweep: list error on a draft prefix is contained — recorded, org resume saved, no delete", async () => {
   const draftPrefix = `${ORG}/uploads/${DRAFT}`;
   const sb = mockSweepSb(

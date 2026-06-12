@@ -140,21 +140,37 @@ async function main(): Promise<void> {
     agg.errors += stats.errors.length;
     lastErrors = stats.errors;
 
+    const prevCursor = cursor;
     cursor = stats.nextCursor;
     ringDeleted += stats.deleted;
+    const hadErrors = stats.errors.length > 0;
+    // Forward progress = a delete OR the cursor moved (listing advanced). Using
+    // `deleted===0` alone as the no-progress signal was wrong (QA MAJOR): a chunk
+    // can scan fresh/unparseable files or advance the ring without deleting.
+    const movedCursor = JSON.stringify(prevCursor ?? null) !== JSON.stringify(cursor);
+    const madeProgress = stats.deleted > 0 || movedCursor;
 
-    // Persistent-error guard: stop if no delete progress + errors recur.
-    if (stats.errors.length > 0 && stats.deleted === 0) {
-      if (++errorStreak >= MAX_ERROR_STREAK) {
-        stopped = `stopped after ${errorStreak} consecutive error chunks with no progress — investigate + re-run`;
-        break;
+    // On an errored chunk, a list failure leaves the cursor UNTOUCHED, so a
+    // transient root error at {rootOffset:0, orgResume:{}} would make
+    // ringComplete() true on cursor SHAPE alone and falsely "complete" the drain
+    // (QA MAJOR). So: never treat an errored chunk as terminal; instead retry,
+    // and only abort if errors RECUR with no forward progress.
+    if (hadErrors) {
+      if (!madeProgress) {
+        if (++errorStreak >= MAX_ERROR_STREAK) {
+          stopped = `stopped after ${errorStreak} consecutive error chunks with no progress — investigate + re-run`;
+          break;
+        }
+      } else {
+        errorStreak = 0;
       }
-    } else {
-      errorStreak = 0;
+      if (chunk + 1 < MAX_CHUNKS) await new Promise((r) => setTimeout(r, SLEEP_MS));
+      continue; // do NOT evaluate ringComplete on an errored chunk
     }
+    errorStreak = 0;
 
     if (ringComplete(cursor)) {
-      // dry-run never deletes, so one full ring lists the whole tree → done.
+      // dry-run never deletes, so one full clean ring lists the whole tree → done.
       // confirm-mode: stop only when a full ring deleted nothing (true drain).
       if (!CONFIRM || ringDeleted === 0) break;
       ringDeleted = 0; // ring deleted something → run another ring (delete-shift may hide survivors)

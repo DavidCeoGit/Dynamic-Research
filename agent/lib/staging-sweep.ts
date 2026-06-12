@@ -221,12 +221,35 @@ function overGlobalBudget(ctx: SweepCtx): boolean {
   );
 }
 
+/** Reject `p` if it doesn't settle within `ms` (timer unref'd + cleared). */
+function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(msg)), ms);
+    // unref so a pending storage call can't keep the worker process alive.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 /**
  * List exactly one page. Increments the global request counter (the single
- * place a list is counted). Never throws (S106 Codex MAJOR #3): both a resolved
- * {error} and a rejected promise degrade to {error:true} + a recorded
- * stats.errors entry; the caller then leaves the relevant cursor UNTOUCHED so
- * the same region is retried next sweep (deletes are idempotent).
+ * place a list is counted — a thrown/timed-out list still consumes a budget
+ * unit BY DESIGN, so an error storm can't spin a prefix for free; the worker
+ * just waits for the next 24h sweep). Never throws (S106 Codex MAJOR #3): a
+ * resolved {error}, a rejected promise, AND a wall-clock timeout all degrade to
+ * {error:true} + a recorded stats.errors entry; the caller then leaves the
+ * relevant cursor UNTOUCHED so the same region is retried next sweep (deletes
+ * are idempotent).
+ *
+ * The per-call timeout (breadth-review F1) bounds a SINGLE hung list() to the
+ * remaining wall-clock budget — maxMillis is otherwise only sampled BETWEEN
+ * calls, so without this one stalled storage call (up to the HTTP client's own
+ * long default timeout) could delay the worker's idle tick past maxMillis,
+ * defeating the headline tick-protection guarantee. Tests resolve list()
+ * synchronously, so the timer never fires.
  */
 async function listPage(
   ctx: SweepCtx,
@@ -234,12 +257,17 @@ async function listPage(
   offset: number,
 ): Promise<{ items: ListedObject[]; eof: boolean; error: boolean }> {
   ctx.stats.requestsUsed += 1;
+  const remainingMs = ctx.maxMillis - (ctx.clock().getTime() - ctx.t0);
   try {
-    const { data, error } = await ctx.sb.storage.from(BUCKET).list(prefix, {
+    const listCall = ctx.sb.storage.from(BUCKET).list(prefix, {
       limit: LIST_LIMIT,
       offset,
       sortBy: { column: "name", order: "asc" },
     });
+    const { data, error } =
+      remainingMs > 0
+        ? await withTimeout(listCall, remainingMs, `list exceeded maxMillis budget (${remainingMs}ms left)`)
+        : await listCall;
     if (error) throw new Error(error.message);
     const items = data ?? [];
     return { items, eof: items.length < LIST_LIMIT, error: false };
@@ -529,10 +557,15 @@ export interface MaybeSweepOptions {
   backoffState?: SweepBackoffState;
 }
 
+/** A valid resume offset is a non-negative integer (breadth-review F6: a
+ *  hand-corrupted marker like `rootOffset:-5` would otherwise reach list()). */
+const isValidOffset = (n: unknown): n is number =>
+  typeof n === "number" && Number.isInteger(n) && n >= 0;
+
 /** Read + validate a WalkCursor from a parsed marker; undefined if absent/legacy/corrupt. */
 function readWalkCursor(marker: SweepMarker): WalkCursor | undefined {
   const wc = marker.walkCursor;
-  if (!wc || typeof wc !== "object" || typeof wc.rootOffset !== "number") {
+  if (!wc || typeof wc !== "object" || !isValidOffset(wc.rootOffset)) {
     return undefined;
   }
   const orgResume: Record<string, OrgResume> = {};
@@ -541,8 +574,8 @@ function readWalkCursor(marker: SweepMarker): WalkCursor | undefined {
       if (
         v &&
         typeof v === "object" &&
-        typeof (v as OrgResume).draftOffset === "number" &&
-        typeof (v as OrgResume).fileOffset === "number"
+        isValidOffset((v as OrgResume).draftOffset) &&
+        isValidOffset((v as OrgResume).fileOffset)
       ) {
         orgResume[k] = { draftOffset: (v as OrgResume).draftOffset, fileOffset: (v as OrgResume).fileOffset };
       }
@@ -668,14 +701,16 @@ export async function maybeRunStagingSweep(
 
     // Re-stamp at COMPLETION so the 24h clock starts when the sweep finishes,
     // not when it began (Codex MAJOR — a >24h sweep would otherwise be due
-    // again immediately). Best-effort: the durable window was already claimed
-    // by the pre-write, so a failed post-write only loses cursor advancement
-    // (next sweep re-resumes from the old cursor — idempotent).
-    const finishedAt = readClock();
-    backoff.lastRunMs = finishedAt.getTime();
+    // again immediately). Clamp to >= the claim time (breadth-review F4) so a
+    // BACKWARD wall-clock step (NTP/VM correction) between claim and completion
+    // can't stamp an EARLIER time and shorten the 24h gate. Best-effort: the
+    // durable window was already claimed by the pre-write, so a failed post-write
+    // only loses cursor advancement (next sweep re-resumes from the old cursor).
+    const completedMs = Math.max(nowMs, readClock().getTime());
+    backoff.lastRunMs = completedMs;
     await writeMarker(
       markerPath,
-      { lastRunAt: finishedAt.toISOString(), walkCursor: stats.nextCursor },
+      { lastRunAt: new Date(completedMs).toISOString(), walkCursor: stats.nextCursor },
       logFn,
     );
 
