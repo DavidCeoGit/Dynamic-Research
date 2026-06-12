@@ -1101,6 +1101,26 @@ test("maybeRunStagingSweep: corrupt ringGen / future entry gen are clamped via t
     "future gen clamped to the (validated) current generation — entry kept, ages from now",
   );
   assert.equal(marker.walkCursor!.ringGen, 1, "corrupt ringGen read as 0, advanced to 1 at the ring EOF");
+
+  // UNSAFE-integer class (v4 Codex MINOR): ringGen at 2^53 would make
+  // `ringGen + 1` a no-op (gens frozen → prune disabled forever). Validation
+  // must reject it (reset to 0) like any other corrupt value.
+  await fs.writeFile(
+    markerPath,
+    JSON.stringify({
+      lastRunAt: stale,
+      walkCursor: {
+        rootOffset: 0,
+        orgResume: { [goneOrg]: { draftOffset: 9, fileOffset: 0, gen: 2 ** 53 } },
+        ringGen: 2 ** 53,
+      },
+    }),
+  );
+  const r2 = await maybeRunStagingSweep({ markerPath, now: NOW, sb, backoffState: { lastRunMs: 0 } });
+  assert.equal(r2.ran, true);
+  const marker2 = JSON.parse(await fs.readFile(markerPath, "utf-8")) as { walkCursor?: WalkCursor };
+  assert.equal(marker2.walkCursor!.ringGen, 1, "unsafe ringGen rejected → 0, advances to 1 (aging unfrozen)");
+  assert.equal(marker2.walkCursor!.orgResume[goneOrg]?.gen, 0, "unsafe entry gen re-stamped at current");
 });
 
 test("sweep: a BACKWARD clock step cannot inflate the per-call delete timeout past the window (verify round, monotonic clock)", async () => {

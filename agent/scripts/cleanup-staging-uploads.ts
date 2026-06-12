@@ -253,6 +253,15 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // ANY premature stop (chunk cap, error-streak — even with agg.errors==0) is
+  // a partial sweep, not a success: the loop did not reach an evaluation-point
+  // drain, so exit 1 per the header's exit-code contract (v4, Codex MAJOR —
+  // a capped no-error run previously printed "Sweep complete." and exited 0).
+  if (stopped) {
+    console.log(`\nPartial sweep — ${stopped}`);
+    process.exit(1);
+  }
+
   if (mode === "dry-run") {
     console.log("\nDRY-RUN complete. Re-run with --confirm to execute the DELETE.");
   } else {

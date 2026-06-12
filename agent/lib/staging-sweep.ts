@@ -710,10 +710,13 @@ export interface MaybeSweepOptions {
   backoffState?: SweepBackoffState;
 }
 
-/** A valid resume offset is a non-negative integer (breadth-review F6: a
- *  hand-corrupted marker like `rootOffset:-5` would otherwise reach list()). */
+/** A valid resume offset / generation is a non-negative SAFE integer
+ *  (breadth-review F6: a hand-corrupted marker like `rootOffset:-5` would
+ *  otherwise reach list(); v4 Codex MINOR: an unsafe `ringGen: 2^53` makes
+ *  `ringGen + 1` a no-op, freezing generation aging and disabling the orphan
+ *  prune forever — unsafe values reset to 0 / re-stamp at current). */
 const isValidOffset = (n: unknown): n is number =>
-  typeof n === "number" && Number.isInteger(n) && n >= 0;
+  typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 
 /** Read + validate a WalkCursor from a parsed marker; undefined if absent/legacy/corrupt. */
 function readWalkCursor(marker: SweepMarker): WalkCursor | undefined {
