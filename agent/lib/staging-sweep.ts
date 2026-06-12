@@ -73,6 +73,31 @@
  *     (cleanup-staging-uploads.ts) therefore loops until a COMPLETE RING deletes
  *     nothing (per-ring, not per-chunk) so a delete-shift mid-ring EOF cannot make
  *     it report a false "drained."
+ *
+ * ── S113 post-merge real-Gemini holistic findings (OWED-leg pass) ──────
+ *   - DELETE-PHASE BUDGET (Gemini BLOCKING): the post-walk remove() loop runs in
+ *     its OWN bounded window (maxDeleteMillis, default 10s), with every remove()
+ *     racing the remaining window via withTimeout. The window is deliberately
+ *     SEPARATE from the walk budget — if deletes shared maxMillis, a tree whose
+ *     walk always exhausts the budget would never delete anything (convergence
+ *     broken). Worst-case sweep wall-clock ≈ maxMillis + maxDeleteMillis
+ *     (default ~25s), still under the worker's 30s poll tick. Paths found but
+ *     not deleted when the window closes are NOT persisted — the next ring
+ *     visit re-lists and reclaims them (idempotent).
+ *   - RING-ACCUMULATED ORPHAN PRUNE (Gemini MAJOR): orphan pruning keys on
+ *     ringSeen — org ids accumulated across ALL the sweeps of the current root
+ *     ring — so the prune fires at every ring EOF even when the ring spans many
+ *     budget-bounded sweeps. The old single-sweep offset-0→EOF gate was
+ *     unreachable on large trees, leaking deleted orgs' cursor entries forever.
+ *     If ring history is UNKNOWN (legacy/corrupt marker found mid-ring) the
+ *     prune is skipped for that ring; the next ring (fresh from 0) prunes. A
+ *     wrongly-pruned LIVE org (delete-shift moving its root entry across an
+ *     already-listed page boundary) only loses resume position — next visit
+ *     re-walks it from 0; never an over-delete (safety floor unchanged).
+ *   - TRUTHFUL deleted-COUNT (Gemini MINOR): stats.deleted counts what Supabase
+ *     remove() REPORTS deleted (data[].length — partial success omits objects),
+ *     not the batch length; clients/mocks resolving data:null fall back to
+ *     batch length for back-compat.
  */
 
 import * as fs from "node:fs/promises";
@@ -104,12 +129,20 @@ const DELETE_BATCH = 100;
 // defaults. A 3-level tree needs >=3 list calls (root + uploads + files) to reach
 // a leaf, so maxRequests<3 / maxRequestsPerOrg<2 cannot make leaf progress and are
 // UNSAFE — they exist only for unit tests that exercise the cursor mechanics on
-// sub-budget slices (the prod callers never pass sub-floor values). maxMillis must
-// be > 0. These are not clamped (clamping would defeat those mechanics tests); they
-// are simply never supplied below the floor by any production path.
+// sub-budget slices (the prod callers never pass sub-floor values). maxMillis and
+// maxDeleteMillis must be > 0. These are not clamped (clamping would defeat those
+// mechanics tests); they are simply never supplied below the floor by any
+// production path.
 const MAX_REQUESTS = 300;
 const MAX_REQUESTS_PER_ORG = 50;
 const MAX_MILLIS = 15_000;
+// Delete-phase window (S113) — separate from the walk budget BY DESIGN (see
+// header). maxMillis + MAX_DELETE_MILLIS must stay comfortably under the
+// worker's 30s poll interval.
+const MAX_DELETE_MILLIS = 10_000;
+// Guard against a corrupt/hostile marker inflating the ring-seen set (S113);
+// real cardinality ≈ tenant count. Oversize → ring history treated as unknown.
+const RING_SEEN_MAX = 10_000;
 
 interface ListedObject {
   name: string;
@@ -153,11 +186,16 @@ export interface OrgResume {
  *     pages) and wraps to 0 at root EOF from any start.
  *   - orgResume: per-org {draftOffset, fileOffset} for orgs truncated this
  *     sweep. Keyed by org id; cardinality ≈ tenant count. Pruned (orphan org
- *     folders) only after a complete offset-0 all-pages-EOF root pass.
+ *     folders) at ring EOF against the ring-accumulated ringSeen set (S113).
+ *   - ringSeen: org ids seen at root since the current ring started at 0,
+ *     accumulated ACROSS sweeps (a ring can span many budget-bounded sweeps).
+ *     Cleared at every ring EOF (after the prune). ABSENT = ring history
+ *     unknown (legacy/corrupt marker) → that ring's EOF skips the prune.
  */
 export interface WalkCursor {
   rootOffset: number;
   orgResume: Record<string, OrgResume>;
+  ringSeen?: string[];
 }
 
 export interface SweepStats {
@@ -172,6 +210,9 @@ export interface SweepStats {
   requestsUsed: number;
   /** True if the GLOBAL budget (maxRequests/maxMillis) tripped this sweep. */
   budgetExhausted: boolean;
+  /** True if the delete window (maxDeleteMillis) closed with paths undeleted
+   *  this sweep (S113) — they are reclaimed on the next ring visit. */
+  deleteBudgetStopped: boolean;
   /** Resume cursor to persist for the NEXT sweep (circular ring + per-org). */
   nextCursor: WalkCursor;
   /** Populated in dryRun mode with the paths that WOULD be deleted. */
@@ -189,6 +230,9 @@ export interface SweepOptions {
   maxRequestsPerOrg?: number;
   /** Global wall-clock cap in ms (default MAX_MILLIS). */
   maxMillis?: number;
+  /** Delete-phase window in ms (default MAX_DELETE_MILLIS) — separate from
+   *  maxMillis so an exhausted walk can never starve deletes (S113). */
+  maxDeleteMillis?: number;
   /** Injectable clock for the elapsed/maxMillis check (defaults to `now` or wall-clock). */
   clockFn?: () => Date;
   /** Resume cursor from the prior sweep's nextCursor. */
@@ -389,10 +433,17 @@ export async function sweepStagingUploads(
   const maxRequests = opts.maxRequests ?? MAX_REQUESTS;
   const maxRequestsPerOrg = opts.maxRequestsPerOrg ?? MAX_REQUESTS_PER_ORG;
   const maxMillis = opts.maxMillis ?? MAX_MILLIS;
+  const maxDeleteMillis = opts.maxDeleteMillis ?? MAX_DELETE_MILLIS;
   const cutoffMs = now.getTime() - ttlHours * 3_600_000;
 
   const startRootOffset = opts.startCursor?.rootOffset ?? 0;
   const startOrgResume = opts.startCursor?.orgResume ?? {};
+  const startedAt0 = startRootOffset === 0;
+  // Ring history (S113): starting at 0 BEGINS a ring (known-empty history,
+  // regardless of any stale incoming ringSeen); mid-ring, the incoming set is
+  // the history — absent = unknown (legacy/corrupt marker) → no prune this ring.
+  const ringHistory = startedAt0 ? [] : opts.startCursor?.ringSeen;
+  const ringKnown = ringHistory !== undefined;
 
   const stats: SweepStats = {
     orgsScanned: 0,
@@ -403,6 +454,7 @@ export async function sweepStagingUploads(
     errors: [],
     requestsUsed: 0,
     budgetExhausted: false,
+    deleteBudgetStopped: false,
     // The cursor is mutated in place as orgs drain/truncate; rootOffset is
     // finalized at the end. Seeded from the incoming cursor.
     nextCursor: { rootOffset: startRootOffset, orgResume: { ...startOrgResume } },
@@ -424,7 +476,6 @@ export async function sweepStagingUploads(
   };
 
   const cursor = stats.nextCursor;
-  const startedAt0 = startRootOffset === 0;
   let rootOffset = startRootOffset;
   const seenOrgIds = new Set<string>();
   let rootEOF = false;
@@ -476,17 +527,34 @@ export async function sweepStagingUploads(
   }
 
   if (rootEOF) {
-    // Completed the root ring this sweep. Prune orphan org cursors ONLY after a
-    // true offset-0 → all-pages-EOF pass with no error/budget-stop (Codex #5):
-    // a partial view must not drop a live org's resume entry.
-    if (startedAt0 && !stats.budgetExhausted) {
+    // Completed the root ring. Prune orphan org cursors against the
+    // RING-accumulated org set — ringHistory (prior sweeps of this ring) ∪
+    // this sweep's seenOrgIds (S113, replaces the single-sweep offset-0 gate
+    // that was unreachable on large multi-sweep rings; Codex #5's
+    // partial-view concern is honored by ring CONTINUITY: rootOffset only
+    // advances past listed pages, an errored page is retried at the same
+    // offset, so a known ring covers every root page 0→EOF). Unknown history
+    // (legacy/corrupt marker found mid-ring) → skip; next ring prunes.
+    if (ringKnown) {
+      const ringOrgs = new Set([...ringHistory, ...seenOrgIds]);
       for (const key of Object.keys(cursor.orgResume)) {
-        if (!seenOrgIds.has(key)) delete cursor.orgResume[key];
+        if (!ringOrgs.has(key)) delete cursor.orgResume[key];
       }
     }
     // Circular wrap from ANY start so the pointer can never strand past the
     // end (Codex #1). Independent of whether any org remains truncated.
     cursor.rootOffset = 0;
+    // A new ring begins with KNOWN-empty history.
+    cursor.ringSeen = [];
+  } else {
+    // Mid-ring stop (budget / root error): persist the accumulated ring
+    // history so the EOF-reaching sweep of this ring can prune; stays
+    // unknown if it was unknown coming in.
+    if (ringKnown) {
+      cursor.ringSeen = [...new Set([...ringHistory, ...seenOrgIds])];
+    } else {
+      delete cursor.ringSeen;
+    }
   }
 
   if (dryRun) {
@@ -495,18 +563,49 @@ export async function sweepStagingUploads(
     return stats;
   }
 
+  // ── Bounded delete phase (S113 — Gemini BLOCKING) ───────────────────
+  // Runs in its OWN window (maxDeleteMillis), NOT the walk's exhausted budget:
+  // every sweep that found expired files must get to delete at least its first
+  // batch or convergence breaks on walk-budget-bound trees. Each remove()
+  // races the remaining window; a hung call cannot stall the worker tick.
+  // Paths left when the window closes are dropped — the next ring visit
+  // re-lists and reclaims them (deletes are idempotent).
+  const deleteT0 = clock().getTime();
   for (let i = 0; i < ctx.expiredPaths.length; i += DELETE_BATCH) {
+    const remainingDeleteMs = maxDeleteMillis - (clock().getTime() - deleteT0);
+    if (remainingDeleteMs <= 0) {
+      stats.deleteBudgetStopped = true;
+      logFn(
+        `[staging-sweep] delete window (${maxDeleteMillis}ms) closed with ` +
+          `${ctx.expiredPaths.length - i} expired paths undeleted — reclaimed next ring`,
+      );
+      break;
+    }
     const batch = ctx.expiredPaths.slice(i, i + DELETE_BATCH);
     try {
       // remove() RESOLVES { error } rather than rejecting — inspect it
       // (feedback_supabase_remove_resolves_error_not_throws).
-      const { error } = await sb.storage.from(BUCKET).remove(batch);
+      const { data, error } = await withTimeout(
+        sb.storage.from(BUCKET).remove(batch),
+        remainingDeleteMs,
+        `remove exceeded delete window (${remainingDeleteMs}ms left)`,
+      );
       if (error) {
         stats.errors.push(`remove batch (${batch.length} paths) failed: ${error.message}`);
         continue;
       }
-      stats.deleted += batch.length;
-      for (const p of batch) logFn(`[staging-sweep] deleted ${p}`);
+      // Count what the API REPORTS deleted (S113 MINOR — a partial success
+      // omits objects from data); data:null (mocks/older clients) falls back
+      // to the batch length.
+      const removedCount = Array.isArray(data) ? data.length : batch.length;
+      stats.deleted += removedCount;
+      if (removedCount === batch.length) {
+        for (const p of batch) logFn(`[staging-sweep] deleted ${p}`);
+      } else {
+        logFn(
+          `[staging-sweep] remove batch partial: ${removedCount}/${batch.length} reported deleted`,
+        );
+      }
     } catch (err) {
       stats.errors.push(`remove batch threw: ${(err as Error).message}`);
     }
@@ -580,6 +679,17 @@ function readWalkCursor(marker: SweepMarker): WalkCursor | undefined {
         orgResume[k] = { draftOffset: (v as OrgResume).draftOffset, fileOffset: (v as OrgResume).fileOffset };
       }
     }
+  }
+  // ringSeen (S113): only a bounded array of UUID-shaped org ids is trusted;
+  // anything else (junk entries, oversize, absent) → ring history UNKNOWN,
+  // which safely skips the next ring-EOF prune.
+  const rs = wc.ringSeen;
+  if (
+    Array.isArray(rs) &&
+    rs.length <= RING_SEEN_MAX &&
+    rs.every((s) => typeof s === "string" && UUID_SHAPE_REGEX.test(s))
+  ) {
+    return { rootOffset: wc.rootOffset, orgResume, ringSeen: rs };
   }
   return { rootOffset: wc.rootOffset, orgResume };
 }
@@ -693,7 +803,8 @@ export async function maybeRunStagingSweep(
       `[staging-sweep] done: orgs=${stats.orgsScanned} drafts=${stats.draftsScanned} ` +
         `files=${stats.filesScanned} expired=${stats.expired} deleted=${stats.deleted} ` +
         `requests=${stats.requestsUsed} errors=${stats.errors.length}` +
-        `${stats.budgetExhausted ? " BUDGET-EXHAUSTED" : ""}`,
+        `${stats.budgetExhausted ? " BUDGET-EXHAUSTED" : ""}` +
+        `${stats.deleteBudgetStopped ? " DELETE-WINDOW-CLOSED" : ""}`,
     );
     for (const e of stats.errors.slice(0, 10)) {
       logFn(`[staging-sweep] error: ${e}`);
