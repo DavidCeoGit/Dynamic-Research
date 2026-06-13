@@ -36,6 +36,7 @@ interface ManifestResponse {
     constraints: string[];
     additionalUrls: string[];
     claimsToVerify: string[];
+    publishRequired: boolean;
   };
   vendorEvaluation: {
     enabled: boolean;
@@ -152,6 +153,14 @@ export async function GET(
       constraints: (uc.constraints as string[]) ?? [],
       additionalUrls: (uc.additionalUrls as string[]) ?? [],
       claimsToVerify: (uc.claimsToVerify as string[]) ?? [],
+      // MRPF PUBLISH gate (S118 Codex MERGE-gate HIGH): a Clone & Edit of a
+      // publish-bound parent must default the new run's checkbox to the
+      // parent's value, not drop it. Omitting the field let the form prefill
+      // an incomplete userContext, zod default it to false, and silently
+      // downgrade the clone out of the gate with ZERO user action. Mirrors the
+      // replay route's S108 precedent. Stays user-EDITABLE (default, not
+      // sticky) — a clone for internal follow-up can still uncheck it.
+      publishRequired: uc.publishRequired === true,
     },
     vendorEvaluation: {
       enabled: (ve.enabled as boolean) ?? false,
