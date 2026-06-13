@@ -173,6 +173,12 @@ export function diagnosePublishFlag(v: unknown, source: string): PublishFlagDiag
     rawValue = String(v);
   }
   if (typeof rawValue !== "string") rawValue = String(rawValue);
+  // S120 Codex MERGE-gate (log-injection hardening, NON-BLOCK): replace control
+  // characters (newlines/CR/tabs/etc.) with spaces BEFORE truncation so a
+  // hostile or AI-written publish flag value cannot forge multiline [SECURITY]
+  // log lines through the rawValue field. Not a gate fail-open — purely the
+  // diagnostic log surface.
+  rawValue = rawValue.replace(/[\x00-\x1f\x7f]/g, " ");
   if (rawValue.length > RAW_VALUE_SLICE) rawValue = `${rawValue.slice(0, RAW_VALUE_SLICE)}…`;
   return { source, rawType: typeof v, rawValue, accepted, rejected: !accepted };
 }

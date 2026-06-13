@@ -164,6 +164,32 @@ test("diagnosePublishFlag: null for absent/boolean (expected shapes), diagnostic
   assert.equal(rejected!.rejected, true);
 });
 
+test("diagnosePublishFlag: control chars are stripped so a hostile value can't forge multiline log lines (S120 Codex MERGE)", () => {
+  const NL = String.fromCharCode(10);
+  const CR = String.fromCharCode(13);
+  const hostile = `true${NL}[SECURITY] job=forged publishRequired source=x accepted=true${CR}\tnoise`;
+  const d = diagnosePublishFlag(hostile, "state.publish_required")!;
+  assert.ok(d, "expected a diagnostic for a present non-boolean string");
+  assert.ok(!d.rawValue.includes(NL), "newline must be stripped from rawValue");
+  assert.ok(!d.rawValue.includes(CR), "carriage return must be stripped from rawValue");
+  // The emitted [SECURITY] alarm must be a single line (no forged extra lines).
+  const line = formatPublishFlagAlarm(JOB_ID, d);
+  assert.equal(line.split(NL).length, 1, "alarm line must not contain embedded newlines");
+});
+
+test("diagnosePublishFlag: symbol/function value does not throw; rawValue coerces to a string (S120 NIT — pins the JSON.stringify→undefined branch)", () => {
+  const sym = diagnosePublishFlag(Symbol("s"), "job.user_context")!;
+  assert.ok(sym, "symbol is a present non-boolean → diagnostic");
+  assert.equal(sym.rawType, "symbol");
+  assert.equal(typeof sym.rawValue, "string", "rawValue must be a string even when JSON.stringify→undefined");
+  assert.equal(sym.rejected, true);
+  const fn = diagnosePublishFlag(() => true, "state.publish_required")!;
+  assert.ok(fn);
+  assert.equal(fn.rawType, "function");
+  assert.equal(typeof fn.rawValue, "string");
+  assert.equal(fn.rejected, true);
+});
+
 test("formatPublishFlagAlarm: emits a [SECURITY] line; flags the silent-skip case for rejected values", () => {
   const rejected = diagnosePublishFlag("yes", "job.user_context")!;
   const line = formatPublishFlagAlarm(JOB_ID, rejected);
