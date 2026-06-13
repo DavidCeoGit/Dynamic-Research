@@ -38,6 +38,93 @@ export function isStateFileName(name: string): boolean {
 }
 
 /**
+ * Subdir (under the per-job workdir) that holds state files carried over from a
+ * PRIOR attempt in a REUSED workdir. The name is deliberately NOT a state-file
+ * candidate, and findStateFile() reads the workdir non-recursively, so archived
+ * files are invisible to selection.
+ */
+export const SUPERSEDED_STATE_DIR = ".superseded-state";
+
+/**
+ * Move every prior-attempt state-file candidate out of the workdir ROOT before
+ * the current run writes or anything reads, so findStateFile() cannot return a
+ * stale (possibly terminal/PASSING) manifest from an earlier re-queue.
+ *
+ * Why (S117 stale-terminal-state fail-open):
+ *   Per-slug workdirs (`C:/tmp/research-compare/<slug>/`) are intentionally
+ *   reused across re-queues of the same topic_slug. If a prior attempt left a
+ *   PASSING `publish_verification` and the new spawn exits WITHOUT writing its
+ *   own state, findStateFile() would return the stale passing file and the
+ *   PUBLISH gate would publish-clear a run that did no work — the exact
+ *   fail-open class MRPF PUBLISH exists to prevent, smuggled in via workdir
+ *   reuse. Archiving at claim time makes findStateFile() return null in that
+ *   case, so the existing "no state.json was written" guard (executor
+ *   verifyPipelineCompletion / studio_only null-state read) fires and the job
+ *   fails CLOSED. It also removes the cosmetic poller mirroring of a stale
+ *   terminal phase ~5s post-spawn.
+ *   See feedback_stale_terminal_state_fail_open_hazard.
+ *
+ * Worker runs are always FRESH — the spawn brief forbids interactive resume and
+ * publish-required runs must never reuse cached legs — so removing the prior
+ * state file from selection never strands a legitimate resume. Forensics are
+ * preserved (rename, not delete) under SUPERSEDED_STATE_DIR.
+ *
+ * Collision-safe across repeated re-queues without Date.now()/random: each
+ * archived name is prefixed with a monotonic index derived from the count of
+ * files already in the archive dir. Returns the ORIGINAL names archived (empty
+ * if the workdir is absent or holds no candidates — idempotent no-op).
+ */
+export async function archiveStaleStateFiles(workDir: string): Promise<string[]> {
+  let names: string[];
+  try {
+    names = await fs.readdir(workDir);
+  } catch (err) {
+    // ENOENT = workdir not created yet → genuinely nothing to archive (safe
+    // no-op). ANY OTHER error (transient EMFILE / Windows EPERM / ENOTDIR)
+    // means we CANNOT prove the workdir is free of a prior attempt's PASSING
+    // state.json — swallowing it would silently leave the stale manifest in
+    // place and re-open the exact fail-OPEN this guard exists to close. So
+    // rethrow and let the caller fail the job CLOSED (Codex MERGE-gate, S117).
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+    throw err;
+  }
+  const stale = names.filter(isStateFileName);
+  if (stale.length === 0) return [];
+
+  const archiveDir = path.join(workDir, SUPERSEDED_STATE_DIR);
+  await fs.mkdir(archiveDir, { recursive: true });
+
+  // The index is derived from the current archive-dir count. This assumes
+  // SERIAL invocation, which the worker guarantees: a single-process daemon
+  // that claims and runs ONE job at a time (CLAUDE.md §6), so two executeJob()
+  // calls never archive the same slug's workdir concurrently. If that invariant
+  // were ever violated a same-index collision is, at worst, a forensics issue,
+  // NEVER a live-state fail-open: on Windows fs.rename throws EEXIST/EPERM (the
+  // job fails CLOSED); on POSIX it would overwrite an EARLIER archived sibling
+  // (forensics loss only — the live workdir root is still cleared). So we do
+  // not pay for a TOCTOU-safe allocator here.
+  let existing: string[] = [];
+  try {
+    existing = await fs.readdir(archiveDir);
+  } catch {
+    // just created — empty
+  }
+  let idx = existing.length;
+
+  const archived: string[] = [];
+  for (const name of stale) {
+    // rename within the same filesystem (subdir of workDir) — atomic + cheap.
+    await fs.rename(
+      path.join(workDir, name),
+      path.join(archiveDir, `${idx}-${name}`),
+    );
+    archived.push(name);
+    idx++;
+  }
+  return archived;
+}
+
+/**
  * Parse the run timestamp embedded in a state-file name into a sortable epoch
  * (ms). Matches ONLY a fully start/end-anchored "<YYYYMMDD>-<HHMMSS>-state.json"
  * (the shape the pipeline writes); a slug-named "<slug>-state.json" that merely
