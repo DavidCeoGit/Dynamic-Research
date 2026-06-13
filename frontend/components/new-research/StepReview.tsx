@@ -76,6 +76,18 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
     (userContext?.additionalUrls?.length ?? 0) > 0 ||
     (userContext?.claimsToVerify?.length ?? 0) > 0;
 
+  // True when the user has set any non-default Option. Drives the
+  // "Default settings" placeholder below. Extracted to a single boolean so
+  // adding a new Option means updating ONE list, not a long negated &&-chain
+  // in JSX (S118 Gemini MERGE-gate readability finding #3).
+  const hasCustomOptions =
+    !!vendor?.enabled ||
+    !!ajiDna ||
+    !!userContext?.publishRequired ||
+    !!customizations?.notebookLM?.persona ||
+    !!customizations?.perplexity?.queryFraming ||
+    !!notifyEmail;
+
   return (
     <div className="space-y-6">
       <div>
@@ -194,6 +206,9 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
         {ajiDna && (
           <p className="text-xs text-zinc-400">Executive Style (AJI DNA): <span className="text-emerald-400">Enabled</span></p>
         )}
+        {userContext?.publishRequired && (
+          <p className="text-xs text-zinc-400">Publish gate: <span className="text-amber-400">Enabled — claim verification required before completion</span></p>
+        )}
         {customizations?.notebookLM?.persona && (
           <p className="text-xs text-zinc-400">Persona: <span className="text-zinc-200">{customizations.notebookLM.persona}</span></p>
         )}
@@ -203,7 +218,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
         {notifyEmail && (
           <p className="text-xs text-zinc-400">Notify: <span className="text-zinc-200">{notifyEmail}</span></p>
         )}
-        {!vendor?.enabled && !ajiDna && !customizations?.notebookLM?.persona && !customizations?.perplexity?.queryFraming && !notifyEmail && (
+        {!hasCustomOptions && (
           <p className="text-xs text-zinc-500 italic">Default settings</p>
         )}
       </div>

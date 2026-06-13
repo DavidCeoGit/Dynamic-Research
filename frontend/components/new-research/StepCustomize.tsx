@@ -3,7 +3,7 @@
 import { useFormContext, Controller } from "react-hook-form";
 import type { FormData } from "@/lib/validate";
 import type { StepProps } from "@/lib/types/queue";
-import { ArrowLeft, ArrowRight, Sparkles } from "lucide-react";
+import { ArrowLeft, ArrowRight, Sparkles, ShieldCheck } from "lucide-react";
 import { TagInput } from "./Shared";
 
 // Path C (S29): subtle hint above pre-filled fields. Sparkles icon matches
@@ -165,6 +165,36 @@ export function StepCustomize({ onNext, onPrev }: StepProps) {
           <span className="text-sm text-zinc-300">Enable executive communication style (AJI DNA)</span>
         </label>
       </div>
+
+      {/* MRPF PUBLISH gate (S118) — flags a run whose outputs are bound for
+          external distribution OR submitted for strategic / capital /
+          operational / architectural authorization. When checked, the worker
+          refuses job completion until every load-bearing claim passes the
+          publish_verification manifest (agent/lib/publish-gate.ts):
+          full-date-anchored, sourced, and verified across all live legs.
+          Leave OFF for internal or exploratory runs — the gate is strict and
+          will hard-block an unverifiable run. Plumbs through
+          userContext.publishRequired → research_queue.user_context jsonb. */}
+      <fieldset className="rounded-lg border border-amber-700/40 bg-amber-950/10 p-4">
+        <legend className="flex items-center gap-1.5 px-2 text-sm font-medium text-amber-300">
+          <ShieldCheck className="h-3.5 w-3.5" /> Publish gate
+        </legend>
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            {...register("userContext.publishRequired")}
+            className="mt-0.5 h-4 w-4 rounded border-zinc-600 bg-zinc-900 text-amber-400 focus:ring-amber-400"
+          />
+          <span className="text-sm text-zinc-300">
+            This run is for publication or decision authorization
+            <span className="mt-1 block text-xs text-zinc-500">
+              Enforces claim verification before completion — the run will not finish until every
+              load-bearing claim is sourced, dated (YYYY-MM-DD), and verified across all live research
+              legs. Leave off for internal or exploratory research.
+            </span>
+          </span>
+        </label>
+      </fieldset>
 
       {/* Email notification */}
       <div>
