@@ -25,6 +25,7 @@ import {
 } from "@/lib/storage";
 import { getOrgContextDualPath } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
+import { resolveClonePublishRequired } from "@/lib/publish-flag";
 import type { AttachmentMeta } from "@/lib/types/queue";
 
 export const dynamic = "force-dynamic";
@@ -119,11 +120,20 @@ export async function GET(
   // permanently truncate the clone). .maybeSingle() returns error:null + data:
   // null when the row is simply absent, so a populated error is a genuine
   // failure → fail closed with 500 rather than returning [].
+  // S120 Defect C — also select user_context here: it is the AUTHORITATIVE
+  // durable publishRequired source (set at submit), and the worker never echoes
+  // publishRequired into state.json's userContext. The S118 fix read
+  // state.userContext.publishRequired (never written) → a no-op that silently
+  // downgraded every clone of a publish parent out of the gate. The clone
+  // prefill (below) ORs this DB source with the state flags via the canonical
+  // predicate. .maybeSingle() returns data:null for legacy storage-only runs
+  // with no queue row — handled by the OR (state flag carries those).
   let attachments: AttachmentMeta[] = [];
+  let attachRowUserContext: { publishRequired?: unknown } | null = null;
   const supabase = getSupabase();
   const { data: attachRow, error: attachErr } = await supabase
     .from("research_queue")
-    .select("attachments")
+    .select("attachments, user_context")
     .eq("topic_slug", slug)
     .eq("organization_id", orgId)
     .maybeSingle();
@@ -134,6 +144,8 @@ export async function GET(
     );
   }
   attachments = (attachRow?.attachments as AttachmentMeta[] | null) ?? [];
+  attachRowUserContext =
+    (attachRow?.user_context as { publishRequired?: unknown } | null | undefined) ?? null;
 
   // Strip runtime-only fields. The form ingests userContext sans contextFilePath
   // + localSourcePath; vendorEvaluation sans vendorsDiscovered/Shortlisted/Excluded
@@ -153,14 +165,22 @@ export async function GET(
       constraints: (uc.constraints as string[]) ?? [],
       additionalUrls: (uc.additionalUrls as string[]) ?? [],
       claimsToVerify: (uc.claimsToVerify as string[]) ?? [],
-      // MRPF PUBLISH gate (S118 Codex MERGE-gate HIGH): a Clone & Edit of a
-      // publish-bound parent must default the new run's checkbox to the
-      // parent's value, not drop it. Omitting the field let the form prefill
-      // an incomplete userContext, zod default it to false, and silently
-      // downgrade the clone out of the gate with ZERO user action. Mirrors the
-      // replay route's S108 precedent. Stays user-EDITABLE (default, not
-      // sticky) — a clone for internal follow-up can still uncheck it.
-      publishRequired: uc.publishRequired === true,
+      // MRPF PUBLISH gate (S118 Codex MERGE-gate HIGH; S120 Defect C fix): a
+      // Clone & Edit of a publish-bound parent must default the new run's
+      // checkbox CHECKED, not drop it. The S118 fix read only
+      // state.userContext.publishRequired — which the worker NEVER writes — a
+      // no-op that silently downgraded every clone (confirmed live, job
+      // 97906d8c). The fix ORs every available source through the canonical
+      // strict predicate: the authoritative DB user_context (covers normal
+      // runs + the exact 97906d8c shape), the top-level state flag (covers
+      // legacy storage-only runs with no queue row), and the legacy state echo.
+      // Stays user-EDITABLE (default, not sticky) — a clone for internal
+      // follow-up can still uncheck it.
+      publishRequired: resolveClonePublishRequired({
+        queueRowUserContext: attachRowUserContext,
+        statePublishRequired: state.publish_required,
+        stateUserContextPublishRequired: uc.publishRequired,
+      }),
     },
     vendorEvaluation: {
       enabled: (ve.enabled as boolean) ?? false,

@@ -131,6 +131,27 @@ test("prompt: PUBLISH block present and contract-faithful when publishRequired=t
   assert.ok(/validates it as a REAL calendar date/.test(p), "missing real-calendar-date fidelity (Codex nit: 2026-13-40 must not pass)");
 });
 
+test('prompt: PUBLISH block present for a DB-stringified flag "TRUE" (S120 flag-only harmonization)', () => {
+  // S120 Codex C4: buildPrompt keys off the durable job flag via the canonical
+  // predicate (isPublishRequired(job, null)), not the prior strict `=== true`.
+  // A direct-DB-insert string flag "TRUE" (bypasses zod) must still inject the
+  // brief, matching the lenient completion gate.
+  const j = baseJob();
+  (j.user_context as unknown as Record<string, unknown>).publishRequired = "TRUE";
+  const p = buildPrompt(j, MANIFEST);
+  assert.ok(p.includes("PUBLISH-REQUIRED RUN (fail-closed)"), "PUBLISH block missing for DB string 'TRUE' flag");
+  assert.ok(p.includes("verification_status"), "missing verification_status key for string flag");
+});
+
+test('prompt: PUBLISH block absent for a rejected non-boolean flag "on" (strict boundary)', () => {
+  // "on" is NOT accepted by the canonical predicate — a raw-checkbox value
+  // normalizes at its own endpoint, never silently engages the gate here.
+  const j = baseJob();
+  (j.user_context as unknown as Record<string, unknown>).publishRequired = "on";
+  const p = buildPrompt(j, MANIFEST);
+  assert.ok(!p.includes("PUBLISH-REQUIRED RUN"), "PUBLISH block leaked for rejected 'on' flag");
+});
+
 test("prompt: PUBLISH block absent for a non-publish job (default)", () => {
   const p = buildPrompt(baseJob(), MANIFEST);
   assert.ok(!p.includes("PUBLISH-REQUIRED RUN"), "PUBLISH block leaked into a non-publish brief");

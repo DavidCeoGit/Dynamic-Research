@@ -17,9 +17,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  diagnosePublishFlag,
   evaluatePublishGate,
   evaluatePublishGateForJob,
+  formatPublishFlagAlarm,
+  isPublishFlagSet,
   isPublishRequired,
+  logPublishFlagDiagnostics,
   readUrgentBypass,
 } from "../lib/publish-gate.js";
 import { buildManifest } from "../executor.js";
@@ -118,6 +122,77 @@ test('isPublishRequired: LLM-stringified "true" still fires the gate (S108 Gemin
   // but arbitrary truthy junk does NOT (only boolean true / string "true")
   const junk = { publish_required: "yes" } as unknown as PipelineState;
   assert.equal(isPublishRequired(jobWith(undefined), junk), false);
+});
+
+// ── isPublishFlagSet (S120 canonical strict predicate) ──────────────
+
+test("isPublishFlagSet: accepts only boolean true and string 'true' (case/space-insensitive)", () => {
+  for (const v of [true, "true", "TRUE", " true ", "  TrUe\t"]) {
+    assert.equal(isPublishFlagSet(v), true, `expected ${JSON.stringify(v)} to be accepted`);
+  }
+});
+
+test("isPublishFlagSet: REJECTS 'on' / '1' / 'yes' and all other non-true values (S120 Gemini F3)", () => {
+  // The strict boundary: a raw-HTML-checkbox 'on' or a numeric/string truthy
+  // value must NOT silently engage the gate — those normalize at their own
+  // endpoint. Pinning rejection keeps the security core free of producer quirks.
+  for (const v of ["on", "1", "yes", "false", "FALSE", "", " ", "0", 1, 0, null, undefined, {}, [], "truex"]) {
+    assert.equal(isPublishFlagSet(v as unknown), false, `expected ${JSON.stringify(v)} to be rejected`);
+  }
+});
+
+// ── diagnosePublishFlag + alarm formatting (S120 logging backstop) ──
+
+test("diagnosePublishFlag: null for absent/boolean (expected shapes), diagnostic for present non-boolean", () => {
+  // Expected shapes produce NO diagnostic.
+  assert.equal(diagnosePublishFlag(undefined, "x"), null);
+  assert.equal(diagnosePublishFlag(null, "x"), null);
+  assert.equal(diagnosePublishFlag(true, "x"), null);
+  assert.equal(diagnosePublishFlag(false, "x"), null);
+  // A present string "true" is a bypassed-normalization signal but ACCEPTED.
+  const accepted = diagnosePublishFlag("true", "job.user_context");
+  assert.ok(accepted, "expected a diagnostic for present non-boolean 'true'");
+  assert.equal(accepted!.accepted, true);
+  assert.equal(accepted!.rejected, false);
+  assert.equal(accepted!.source, "job.user_context");
+  assert.equal(accepted!.rawType, "string");
+  // The DANGEROUS case: a present non-boolean the strict core REJECTS
+  // (silent gate-skip risk) → diagnostic with rejected:true.
+  const rejected = diagnosePublishFlag("yes", "state.publish_required");
+  assert.ok(rejected);
+  assert.equal(rejected!.accepted, false);
+  assert.equal(rejected!.rejected, true);
+});
+
+test("formatPublishFlagAlarm: emits a [SECURITY] line; flags the silent-skip case for rejected values", () => {
+  const rejected = diagnosePublishFlag("yes", "job.user_context")!;
+  const line = formatPublishFlagAlarm(JOB_ID, rejected);
+  assert.ok(line.startsWith("[SECURITY]"), "alarm must start with [SECURITY]");
+  assert.ok(line.includes(`job=${JOB_ID}`));
+  assert.ok(line.includes("source=job.user_context"));
+  assert.ok(line.includes("rejected=true"));
+  assert.ok(/SILENT gate-skip risk/i.test(line), "rejected value must flag the silent gate-skip risk");
+  // An accepted non-boolean still alarms (boundary bypassed) but is NOT a skip risk.
+  const acceptedLine = formatPublishFlagAlarm(JOB_ID, diagnosePublishFlag("true", "state.publish_required")!);
+  assert.ok(acceptedLine.includes("accepted=true"));
+  assert.ok(!/SILENT gate-skip risk/i.test(acceptedLine));
+});
+
+test("logPublishFlagDiagnostics: emits one line per present non-boolean source, none for clean shapes", () => {
+  const lines: string[] = [];
+  logPublishFlagDiagnostics(
+    JOB_ID,
+    [
+      { value: true, source: "a" },          // clean → no line
+      { value: undefined, source: "b" },     // absent → no line
+      { value: "yes", source: "c" },         // present non-boolean → 1 line
+      { value: "true", source: "d" },        // present non-boolean → 1 line
+    ],
+    (l) => lines.push(l),
+  );
+  assert.equal(lines.length, 2);
+  assert.ok(lines.some((l) => l.includes("source=c") && l.includes("rejected=true")));
+  assert.ok(lines.some((l) => l.includes("source=d") && l.includes("accepted=true")));
 });
 
 // ── evaluatePublishGate: clean pass + no_load_bearing_claims ────────
@@ -467,6 +542,22 @@ test("buildManifest seeds publish_required from the job flag and a null manifest
   const off = buildManifest(manifestJob()) as Record<string, unknown>;
   assert.equal(off.publish_required, false);
   assert.equal(off.publish_verification, null);
+});
+
+test("buildManifest seeds publish_required via the strict predicate — DB string 'true' → true (S120 Defect B)", () => {
+  // Pre-S120 the seed was `=== true`, so a direct-DB-insert string flag wrote
+  // publish_required:false into the manifest even though the lenient gate still
+  // fired — a provenance lie. Harmonized: the seed uses isPublishFlagSet.
+  const j = manifestJob();
+  (j.user_context as unknown as Record<string, unknown>).publishRequired = "true";
+  const m = buildManifest(j) as Record<string, unknown>;
+  assert.equal(m.publish_required, true);
+
+  // And a rejected non-boolean ("on") stays false at the seed (strict boundary).
+  const j2 = manifestJob();
+  (j2.user_context as unknown as Record<string, unknown>).publishRequired = "on";
+  const m2 = buildManifest(j2) as Record<string, unknown>;
+  assert.equal(m2.publish_required, false);
 });
 
 test("buildManifest urgent_signoff_present reflects the operator sign-off file (S108 Gemini G1)", async () => {
