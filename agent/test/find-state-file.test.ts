@@ -22,6 +22,8 @@ import {
   embeddedStateTimestampMs,
   selectNewestStateFile,
   findStateFile,
+  archiveStaleStateFiles,
+  SUPERSEDED_STATE_DIR,
 } from "../lib/find-state-file.js";
 
 describe("isStateFileName", () => {
@@ -163,6 +165,90 @@ describe("findStateFile (local fs)", () => {
     await writeAt(dir, "20260604-100000-state.json", "{}", t);
     await writeAt(dir, "20260602-100000-state.json", "{}", t);
     assert.equal(await findStateFile(dir), path.join(dir, "20260604-100000-state.json"));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe("archiveStaleStateFiles (S117 stale-terminal-state fail-open)", () => {
+  async function tmpdir(): Promise<string> {
+    return fs.mkdtemp(path.join(os.tmpdir(), "asf-"));
+  }
+
+  test("absent workdir (ENOENT) → no-op, returns []", async () => {
+    const missing = path.join(os.tmpdir(), "asf-does-not-exist-xyz");
+    assert.deepEqual(await archiveStaleStateFiles(missing), []);
+  });
+
+  test("non-ENOENT readdir error rethrows → caller fails CLOSED (Codex S117)", async () => {
+    // A workDir path that is actually a FILE makes fs.readdir throw ENOTDIR,
+    // not ENOENT. Swallowing it would leave a possibly-stale passing manifest
+    // un-archived (fail-open); the helper MUST rethrow so executeJob can fail
+    // the job closed.
+    const dir = await tmpdir();
+    const notADir = path.join(dir, "iam-a-file");
+    await fs.writeFile(notADir, "x", "utf-8");
+    await assert.rejects(
+      archiveStaleStateFiles(notADir),
+      (err: NodeJS.ErrnoException) => err.code !== "ENOENT",
+    );
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  test("no state candidates → no-op, no archive dir created", async () => {
+    const dir = await tmpdir();
+    await fs.writeFile(path.join(dir, "brief.md"), "x", "utf-8");
+    assert.deepEqual(await archiveStaleStateFiles(dir), []);
+    await assert.rejects(fs.stat(path.join(dir, SUPERSEDED_STATE_DIR)));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  test("the core fail-open: a stale PASSING manifest is removed from selection", async () => {
+    // Reproduces the hazard: a prior attempt's terminal+passing state.json
+    // remains in a reused workdir. After archiving, findStateFile() returns
+    // null, so the executor's "no state.json was written" guard fails CLOSED
+    // instead of the gate publish-clearing the stale manifest.
+    const dir = await tmpdir();
+    await fs.writeFile(
+      path.join(dir, "20260612-235959-state.json"),
+      JSON.stringify({ phase: "complete", publish_verification: { verification_status: "passed" } }),
+      "utf-8",
+    );
+    const archived = await archiveStaleStateFiles(dir);
+    assert.deepEqual(archived, ["20260612-235959-state.json"]);
+    assert.equal(await findStateFile(dir), null);
+    // forensics preserved (renamed, not deleted)
+    const moved = await fs.readdir(path.join(dir, SUPERSEDED_STATE_DIR));
+    assert.deepEqual(moved, ["0-20260612-235959-state.json"]);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  test("archives both plain and prefixed candidates, leaves non-state files", async () => {
+    const dir = await tmpdir();
+    await fs.writeFile(path.join(dir, "state.json"), "{}", "utf-8");
+    await fs.writeFile(path.join(dir, "20260601-100000-state.json"), "{}", "utf-8");
+    await fs.writeFile(path.join(dir, "research-plan.json"), "{}", "utf-8");
+    const archived = await archiveStaleStateFiles(dir);
+    assert.equal(archived.length, 2);
+    assert.ok(archived.includes("state.json"));
+    assert.ok(archived.includes("20260601-100000-state.json"));
+    // non-state file untouched; findStateFile sees nothing in root
+    assert.ok((await fs.readdir(dir)).includes("research-plan.json"));
+    assert.equal(await findStateFile(dir), null);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  test("idempotent + collision-safe across repeated re-queues (monotonic index)", async () => {
+    const dir = await tmpdir();
+    // first re-queue leaves a state file
+    await fs.writeFile(path.join(dir, "state.json"), "{}", "utf-8");
+    await archiveStaleStateFiles(dir);
+    // second re-queue leaves another state file of the SAME name
+    await fs.writeFile(path.join(dir, "state.json"), "{}", "utf-8");
+    await archiveStaleStateFiles(dir);
+    const moved = (await fs.readdir(path.join(dir, SUPERSEDED_STATE_DIR))).sort();
+    assert.deepEqual(moved, ["0-state.json", "1-state.json"]);
+    // a third call with nothing to archive is a clean no-op
+    assert.deepEqual(await archiveStaleStateFiles(dir), []);
     await fs.rm(dir, { recursive: true, force: true });
   });
 });

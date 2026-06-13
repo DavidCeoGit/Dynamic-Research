@@ -31,7 +31,7 @@ import {
   downloadAttachments,
   type AttachmentDownloadResult,
 } from "./lib/attachments.js";
-import { findStateFile } from "./lib/find-state-file.js";
+import { archiveStaleStateFiles, findStateFile } from "./lib/find-state-file.js";
 import { selectUploadSet } from "./lib/upload-set.js";
 import { sendCompletionEmail, sendPlanReviewEmail } from "./lib/notify.js";
 import {
@@ -424,6 +424,38 @@ export async function executeJob(job: ResearchJob): Promise<string> {
 
   await fs.mkdir(workDir, { recursive: true });
   await fs.mkdir(projectsDir, { recursive: true });
+
+  // S117 stale-terminal-state fail-open hardening: per-slug workdirs are reused
+  // across re-queues. Archive any prior attempt's *-state.json BEFORE this run
+  // writes or the poller/gate reads, so findStateFile() can never return a
+  // stale (possibly PASSING) manifest. With the stale file gone, a new spawn
+  // that exits without writing its own state hits the existing "no state.json"
+  // guard (verifyPipelineCompletion / studio_only null-state read) and fails
+  // CLOSED instead of publish-clearing a no-work run. Covers BOTH the full and
+  // studio_only paths — this is the single workDir chokepoint both share.
+  // See feedback_stale_terminal_state_fail_open_hazard.
+  // Codex MERGE-gate (S117): a non-ENOENT archive failure means we could NOT
+  // prove the workdir is clear of a stale passing manifest — fail the job
+  // CLOSED rather than proceed and risk publish-clearing it.
+  let archivedState: string[] = [];
+  try {
+    archivedState = await archiveStaleStateFiles(workDir);
+  } catch (err) {
+    const reason =
+      `PUBLISH gate fail-closed (MRPF): could not archive prior-attempt state files in the ` +
+      `reused workdir (${(err as Error).message}) — refusing to run on a workdir that may still ` +
+      `hold a stale passing publish_verification`;
+    log(job.id, reason);
+    await failJob(job.id, reason);
+    await notifyTerminal(job, "failed", reason);
+    throw new Error(reason);
+  }
+  if (archivedState.length > 0) {
+    log(
+      job.id,
+      `[stale-state] archived ${archivedState.length} prior-attempt state file(s): ${archivedState.join(", ")}`,
+    );
+  }
 
   const allowlistDir = path.join(workDir, ".claude");
   await fs.mkdir(allowlistDir, { recursive: true });
