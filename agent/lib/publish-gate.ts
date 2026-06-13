@@ -111,16 +111,105 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const truncate = (s: string): string => (s.length > REASON_SLICE ? `${s.slice(0, REASON_SLICE)}…` : s);
 
 /**
- * Flag check tolerant of LLM-stringified booleans (S108 Gemini G2): the state
- * file is written by the spawned pipeline, which can serialize `true` as
- * `"true"`. Accepting the string form makes the gate fire MORE often — the
- * fail-closed direction; the reverse (a string silently reading as false and
- * skipping the gate) is the fail-open this closes. Applied to the jsonb job
- * flag too: zod guarantees a real boolean on the API path, but direct DB
- * writes bypass zod.
+ * Canonical STRICT publish-flag predicate (S120 coercion harmonization).
+ *
+ * Tolerant of LLM-stringified booleans (S108 Gemini G2): the state file is
+ * written by the spawned pipeline, which can serialize `true` as `"true"`.
+ * Accepting the string form makes the gate fire MORE often — the fail-closed
+ * direction; the reverse (a string silently reading as false and skipping the
+ * gate) is the fail-open this closes. Applied to the jsonb job flag too: zod
+ * guarantees a real boolean on the API path, but direct DB writes bypass zod.
+ *
+ * Accepts ONLY `true` and `"true"` (case/space-insensitive). Deliberately does
+ * NOT accept `"on"` / `"1"` / `"yes"` (S120 Gemini F3): a raw-HTML-checkbox
+ * path, if ever added, normalizes its `"on"` at its OWN endpoint, keeping this
+ * security core free of producer quirks. Every write boundary normalizes to a
+ * strict boolean through THIS predicate so stored data is already clean; a
+ * present-but-rejected non-boolean reaching the gate is therefore an ALARM
+ * (a bypassed normalization boundary), surfaced via diagnosePublishFlag().
+ *
+ * MUST stay behavior-identical to frontend/lib/publish-flag.ts — behavioral
+ * parity is enforced by test/publish-flag-parity.test.ts.
  */
-const truthyFlag = (v: unknown): boolean =>
-  v === true || (typeof v === "string" && v.trim().toLowerCase() === "true");
+export function isPublishFlagSet(v: unknown): boolean {
+  return v === true || (typeof v === "string" && v.trim().toLowerCase() === "true");
+}
+
+/** Truncation bound so a hostile raw value can't blow up a log line. */
+const RAW_VALUE_SLICE = 80;
+
+export interface PublishFlagDiagnostic {
+  /** Where the raw value came from (e.g. "job.user_context", "state.publish_required"). */
+  source: string;
+  /** typeof the raw value. */
+  rawType: string;
+  /** Truncated string repr of the raw value. */
+  rawValue: string;
+  /** True when isPublishFlagSet accepted it (a present non-boolean that still fired the gate). */
+  accepted: boolean;
+  /** True when the strict core REJECTED it — the dangerous SILENT gate-skip case. */
+  rejected: boolean;
+}
+
+/**
+ * Diagnose a raw publishRequired value (S120 Gemini F2 / Codex C2,C3). Returns
+ * a diagnostic ONLY for a PRESENT, non-boolean value — the signal that a
+ * normalization boundary was bypassed. Returns null for absent
+ * (undefined/null) or already-clean boolean values (the expected shapes).
+ *
+ * The dangerous case is NOT an accepted `"true"`; it is a REJECTED non-boolean
+ * (`"yes"`/`"on"`/`1`) that the strict core turns away, causing a SILENT
+ * gate-skip. The predicate itself stays PURE (no logger, no job id) — the
+ * executor call-sites that carry `job.id` + a logger invoke this and emit the
+ * `[SECURITY]` line via formatPublishFlagAlarm().
+ */
+export function diagnosePublishFlag(v: unknown, source: string): PublishFlagDiagnostic | null {
+  if (v === undefined || v === null || typeof v === "boolean") return null;
+  const accepted = isPublishFlagSet(v);
+  let rawValue: string;
+  try {
+    rawValue = typeof v === "string" ? v : JSON.stringify(v);
+  } catch {
+    rawValue = String(v);
+  }
+  if (typeof rawValue !== "string") rawValue = String(rawValue);
+  // S120 Codex MERGE-gate (log-injection hardening, NON-BLOCK): replace control
+  // characters (newlines/CR/tabs/etc.) with spaces BEFORE truncation so a
+  // hostile or AI-written publish flag value cannot forge multiline [SECURITY]
+  // log lines through the rawValue field. Not a gate fail-open — purely the
+  // diagnostic log surface.
+  rawValue = rawValue.replace(/[\x00-\x1f\x7f]/g, " ");
+  if (rawValue.length > RAW_VALUE_SLICE) rawValue = `${rawValue.slice(0, RAW_VALUE_SLICE)}…`;
+  return { source, rawType: typeof v, rawValue, accepted, rejected: !accepted };
+}
+
+/** Format a diagnostic as a single `[SECURITY]` log line for the executor. */
+export function formatPublishFlagAlarm(jobId: string, d: PublishFlagDiagnostic): string {
+  return (
+    `[SECURITY] job=${jobId} publishRequired source=${d.source} rawType=${d.rawType} ` +
+    `rawValue=${d.rawValue} accepted=${d.accepted} rejected=${d.rejected} — ` +
+    `non-boolean publishRequired reached the gate (a normalization boundary was bypassed)` +
+    (d.rejected ? "; REJECTED by strict core → SILENT gate-skip risk" : "")
+  );
+}
+
+/**
+ * Inspect every named publishRequired source for a job+state and emit a
+ * `[SECURITY]` alarm line (via `emit`) for each present, non-boolean value.
+ * Called from executor sites that carry `job.id` + a logger, BEFORE the
+ * applicability early-return, so a bypassed-normalization value is logged even
+ * when the strict core rejects it (the silent gate-skip alarm).
+ */
+export function logPublishFlagDiagnostics(
+  jobId: string,
+  sources: Array<{ value: unknown; source: string }>,
+  emit: (line: string) => void,
+): void {
+  for (const { value, source } of sources) {
+    const d = diagnosePublishFlag(value, source);
+    if (d) emit(formatPublishFlagAlarm(jobId, d));
+  }
+}
 
 /**
  * publish_required is an OR of the durable job flag (user_context jsonb, set
@@ -132,7 +221,7 @@ export function isPublishRequired(
   job: Pick<ResearchJob, "user_context">,
   state: PipelineState | null | undefined,
 ): boolean {
-  return truthyFlag(job.user_context?.publishRequired) || truthyFlag(state?.publish_required);
+  return isPublishFlagSet(job.user_context?.publishRequired) || isPublishFlagSet(state?.publish_required);
 }
 
 function validateClaim(claim: unknown, idx: number, reasons: string[]): void {

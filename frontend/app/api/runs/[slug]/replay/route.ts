@@ -26,6 +26,7 @@ import {
 import { estimateMinutes } from "@/lib/estimates";
 import type { SelectedProducts, AttachmentMeta } from "@/lib/types/queue";
 import { getOrgContextDualPath } from "@/lib/auth";
+import { isPublishFlagSet } from "@/lib/publish-flag";
 import { verifyAndCopyAttachments, removeRunSources } from "@/lib/storage";
 import { mapDbAttachmentsToParentPayload } from "@/lib/attachments-copy";
 import { clientIp, checkRateLimit } from "@/lib/rate-limit";
@@ -136,8 +137,11 @@ export async function POST(
       claimsToVerify: (uc.claimsToVerify as string[]) ?? [],
       // MRPF PUBLISH gate (S108 Codex C2): a replay of a publish-bound run
       // must stay publish-bound — omitting this let zod default it to false,
-      // silently downgrading the rerun out of the verification gate.
-      publishRequired: uc.publishRequired === true,
+      // silently downgrading the rerun out of the verification gate. S120:
+      // route through the canonical strict predicate so a DB string "true"
+      // (direct-insert path that bypasses zod) is not silently downgraded by
+      // `=== true`. uc = parent.user_context — the authoritative DB source.
+      publishRequired: isPublishFlagSet(uc.publishRequired),
     },
     vendorEvaluation: {
       enabled: (ve.enabled as boolean) ?? false,
