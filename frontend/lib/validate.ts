@@ -289,7 +289,8 @@ export const generatedQuestionSchema = z.object({
 });
 
 export const questionsResponseSchema = z.object({
-  questions: z.array(generatedQuestionSchema).min(2).max(7),
+  // S128 strict structured-outputs (Sonnet 4.6) rejects array minItems/maxItems; count enforced by route prompt + Path B filter
+  questions: z.array(generatedQuestionSchema),
 });
 
 /**
