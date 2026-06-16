@@ -273,18 +273,29 @@ export async function readStateJson(
 
 /**
  * Generate a signed URL for a file (1hr expiry by default).
+ *
+ * Pass `downloadAs` (a filename) to force a download: Supabase sets
+ * `Content-Disposition: attachment; filename="<downloadAs>"` on the signed
+ * URL. This is required because a cross-origin `<a download>` attribute is
+ * ignored by browsers — without it, media opens inline instead of downloading
+ * (S132 Bug-1). Omit it for inline viewers (audio/video/PDF players).
  */
 export async function getSignedUrl(
   orgId: string,
   slug: string,
   filename: string,
   expiresIn = 3600,
+  downloadAs?: string,
 ): Promise<string> {
   const supabase = getSupabase();
   const objectPath = scopedStoragePath(orgId, slug, filename);
   const { data, error } = await supabase.storage
     .from(BUCKET)
-    .createSignedUrl(objectPath, expiresIn);
+    .createSignedUrl(
+      objectPath,
+      expiresIn,
+      downloadAs ? { download: downloadAs } : undefined,
+    );
 
   if (error) {
     throw new Error(`getSignedUrl(${objectPath}) failed: ${error.message}`);
