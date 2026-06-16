@@ -85,7 +85,12 @@ export async function POST(request: Request) {
 
   try {
     const result = await generateObject({
-      model: anthropic("claude-sonnet-4-20250514"),
+      // S128 — bumped from retired claude-sonnet-4-20250514 (Sonnet 4, retired
+      // 2026-06-15) to claude-sonnet-4-6. The retired snapshot 404'd, which the
+      // AI SDK surfaced as AI_APICallError and the UI masked as "Questions could
+      // not be generated." Latest Sonnet keeps these cheap helper calls on the
+      // Sonnet tier (Opus would be ~5x cost for no quality gain here).
+      model: anthropic("claude-sonnet-4-6"),
       schema: extractedContextSchema,
       system: SYSTEM_PROMPT,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
