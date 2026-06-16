@@ -299,7 +299,15 @@ export function useNewResearchForm() {
         case "additionalUrls": {
           const current = form.getValues("userContext.additionalUrls") ?? [];
           const val = typeof answer === "string" ? answer : "";
-          const urls = val.split(/[,\s]+/).filter(Boolean);
+          // S130: only accept URL-shaped tokens. The split lets users paste
+          // several space/comma-separated URLs at once, but with no shape
+          // check ANY prose paste (e.g. a PDF's full text) shattered into
+          // hundreds of single-word "URLs". Require an http(s):// scheme OR a
+          // bare domain (a dot between word chars, no whitespace); plain words
+          // like "negotiating" have no dot and are dropped.
+          const isUrlish = (u: string) =>
+            /^https?:\/\/\S+$/i.test(u) || /^[\w-]+\.[\w.-]+(\/\S*)?$/i.test(u);
+          const urls = val.split(/[,\s]+/).filter(Boolean).filter(isUrlish);
           form.setValue("userContext.additionalUrls", [...new Set([...current, ...urls])]);
           break;
         }
