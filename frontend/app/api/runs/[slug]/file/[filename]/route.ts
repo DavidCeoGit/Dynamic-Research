@@ -6,6 +6,9 @@
  * - Media files (mp3, mp4, pdf, pptx, png, docx): 302 redirect to signed URL
  * - Text files (md, json): downloaded and served inline
  * - Supabase CDN handles Range requests natively after redirect
+ * - `?download=1` forces a download (Content-Disposition: attachment on the
+ *   signed URL) for media — a cross-origin `<a download>` is otherwise ignored
+ *   and media opens inline (S132 Bug-1). Inline viewers omit the param.
  *
  * S56 Phase 2 — replaces resolveOrgForSlug stopgap with session-or-env
  * orgId from getOrgContextDualPath(). Cross-tenant isolation is the storage
@@ -25,10 +28,12 @@ import { getOrgContextDualPath } from "@/lib/auth";
 export const dynamic = "force-dynamic";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ slug: string; filename: string }> },
 ) {
   const { slug, filename } = await params;
+  const wantsDownload =
+    new URL(request.url).searchParams.get("download") === "1";
 
   // ── Validate filename (no path traversal) ──────────────────
   if (filename.includes("/") || filename.includes("\\") || filename.includes("..")) {
@@ -87,7 +92,13 @@ export async function GET(
 
   // ── Media files: redirect to signed URL ────────────────────
   try {
-    const signedUrl = await getSignedUrl(orgId, slug, filename, 3600);
+    const signedUrl = await getSignedUrl(
+      orgId,
+      slug,
+      filename,
+      3600,
+      wantsDownload ? filename : undefined,
+    );
 
     return new Response(null, {
       status: 302,

@@ -123,6 +123,15 @@ function mediaUrl(slug: string, filename: string): string {
   return `/api/runs/${encodeURIComponent(slug)}/file/${encodeURIComponent(filename)}`;
 }
 
+/** Append `?download=1` so the file route forces Content-Disposition: attachment
+ *  on the signed URL. A cross-origin `<a download>` attribute is ignored by
+ *  browsers (the 302 redirects to Supabase, a different origin), so media opens
+ *  inline instead of downloading. Use ONLY for download anchors — inline
+ *  viewers (audio/video/PDF src) must keep the plain URL (S132 Bug-1). */
+function withDownload(url: string): string {
+  return url.includes("?") ? `${url}&download=1` : `${url}?download=1`;
+}
+
 /** Map server file types to renderable media types.
  *  Excludes: state (.json), docx (.docx — available as download from markdown view).
  *  Includes: markdown (.md) rendered inline with Word download option.
@@ -417,7 +426,7 @@ export default function GalleryPage({
               <Presentation className="mx-auto h-12 w-12 text-zinc-500 mb-4" />
               <p className="text-sm text-zinc-400 mb-4">Slide deck preview is available on larger screens.</p>
               <a
-                href={file.url}
+                href={withDownload(file.url)}
                 download={file.filename}
                 className="inline-flex items-center gap-2 rounded-lg bg-[#c8a951] px-5 py-2.5 text-sm font-medium text-[#1a2744] hover:bg-[#d4b85e] transition"
               >
@@ -496,7 +505,7 @@ export default function GalleryPage({
               {resolvedFile.type === "markdown" &&
                 hasMatchingDocx(resolvedFile.filename) ? (
                   <a
-                    href={docxUrl(slug, resolvedFile.filename)!}
+                    href={withDownload(docxUrl(slug, resolvedFile.filename)!)}
                     download={resolvedFile.filename.replace(/\.md$/, ".docx")}
                     className="flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-300 transition hover:bg-zinc-700"
                   >
@@ -505,7 +514,7 @@ export default function GalleryPage({
                   </a>
                 ) : (
                   <a
-                    href={resolvedFile.url}
+                    href={withDownload(resolvedFile.url)}
                     download={resolvedFile.filename}
                     className="flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-300 transition hover:bg-zinc-700"
                   >
