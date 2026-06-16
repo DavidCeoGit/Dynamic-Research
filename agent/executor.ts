@@ -56,11 +56,51 @@ import {
   logPublishFlagDiagnostics,
   readUrgentBypass,
 } from "./lib/publish-gate.js";
+import {
+  enforceStudioCompleteness,
+  defaultDeps as studioCompletenessDeps,
+} from "./lib/studio-completeness.js";
 import type { ResearchJob, PipelineState } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
 
 const WORKING_DIR = process.env.WORKING_DIR ?? "/c/tmp/research-compare";
+
+// S129 studio-completeness gate. After claude -p exits, before completeJob, the
+// worker re-checks that every SELECTED studio product is on disk and recovers
+// any that are ready-but-not-downloaded via the RELIABLE artifact-list signal
+// (the pipeline's `artifact poll` lies "in_progress" after a video completes).
+// A still-rendering product is polled up to STUDIO_RECOVERY_MAX_MS; anything
+// still missing fails the job CLOSED (never a silent success). The gate's own
+// runtime is NOT bounded by MAX_JOB_DURATION_MS (that cap only kills the claude
+// subprocess); NLM list/download is $0. See lib/studio-completeness.ts.
+//
+// COVERAGE BOUNDARY (Gemini MERGE MINOR-3): the gate runs ONLY on the claude
+// exit-0 success path. If the pipeline BLOCKS on a slow product and trips the
+// MAX_JOB_DURATION_MS 90-min cap, claude is killed (exit!=0) and the job fails
+// at the exit-code check ABOVE — the gate never runs, so a still-rendering
+// product on a CAPPED job is not recovered here (manual finalize-recovered-run.ts
+// remains the recourse). The in-pipeline detection fix (research-compare.md poll
+// loop now uses `artifact list`, not the lying `artifact poll`) makes the asset
+// land DURING the job in the common case, so reaching this backstop with a truly
+// still-rendering product is rare.
+//
+// STARVATION (Gemini MERGE MAJOR-2): this runs synchronously on the single-
+// threaded worker, so a genuinely-still-rendering product blocks the next job
+// for up to the budget. The dominant case (asset done, poll just lied) recovers
+// on the FIRST list() call (~0 wait); the budget only bites the rare rendering
+// tail. Default 15 min bounds worst-case queue latency (acceptable behind a
+// 60-90 min job + 5-min cron). A non-blocking DB-`recovering`-state + async
+// poller is the future architecture if the tail becomes common.
+// Parse a non-negative ms env var, falling back if unset/NaN/negative (Codex
+// MERGE MAJOR-4 — a bad STUDIO_RECOVERY_* value must not produce a NaN deadline /
+// spin loop; the module also defends via safeMs, this is belt-and-suspenders).
+function envMs(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+const STUDIO_RECOVERY_MAX_MS = envMs("STUDIO_RECOVERY_MAX_MS", 900_000);
+const STUDIO_RECOVERY_POLL_MS = envMs("STUDIO_RECOVERY_POLL_MS", 60_000);
 
 // MRPF PUBLISH gate (S108): operator-only URGENT risk-acceptance files live
 // here as <job-id>.txt (gitignored; OUTSIDE per-job workdirs so the spawned
@@ -716,6 +756,52 @@ export async function executeJob(job: ResearchJob): Promise<string> {
       } else {
         log(job.id, "[publish-gate] publish_verification PASSED — all legs live, all claims verified");
       }
+    }
+
+    // S129 studio-completeness fail-closed gate. BEFORE upload so any recovered
+    // file is shipped by the same uploadOutputs pass. Closes the recurring
+    // "video finished in the notebook but never reached the gallery" bug: the
+    // pipeline declares phase 7 complete even when a selected product is still
+    // (per the unreliable `artifact poll`) in_progress, and uploads only what's
+    // on disk. Here the worker re-checks requested-vs-delivered with the
+    // reliable `artifact list --type` signal, downloads ready-but-missing
+    // products by id, and refuses to complete a job that is genuinely missing a
+    // selected product. verdict.state is the parsed state.json (guaranteed on
+    // the success path); if absent we skip the gate (the empty-deliverables
+    // guard below still fires) rather than crash.
+    if (verdict.state) {
+      const completeness = await enforceStudioCompleteness(
+        job.selected_products, // DURABLE DB obligation source (Codex MAJOR-3), not state
+        verdict.state,
+        projectsDir,
+        {
+          recoveryBudgetMs: STUDIO_RECOVERY_MAX_MS,
+          pollIntervalMs: STUDIO_RECOVERY_POLL_MS,
+        },
+        studioCompletenessDeps((line) => log(job.id, line)),
+      );
+      if (completeness.recovered.length > 0) {
+        log(
+          job.id,
+          `[studio-completeness] recovered ${completeness.recovered.length} product(s): ` +
+            completeness.recovered.join(", "),
+        );
+      }
+      if (!completeness.ok) {
+        const reason =
+          `Studio completeness fail-closed (S129): selected product(s) missing and ` +
+          `unrecoverable from NotebookLM: ${completeness.stillMissing.join(", ")}. ` +
+          completeness.notes.join(" | ");
+        log(job.id, reason.slice(0, 2000));
+        await failJob(job.id, reason.slice(0, 2000));
+        await notifyTerminal(job, "failed", reason.slice(0, 2000));
+        throw new Error(reason);
+      }
+    } else {
+      log(
+        job.id,
+        "[studio-completeness] WARN: verdict.state absent on success path — skipping completeness gate",
+      );
     }
 
     log(job.id, "Pipeline complete — uploading outputs to Supabase Storage");
