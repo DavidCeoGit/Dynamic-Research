@@ -382,11 +382,24 @@ export async function enforceStudioCompleteness(
 
 // ── Real (non-injected) dependency implementations ───────────────────
 
-/** List COMPLETED (status_id===3) artifacts of a type, newest-first. */
-export function realListArtifacts(
-  notebookId: string,
-  nlmType: string,
-): NlmArtifactRef[] | null {
+interface RawArtifact {
+  id: string;
+  title: string;
+  created_at: string;
+  status_id?: number;
+}
+
+/**
+ * Raw `artifact list --type <T> --json` parse — ALL statuses, newest-first, or
+ * null on CLI/parse error. The NLM `LIST_ARTIFACTS` RPC filter is
+ * `NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"` (verified in the CLI
+ * source `notebooklm/_artifacts.py`), so this surfaces processing(1)/pending(2)/
+ * completed(3)/failed(4) — every status except suggested. status_id maps
+ * 1=processing 2=pending 3=completed 4=failed (notebooklm/types.py). Callers
+ * pick which statuses they care about. Single source of the spawn+parse so the
+ * completed-only and all-status listers can never drift apart.
+ */
+function rawListArtifacts(notebookId: string, nlmType: string): RawArtifact[] | null {
   const r = spawnSync(
     NLM_BIN,
     ["artifact", "list", "-n", notebookId, "--type", nlmType, "--json"],
@@ -399,20 +412,50 @@ export function realListArtifacts(
   );
   if (r.status !== 0) return null;
   try {
-    const parsed = JSON.parse(r.stdout ?? "") as {
-      artifacts?: Array<{ id: string; title: string; created_at: string; status_id?: number }>;
-    };
-    // status_id 3 == completed; undefined assumed completed for forward-compat
-    // (mirrors verify-gallery-vs-notebook.ts). In_progress (other status_id)
-    // is excluded — that is the whole point vs the unreliable `artifact poll`.
-    const arts = (parsed.artifacts ?? []).filter(
-      (a) => a.status_id === 3 || a.status_id === undefined,
-    );
+    const parsed = JSON.parse(r.stdout ?? "") as { artifacts?: RawArtifact[] };
+    const arts = (parsed.artifacts ?? []).slice();
     arts.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
-    return arts.map((a) => ({ id: a.id, title: a.title, created_at: a.created_at }));
+    return arts;
   } catch {
     return null;
   }
+}
+
+/** List COMPLETED (status_id===3) artifacts of a type, newest-first. */
+export function realListArtifacts(
+  notebookId: string,
+  nlmType: string,
+): NlmArtifactRef[] | null {
+  const arts = rawListArtifacts(notebookId, nlmType);
+  if (arts === null) return null;
+  // status_id 3 == completed; undefined assumed completed for forward-compat
+  // (mirrors verify-gallery-vs-notebook.ts). In_progress (other status_id)
+  // is excluded — that is the whole point vs the unreliable `artifact poll`.
+  return arts
+    .filter((a) => a.status_id === 3 || a.status_id === undefined)
+    .map((a) => ({ id: a.id, title: a.title, created_at: a.created_at }));
+}
+
+/**
+ * S142 — ALL-status artifact ids of a type (regardless of status_id), newest-
+ * first, or null on CLI/parse error.
+ *
+ * The studio_only pre-generation snapshot uses THIS, not realListArtifacts,
+ * so a FOREIGN generation that is already IN-PROGRESS on a SHARED parent
+ * notebook when our run starts is captured in the before-set and is therefore
+ * excluded from "new" once it completes (closes the concurrent-foreign exact-1
+ * false-success Codex caught at S141). The artifact `id` is the backend entity
+ * id (data[0] in the API tuple — notebooklm/types.py Artifact.from_api_response)
+ * and is STABLE across the processing→completed transition, so a before-set id
+ * still matches the same artifact after it finishes rendering.
+ */
+export function realListAllArtifactIds(
+  notebookId: string,
+  nlmType: string,
+): string[] | null {
+  const arts = rawListArtifacts(notebookId, nlmType);
+  if (arts === null) return null;
+  return arts.map((a) => a.id).filter(Boolean);
 }
 
 /** Download a specific artifact BY ID; resolve true only on a non-empty file. */

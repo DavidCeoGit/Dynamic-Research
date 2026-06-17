@@ -49,6 +49,17 @@
  *   an unresolved or AMBIGUOUS product rides its own per-product poll timeout and
  *   then fails the run (the executor failJobs it) — we NEVER guess an artifact id
  *   (that would reintroduce S31). A partial set is already a failed run below.
+ *
+ * S142 — concurrent-FOREIGN exact-1 hardening (Codex S141 CRITICAL). The S141
+ *   snapshot was COMPLETED-only, so a foreign generation of the same type that
+ *   was already IN-PROGRESS on the SHARED parent notebook at our start was not in
+ *   the before-set; when it finished it was the only "new" completed id and got
+ *   resolved as ours. The snapshot is now ALL-STATUS (realListAllArtifactIds —
+ *   includes in-progress/pending), so already-in-flight foreign work is excluded.
+ *   A degraded (failed-3×) snapshot now fully fail-closes (resolves nothing) —
+ *   closing Codex's degraded "widening edge." Residual (narrowed, not closed): a
+ *   foreign generate that STARTS strictly after our snapshot — still guarded by
+ *   the >1-new fail-closed rule when both artifacts complete.
  */
 
 import * as fs from "node:fs/promises";
@@ -60,6 +71,7 @@ import { scopedStoragePath, uploadWithAudit } from "../lib/storage-paths.js";
 import { isStateFileName, selectNewestStateFile } from "../lib/find-state-file.js";
 import {
   realListArtifacts,
+  realListAllArtifactIds,
   realDownloadArtifact,
   type NlmArtifactRef,
 } from "../lib/studio-completeness.js";
@@ -501,43 +513,49 @@ async function main(): Promise<void> {
     );
   }
 
-  // 4.5. S141 Layer 1 — PRE-GENERATION SNAPSHOT. For each selected product,
-  //      record the set of completed-artifact ids that ALREADY exist for its
-  //      type, BEFORE we launch any generate. The run floor (now − 5s skew
-  //      buffer) is captured before the snapshot reads so a freshly-rendered
-  //      artifact's created_at can never fall below it. A definitively-failed
-  //      list (3 tries) degrades to an EMPTY before-set — the created_at floor
-  //      then guards against admitting a stale prior-run artifact.
+  // 4.5. S141 Layer 1 / S142 hardening — PRE-GENERATION SNAPSHOT. For each
+  //      selected product, record the set of ALL-STATUS artifact ids that
+  //      ALREADY exist for its type (realListAllArtifactIds — processing,
+  //      pending, completed, failed; NOT completed-only), BEFORE we launch any
+  //      generate. Capturing in-progress ids is the S142 fix: studio_only runs
+  //      against a SHARED parent notebook, so a FOREIGN generation already in
+  //      flight at our start must be in the before-set, or it would be the only
+  //      "new" completed id when it finishes and be resolved as OURS (Codex S141
+  //      CRITICAL). The run floor (now − 5s skew buffer) is captured before the
+  //      snapshot reads so a freshly-rendered artifact's created_at can never
+  //      fall below it. A definitively-failed list (3 tries) degrades to an
+  //      EMPTY before-set with snapshotOk=false → freshCompleted then resolves
+  //      NOTHING for that product (fully fail-closed; no created_at-only admit).
   const runFloorMs = Date.now() - 5_000;
-  const beforeIds: Record<string, Set<string>> = {};
-  // Whether the snapshot for each product SUCCEEDED. A degraded (failed-3×)
-  // snapshot makes the before-diff non-authoritative, so freshCompleted must
-  // then prove freshness by the created_at floor alone (Gemini MERGE MAJOR).
+  const beforeAllIds: Record<string, Set<string>> = {};
+  // Whether the all-status snapshot for each product SUCCEEDED. A degraded
+  // (failed-3×) snapshot leaves no before-set to distinguish ours from a foreign
+  // artifact, so freshCompleted fails-closed and resolves nothing (S142).
   const snapshotOk: Record<string, boolean> = {};
   for (const product of products) {
     const def = PRODUCT_DEFS[product];
     let ids: string[] | null = null;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const arts = realListArtifacts(notebookId, def.cliType);
-      if (arts) {
-        ids = arts.map((a) => a.id).filter(Boolean);
+      const allIds = realListAllArtifactIds(notebookId, def.cliType);
+      if (allIds) {
+        ids = allIds;
         break;
       }
       await sleep(3_000);
     }
-    beforeIds[product] = new Set(ids ?? []);
+    beforeAllIds[product] = new Set(ids ?? []);
     snapshotOk[product] = ids !== null;
     if (ids === null) {
       console.error(
-        `[studio-only] WARN: snapshot list for ${product} failed after 3 tries — ` +
-          `before-set EMPTY + DEGRADED; freshness now requires a parseable created_at ` +
-          `≥ floor ${runFloorMs} (fail-closed, never the S31 wrong artifact)`,
+        `[studio-only] WARN: all-status snapshot for ${product} failed after 3 tries — ` +
+          `DEGRADED; this product can no longer be resolved and will FAIL-CLOSED at its ` +
+          `timeout (we cannot prove ours-vs-foreign without a snapshot — never the S31 wrong artifact)`,
       );
     }
   }
   console.log(
-    `[studio-only] snapshot floor=${runFloorMs} before=` +
-      JSON.stringify(Object.fromEntries(products.map((p) => [p, beforeIds[p].size]))),
+    `[studio-only] snapshot floor=${runFloorMs} before(all-status)=` +
+      JSON.stringify(Object.fromEntries(products.map((p) => [p, beforeAllIds[p].size]))),
   );
 
   // 5. Launch every selected product's generate (fast — returns a task_id).
@@ -606,7 +624,7 @@ async function main(): Promise<void> {
       }
       const fresh = freshCompleted(
         arts,
-        beforeIds[task.product] ?? new Set(),
+        beforeAllIds[task.product] ?? new Set(),
         runFloorMs,
         snapshotOk[task.product] ?? false,
       );

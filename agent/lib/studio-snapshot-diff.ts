@@ -1,5 +1,6 @@
 /**
  * S141 — studio_only snapshot-diff resolution (extracted for unit testing).
+ * S142 — hardened against the concurrent-FOREIGN exact-1 false-success.
  *
  * The studio_only regen path (agent/scripts/regenerate-studio-products.ts)
  * resolves each product's NEW completed NotebookLM artifact by diffing the
@@ -14,6 +15,18 @@
  * unproven artifact must NEVER be admitted (that would reintroduce the S31
  * wrong-artifact bug). When freshness cannot be proven, the product stays
  * unresolved and the run fails — never a wrong download.
+ *
+ * S142 — the before-set is now ALL-STATUS, not completed-only. studio_only runs
+ * against a SHARED parent notebook; the S141 completed-only snapshot could not
+ * see a FOREIGN generation already IN-PROGRESS at our start, so when that
+ * foreign artifact completed it was the only "new" completed id → resolved as
+ * ours (Codex S141 CRITICAL). The snapshot now records every artifact id of the
+ * type regardless of status (realListAllArtifactIds), so an already-in-flight
+ * foreign artifact is in the before-set and is excluded once it completes. The
+ * residual — a foreign generation that STARTS strictly after our snapshot and
+ * completes before ours — is narrowed but not closed by this layer; it stays
+ * fail-closed-friendly (the >1-new guard at the call site refuses to guess when
+ * both ours and a foreign artifact complete).
  */
 
 import type { NlmArtifactRef } from "./studio-completeness.js";
@@ -27,32 +40,42 @@ export function createdAtMs(a: NlmArtifactRef): number | null {
 }
 
 /**
- * The NEW completed artifacts of a type since the snapshot. `snapshotReliable`
- * is whether the pre-gen snapshot list for this product SUCCEEDED (vs degrading
- * to an empty before-set after 3 failed tries).
+ * The NEW completed artifacts of a type since the snapshot.
  *
- * S141 Gemini MERGE MAJOR — fail-closed under chained failure: if the snapshot
- * DEGRADED, the before-set diff proves nothing, so freshness must be PROVEN by a
- * parseable created_at at/after the floor. An absent/unparseable created_at on a
- * degraded snapshot is UNPROVABLE and is REJECTED (otherwise a stale parent-run
- * artifact with malformed metadata could be admitted → reintroduces S31). When
- * the snapshot was RELIABLE, "not in before-set" itself proves newness, so a
- * provably-new id with no created_at is fine; a parseable-but-stale created_at is
- * still rejected as defense-in-depth.
+ * @param arts            COMPLETED artifacts of the type (status_id===3), from
+ *                        realListArtifacts, newest-first.
+ * @param beforeAllIds    ALL-STATUS artifact ids present BEFORE generation
+ *                        (realListAllArtifactIds snapshot) — includes
+ *                        in-progress/pending foreign work, so a foreign artifact
+ *                        already in flight at our start is excluded once it
+ *                        completes (S142).
+ * @param runFloorMs      now − skew buffer, captured before the snapshot.
+ * @param snapshotReliable whether the all-status snapshot list SUCCEEDED (vs
+ *                        degrading to an empty before-set after 3 failed tries).
+ *
+ * S142 — DEGRADED snapshot is fully fail-closed: with no before-set we cannot
+ * distinguish OURS from a foreign artifact created just after the floor (Codex's
+ * S141 "widening edge"). studio_only has no Layer-2 backstop, so admitting on
+ * created_at alone is an unacceptable guess → resolve NOTHING. The product rides
+ * to its per-product timeout and the run fails (re-runnable) rather than risk
+ * S31. A reliable all-status snapshot is the ONLY path that resolves an artifact.
+ *
+ * Under a RELIABLE snapshot, "not in the all-status before-set" proves the
+ * artifact did not exist (in ANY state) when we started, so a provably-new id
+ * with no created_at is admitted; a parseable-but-stale created_at is still
+ * rejected as defense-in-depth (Gemini S141 MAJOR).
  */
 export function freshCompleted(
   arts: NlmArtifactRef[],
-  beforeIds: Set<string>,
+  beforeAllIds: Set<string>,
   runFloorMs: number,
   snapshotReliable: boolean,
 ): NlmArtifactRef[] {
+  // Degraded snapshot → unprovable ours-vs-foreign → fail-closed (never S31).
+  if (!snapshotReliable) return [];
   return arts.filter((a) => {
-    if (!a.id || beforeIds.has(a.id)) return false;
+    if (!a.id || beforeAllIds.has(a.id)) return false;
     const c = createdAtMs(a);
-    if (snapshotReliable) {
-      return c == null ? true : c >= runFloorMs;
-    }
-    // Degraded snapshot: unprovable freshness → fail-closed (never S31).
-    return c != null && c >= runFloorMs;
+    return c == null ? true : c >= runFloorMs;
   });
 }
