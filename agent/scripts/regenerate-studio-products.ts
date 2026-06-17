@@ -27,16 +27,43 @@
  * under the CLONE's own slug as v1-named files (conventions.studioFilename).
  * The parent_run_id pointer (CE-1) is the lineage link. Surfacing v1/v2 of a
  * product side-by-side in ONE gallery is a documented v2 enhancement.
+ *
+ * S141 — Layer 1 snapshot-diff poll + download-by-id port.
+ *   This path previously polled `notebooklm artifact poll <taskId>`, which lies
+ *   `in_progress` even AFTER an artifact renders (S129/S135 cap-stall), and
+ *   downloaded BARE `download <type>` = NLM default-latest = the S31
+ *   wrong-artifact bug. Both are now closed by porting the full-pipeline Layer 1
+ *   contract (~/.claude/commands/research-compare.md, S138) into this script:
+ *   snapshot each product type's completed-artifact ids BEFORE generation, then
+ *   resolve each product's NEW completed artifact by DIFFING the type's
+ *   completed list against that snapshot (created_at-floor-filtered), persist the
+ *   resolved id to state.artifacts[product], and DOWNLOAD BY ID (`-a <id>`).
+ *   The list+download seams are reused verbatim from the worker's shipped,
+ *   MERGE-gate-reviewed studio-completeness.ts (realListArtifacts /
+ *   realDownloadArtifact — status_id===3, `-a`, backslash-path fallback).
+ *
+ *   Backstop difference vs the full pipeline: studio_only is its OWN executor
+ *   exit path (runStudioOnly) and is NOT wrapped by the S136 Layer-2 cap-kill
+ *   recovery. So the full-pipeline "leave unresolved → ride to the cap → Layer-2
+ *   recovers" contract does NOT apply here. The safe adaptation is FAIL-CLOSED:
+ *   an unresolved or AMBIGUOUS product rides its own per-product poll timeout and
+ *   then fails the run (the executor failJobs it) — we NEVER guess an artifact id
+ *   (that would reintroduce S31). A partial set is already a failed run below.
  */
 
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createClient } from "@supabase/supabase-js";
 import { BUCKET, STUDIO_PRODUCTS, studioFilename, getContentType } from "../lib/conventions.js";
 import { PHASE_CHECKS } from "../lib/workflow-conventions.js";
 import { scopedStoragePath, uploadWithAudit } from "../lib/storage-paths.js";
 import { isStateFileName, selectNewestStateFile } from "../lib/find-state-file.js";
+import {
+  realListArtifacts,
+  realDownloadArtifact,
+  type NlmArtifactRef,
+} from "../lib/studio-completeness.js";
+import { freshCompleted } from "../lib/studio-snapshot-diff.js";
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -72,9 +99,10 @@ const NLM_BIN =
 //
 // `product` is the state key (audio/video/slides/report/infographic) and is
 // also the conventions.json STUDIO_PRODUCTS key (→ correct file extension).
-// `cliType` is the NLM CLI argument — note slides ↔ slide-deck. genFlags are
-// the per-product format flags from the notebooklm-cli skill. maxPollMin is
-// the per-product timeout (audio/video are the long ones).
+// `cliType` is the NLM CLI argument — note slides ↔ slide-deck. It is ALSO the
+// `--type` value `artifact list`/`download` take (mirrors PRODUCT_TO_NLM_TYPE
+// in studio-completeness.ts). genFlags are the per-product format flags from
+// the notebooklm-cli skill. maxPollMin is the per-product timeout.
 
 interface ProductDef {
   cliType: string;
@@ -106,6 +134,14 @@ let manifestSlug = "";
 let manifestOrgId = "";
 let parentOrgId = "";
 let stateFilePath = "";
+// S141 — the parent notebook id (resolved in main); module-level so the
+// list/download seams in the poll loop + downloadAndUpload can scope every NLM
+// read/write with `-n notebookId` (never the ambient "current notebook").
+let notebookId = "";
+// S141 — resolved list-canonical artifact ids, product → {task_id}. Persisted
+// into every state.json write so a future reader (e.g. a studio_only
+// completeness gate) has the exact id the run produced, never default-latest.
+const resolvedArtifacts: Record<string, { task_id: string; status?: string; version?: number }> = {};
 
 async function writeState(phase: string, phaseStatus: string): Promise<void> {
   if (!stateFilePath) return;
@@ -117,6 +153,8 @@ async function writeState(phase: string, phaseStatus: string): Promise<void> {
     phase,
     phase_status: phaseStatus,
     pipeline_mode: "studio_only",
+    notebook_id: notebookId || undefined,
+    artifacts: resolvedArtifacts,
   };
   try {
     await fs.writeFile(stateFilePath, JSON.stringify(state, null, 2));
@@ -131,12 +169,17 @@ async function fail(reason: string): Promise<never> {
   process.exit(1);
 }
 
-// ── NLM CLI helper ──────────────────────────────────────────────────
+// ── NLM CLI helper (generate + notebook-select only) ────────────────
 //
 // Calls the venv notebooklm.exe directly (no `source activate` needed — the
 // venv binary is already wired to its interpreter). PYTHONIOENCODING=utf-8
 // prevents the cp1252 crash on Windows (skill Bug 3). spawnSync with an args
 // array means no shell — multi-line instruction strings need no escaping.
+//
+// NOTE: artifact LISTING and DOWNLOADING are NOT done through this helper —
+// they go through realListArtifacts / realDownloadArtifact (studio-completeness.ts)
+// so the status_id===3 filter, `-a <id>` download, and Bug-12 backslash fallback
+// are the SAME shipped, reviewed code the worker's completeness gate uses.
 
 interface NlmResult {
   stdout: string;
@@ -155,11 +198,6 @@ function nlm(args: string[], timeoutMs = 120_000): NlmResult {
     stderr: r.stderr ?? "",
     status: typeof r.status === "number" ? r.status : -1,
   };
-}
-
-function looksLikeAuthError(text: string): boolean {
-  const t = text.toLowerCase();
-  return t.includes("auth") || t.includes("login") || t.includes("sign in");
 }
 
 // ── Instruction builder ─────────────────────────────────────────────
@@ -222,7 +260,10 @@ function buildInstruction(
 //
 // `generate <type> ... --json` returns a task id; the exact JSON shape isn't
 // contractually fixed, so try the common field names, then fall back to a
-// raw-text regex before giving up.
+// raw-text regex before giving up. S141: the submit task_id is now LOG-ONLY —
+// completion + download are resolved by snapshot-diff against `artifact list`,
+// because the submit id is an ALIAS that `artifact poll` reports `in_progress`
+// on forever after render (S129/S135). We keep extracting it purely for traceability.
 
 function extractTaskId(stdout: string): string | null {
   try {
@@ -257,6 +298,15 @@ function compactTimestamp(d = new Date()): string {
     `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
   );
 }
+
+// ── Snapshot-diff resolution ────────────────────────────────────────
+//
+// realListArtifacts returns ONLY status_id===3 (COMPLETED) artifacts, newest-
+// first. So an artifact that is NEW vs the pre-generation snapshot AND passes
+// the created_at floor is, in one shot, both resolved (we know its id) and done
+// (it is in the completed list). We never trust the lying `artifact poll`.
+// The pure decision logic lives in ../lib/studio-snapshot-diff.ts (unit-tested
+// without self-executing this script); `freshCompleted` is imported above.
 
 // ── Main ────────────────────────────────────────────────────────────
 
@@ -309,7 +359,7 @@ async function main(): Promise<void> {
     }
     console.log(`[studio-only] fallback resolved org_id: ${manifestOrgId}`);
   }
-  stateFilePath = path.join(workDir, `${manifestSlug}-state.json`);
+  stateFilePath = `${workDir}/${manifestSlug}-state.json`;
 
   const parentRunId = manifest.parent_run_id ? String(manifest.parent_run_id) : "";
   if (!parentRunId) {
@@ -422,7 +472,7 @@ async function main(): Promise<void> {
     await fail(`parent state.json is not valid JSON: ${(err as Error).message}`);
     return;
   }
-  const notebookId = parentState.notebook_id ? String(parentState.notebook_id) : "";
+  notebookId = parentState.notebook_id ? String(parentState.notebook_id) : "";
   if (!notebookId) {
     await fail(
       `parent run ${parentSlug} state.json has no notebook_id — its notebook was never recorded ` +
@@ -441,6 +491,8 @@ async function main(): Promise<void> {
   }
 
   // 4. Select the notebook (Bug 11 — generate/download act on the active one).
+  //    All artifact list/download below ALSO pass `-n notebookId` explicitly,
+  //    so resolution never depends on the ambient "current notebook" drifting.
   const useOut = nlm(["use", notebookId]);
   if (useOut.status !== 0) {
     await fail(
@@ -449,8 +501,49 @@ async function main(): Promise<void> {
     );
   }
 
+  // 4.5. S141 Layer 1 — PRE-GENERATION SNAPSHOT. For each selected product,
+  //      record the set of completed-artifact ids that ALREADY exist for its
+  //      type, BEFORE we launch any generate. The run floor (now − 5s skew
+  //      buffer) is captured before the snapshot reads so a freshly-rendered
+  //      artifact's created_at can never fall below it. A definitively-failed
+  //      list (3 tries) degrades to an EMPTY before-set — the created_at floor
+  //      then guards against admitting a stale prior-run artifact.
+  const runFloorMs = Date.now() - 5_000;
+  const beforeIds: Record<string, Set<string>> = {};
+  // Whether the snapshot for each product SUCCEEDED. A degraded (failed-3×)
+  // snapshot makes the before-diff non-authoritative, so freshCompleted must
+  // then prove freshness by the created_at floor alone (Gemini MERGE MAJOR).
+  const snapshotOk: Record<string, boolean> = {};
+  for (const product of products) {
+    const def = PRODUCT_DEFS[product];
+    let ids: string[] | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const arts = realListArtifacts(notebookId, def.cliType);
+      if (arts) {
+        ids = arts.map((a) => a.id).filter(Boolean);
+        break;
+      }
+      await sleep(3_000);
+    }
+    beforeIds[product] = new Set(ids ?? []);
+    snapshotOk[product] = ids !== null;
+    if (ids === null) {
+      console.error(
+        `[studio-only] WARN: snapshot list for ${product} failed after 3 tries — ` +
+          `before-set EMPTY + DEGRADED; freshness now requires a parseable created_at ` +
+          `≥ floor ${runFloorMs} (fail-closed, never the S31 wrong artifact)`,
+      );
+    }
+  }
+  console.log(
+    `[studio-only] snapshot floor=${runFloorMs} before=` +
+      JSON.stringify(Object.fromEntries(products.map((p) => [p, beforeIds[p].size]))),
+  );
+
   // 5. Launch every selected product's generate (fast — returns a task_id).
   //    5s spacing between launches avoids server-side queue congestion (Bug 20).
+  //    The returned task_id is LOG-ONLY now (S141) — completion is detected by
+  //    snapshot-diff, not by polling this (lying) id.
   await writeState("5.5", `Launching ${products.length} Studio product(s)`);
   interface Task {
     product: string;
@@ -470,14 +563,10 @@ async function main(): Promise<void> {
       launchFailures.push(`${product}: generate exited ${gen.status} — ${(gen.stderr || gen.stdout).slice(0, 200)}`);
       continue;
     }
-    const taskId = extractTaskId(gen.stdout);
-    if (!taskId) {
-      launchFailures.push(`${product}: could not parse a task_id from generate output`);
-      continue;
-    }
+    const taskId = extractTaskId(gen.stdout) ?? "(unparsed)";
     // 30s poll interval → polls needed = minutes * 2.
     tasks.push({ product, cliType: def.cliType, taskId, maxPolls: def.maxPollMin * 2 });
-    console.log(`[studio-only]   → task ${taskId}`);
+    console.log(`[studio-only]   → launched ${product} (submit task ${taskId}, log-only)`);
     await sleep(5_000);
   }
 
@@ -485,8 +574,12 @@ async function main(): Promise<void> {
     await fail(`no products could be launched. ${launchFailures.join(" | ")}`);
   }
 
-  // 6. Unified poll loop. Each cycle: poll every still-running task; download
-  //    + upload the moment one completes. 30s between cycles.
+  // 6. Unified poll loop (S141 snapshot-diff). Each cycle, for every still-
+  //    running task: list the type's COMPLETED artifacts, diff against the
+  //    snapshot + floor. A unique new completed artifact = resolved AND done
+  //    in one shot → persist its id → download BY ID → upload. 30s between cycles.
+  //    AMBIGUOUS (>1 new) or not-yet-surfaced (0 new) products keep waiting and
+  //    FAIL-CLOSED at their per-product timeout — we never guess an id (S31).
   const POLL_INTERVAL_MS = 30_000;
   const done = new Set<string>();
   const failedProducts: string[] = [...launchFailures];
@@ -504,35 +597,56 @@ async function main(): Promise<void> {
         done.add(task.product);
         continue;
       }
-      const poll = nlm(["artifact", "poll", task.taskId], 60_000);
-      const out = poll.stdout + poll.stderr;
-      // Auth blips: don't fail — the 30-min refresh task heals it. Just skip
-      // this cycle for this task and try again next loop.
-      if (looksLikeAuthError(out) && poll.status !== 0) {
-        console.error(`[studio-only] ${task.product}: auth blip on poll — will retry next cycle`);
+
+      const arts = realListArtifacts(notebookId, task.cliType);
+      if (arts === null) {
+        // Transient list/auth error: don't fail — ride to this product's timeout.
+        console.error(`[studio-only] cycle ${cycle} | ${task.product}: artifact list error — retry next cycle`);
         continue;
       }
-      const m = out.match(/status='([^']+)'/);
-      const status = m ? m[1] : "unknown";
-      console.log(`[studio-only] cycle ${cycle} | ${task.product}: ${status}`);
+      const fresh = freshCompleted(
+        arts,
+        beforeIds[task.product] ?? new Set(),
+        runFloorMs,
+        snapshotOk[task.product] ?? false,
+      );
 
-      if (status === "completed" || status === "ready" || status === "done") {
-        const result = await downloadAndUpload(task, sb, timestamp);
-        if (result.ok) {
-          uploaded.push(result.remoteName!);
-          await writeState(
-            "5.5",
-            `${task.product} ✓ (${uploaded.length}/${tasks.length} uploaded)`,
-          );
-        } else {
-          failedProducts.push(`${task.product}: ${result.reason}`);
-        }
-        done.add(task.product);
-      } else if (status === "failed") {
-        console.error(`[studio-only] ${task.product}: generation FAILED`);
-        failedProducts.push(`${task.product}: NotebookLM reported generation failed`);
-        done.add(task.product);
+      if (fresh.length === 0) {
+        console.log(`[studio-only] cycle ${cycle} | ${task.product}: awaiting completion (none new yet)`);
+        continue;
       }
+      if (fresh.length > 1) {
+        // Two+ new completed artifacts of this type since the snapshot. Studio
+        // launched exactly one generate per product, so this is a concurrent
+        // run / reused notebook. Do NOT guess (S31) — keep waiting; the product
+        // fails-closed at its timeout rather than risk downloading the wrong file.
+        console.error(
+          `[studio-only] cycle ${cycle} | ${task.product}: AMBIGUOUS — ${fresh.length} new completed ids ` +
+            `[${fresh.map((a) => a.id).join(", ")}] — NOT guessing; will fail-closed at timeout`,
+        );
+        continue;
+      }
+
+      const winner = fresh[0];
+      // Persist the resolved id immediately (fail-closed diagnostics + the
+      // expectedArtifactId a future studio_only completeness gate would read).
+      resolvedArtifacts[task.product] = { task_id: winner.id };
+      console.log(`[studio-only] cycle ${cycle} | ${task.product}: completed → artifact ${winner.id}`);
+      const result = await downloadAndUpload(task, winner, sb, timestamp);
+      if (result.ok) {
+        // Only on successful UPLOAD does the gallery count this product complete.
+        // status/version mirror the full-pipeline ArtifactState shape the
+        // frontend's "Artifacts Completed" counter reads (VendorTabs).
+        resolvedArtifacts[task.product] = { task_id: winner.id, status: "completed", version: 1 };
+        uploaded.push(result.remoteName!);
+        await writeState(
+          "5.5",
+          `${task.product} ✓ (${uploaded.length}/${tasks.length} uploaded)`,
+        );
+      } else {
+        failedProducts.push(`${task.product}: ${result.reason}`);
+      }
+      done.add(task.product);
     }
     if (done.size < tasks.length) await sleep(POLL_INTERVAL_MS);
   }
@@ -562,56 +676,36 @@ async function main(): Promise<void> {
 }
 
 // ── Download + upload one completed artifact ────────────────────────
+//
+// S141: downloads the SPECIFIC resolved artifact BY ID via realDownloadArtifact
+// (`download <type> -n <nb> -a <id> <path> --force`, with the Bug-12 backslash
+// fallback + non-empty check) — never bare default-latest (S31). The artifact's
+// canonical NLM title (from `artifact list`) names the file, replacing the old
+// stdout-regex title parse.
 
 async function downloadAndUpload(
   task: { product: string; cliType: string },
+  artifact: NlmArtifactRef,
   sb: ReturnType<typeof createClient>,
   timestamp: string,
 ): Promise<{ ok: boolean; remoteName?: string; reason?: string }> {
   const ext = STUDIO_PRODUCTS[task.product]?.ext;
   if (!ext) return { ok: false, reason: `unknown product (no ext in conventions): ${task.product}` };
 
-  // Download to a temp path in the workDir. Windows-native path avoids the
-  // backslash-directory bug (skill Bug 12).
-  const tmpPath = `${workDir}/_dl-${task.product}.${ext}`;
-  const dl = nlm(["download", task.cliType, tmpPath], 300_000);
-  const dlOut = dl.stdout + dl.stderr;
-  if (dl.status !== 0) {
-    return { ok: false, reason: `download exited ${dl.status} — ${dlOut.slice(0, 200)}` };
-  }
-
-  // Bug 12 fallback: if the file isn't where we asked, check the literal
-  // backslash-path location NLM sometimes writes to instead.
-  let localPath = tmpPath;
-  try {
-    await fs.access(tmpPath);
-  } catch {
-    const backslash = tmpPath.replace(/^([A-Za-z]):\//, "\\$1\\").replace(/\//g, "\\");
-    try {
-      await fs.access(backslash);
-      localPath = backslash;
-    } catch {
-      return { ok: false, reason: `download reported success but no file at ${tmpPath}` };
-    }
-  }
-
-  // Title for the conventions-compliant filename (skill: "Artifact: <title>").
-  const titleMatch = dlOut.match(/Artifact:\s*(.+?)(?:\s*\(|\r?\n|$)/);
-  const title = titleMatch ? titleMatch[1].trim() : task.product;
+  // Name the local file with the conventions-compliant name up front; the
+  // download writes straight to it (Windows-native path avoids the backslash-
+  // directory bug, handled inside realDownloadArtifact).
+  const title = artifact.title?.trim() || task.product;
   const remoteName = studioFilename(title, timestamp, task.product);
-
-  const buf = await fs.readFile(localPath);
-  if (buf.length === 0) return { ok: false, reason: "downloaded file is empty" };
-
-  // Keep a conventions-named local copy in the workdir (parity with the
-  // full-pipeline path, which leaves named deliverables on disk).
   const namedLocal = `${workDir}/${remoteName}`;
-  try {
-    await fs.copyFile(localPath, namedLocal);
-    await fs.rm(localPath, { force: true });
-  } catch {
-    // non-fatal — the upload below is the load-bearing step
+
+  const ok = await realDownloadArtifact(notebookId, artifact.id, task.cliType, namedLocal);
+  if (!ok) {
+    return { ok: false, reason: `download of artifact ${artifact.id} failed or produced an empty file` };
   }
+
+  const buf = await fs.readFile(namedLocal);
+  if (buf.length === 0) return { ok: false, reason: "downloaded file is empty" };
 
   const contentType = getContentType(remoteName);
   // Phase B / S50 — upload to the CLONE's org-prefixed path + write an audit
