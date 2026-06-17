@@ -647,11 +647,18 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     // S69: pass getStdout so waitForProcess can compute in-flight cost
     // estimates and trip MAX_JOB_COST_CENTS. Back-compat: arg is optional;
     // callers that don't pass it (none currently) just skip the cost check.
-    const exitCode = await waitForProcess(claudeProcess, job, getStdout);
+    const { code: exitCode, killReason } = await waitForProcess(claudeProcess, job, getStdout);
     exitCodeForUsage = exitCode;
     stdoutForUsage = getStdout();
 
     stateWatcher.stop();
+
+    // S136 Layer 2: a MAX_JOB_DURATION cap-kill whose studio artifacts already
+    // finished in NotebookLM should be RECOVERED (download → upload → complete)
+    // rather than hard-failed. Set on the eligible path below; when non-null it
+    // replaces the verifyPipelineCompletion verdict so control flows through the
+    // existing PUBLISH + studio-completeness + upload + completeJob tail.
+    let recoveryVerdict: CompletionVerdict | null = null;
 
     if (exitCode !== 0) {
       const errMsg = `Claude process exited with code ${exitCode}`;
@@ -670,23 +677,45 @@ export async function executeJob(job: ResearchJob): Promise<string> {
         stdoutTail,
         stderrTail,
       });
-      if (classified) {
-        markPendingTerminalExit({
-          ...classified,
-          source: "executor:claude-spawn",
-        });
+
+      // S136 Layer 2 recovery gate (Gemini MERGE CRITICAL-2 / Codex K-4):
+      // ONLY a pure duration cap-kill with NO terminal error and a recoverable
+      // notebook is eligible. A cost-cap kill (killReason==="COST") and any
+      // classified terminal error stay fail-fast — they MUST NOT be recovered,
+      // so a runaway/cost-killed job can never be laundered into a success.
+      const recoveryState =
+        killReason === "DURATION" && !classified
+          ? await readStateForRecovery(workDir)
+          : null;
+      if (shouldRecoverAfterDurationKill(killReason, !!classified, !!recoveryState?.notebook_id)) {
         log(
           job.id,
-          `[executor] terminal-error classified: kind=${classified.kind} signature=${classified.signature} — worker will exit after this job finishes`,
+          `[S136] MAX_JOB_DURATION cap-kill with no terminal error — attempting studio-completeness recovery instead of failing (notebook ${recoveryState!.notebook_id})`,
         );
-      }
+        recoveryVerdict = {
+          success: true,
+          reason: "S136: recovered after MAX_JOB_DURATION cap-kill",
+          state: recoveryState!,
+        };
+      } else {
+        if (classified) {
+          markPendingTerminalExit({
+            ...classified,
+            source: "executor:claude-spawn",
+          });
+          log(
+            job.id,
+            `[executor] terminal-error classified: kind=${classified.kind} signature=${classified.signature} — worker will exit after this job finishes`,
+          );
+        }
 
-      await failJob(job.id, errMsg);
-      await notifyTerminal(job, "failed", errMsg);
-      throw new Error(errMsg);
+        await failJob(job.id, errMsg);
+        await notifyTerminal(job, "failed", errMsg);
+        throw new Error(errMsg);
+      }
     }
 
-    const verdict = await verifyPipelineCompletion(workDir);
+    const verdict = recoveryVerdict ?? (await verifyPipelineCompletion(workDir));
     if (!verdict.success) {
       log(job.id, `Pipeline did not complete: ${verdict.reason}`);
 
@@ -1083,7 +1112,9 @@ async function runStudioOnly(
   }
 
   const stateWatcher = watchStateFile(job, workDir);
-  const exitCode = await waitForProcess(child, job);
+  // S136: waitForProcess now returns {code, killReason}; the studio-only regen
+  // path keeps its existing fail-fast behavior (no duration recovery here yet).
+  const { code: exitCode } = await waitForProcess(child, job);
   stateWatcher.stop();
 
   if (exitCode !== 0) {
@@ -1553,11 +1584,33 @@ function spawnClaude(prompt: string, cwd: string): {
 
 // ── Process completion waiter ───────────────────────────────────────
 
+/** Why a watched `claude -p` was SIGTERM'd, or NONE if it exited on its own. */
+export type KillReason = "NONE" | "DURATION" | "COST";
+
+/**
+ * S136 Layer 2 — pure recovery-eligibility decision (unit-tested without the
+ * private process internals). A worker may ONLY attempt studio-artifact
+ * recovery after a kill when ALL hold:
+ *   - the kill was the MAX_JOB_DURATION cap (NOT the cost cap),
+ *   - NO terminal error was classified (credit/auth/billing/model — a
+ *     duration kill that ALSO emitted one must stay fail-fast), and
+ *   - a notebook_id exists to recover from.
+ * Cost-cap kills and terminal errors are NEVER recovery-eligible (Gemini
+ * MERGE CRITICAL-2 cost-bypass guard / Codex K-4).
+ */
+export function shouldRecoverAfterDurationKill(
+  killReason: KillReason,
+  hasTerminalError: boolean,
+  hasNotebookId: boolean,
+): boolean {
+  return killReason === "DURATION" && !hasTerminalError && hasNotebookId;
+}
+
 function waitForProcess(
   child: ChildProcess,
   job: ResearchJob,
   getStdout?: () => string,
-): Promise<number> {
+): Promise<{ code: number; killReason: KillReason }> {
   const maxDuration = Number(process.env.MAX_JOB_DURATION_MS) || 5_400_000;
   const SLEEP_THRESHOLD_MS = 5 * 60 * 1000;
   const TICK_MS = 30_000;
@@ -1570,6 +1623,9 @@ function waitForProcess(
     let lastTick = Date.now();
     let activeMs = 0;
     let killAttempted = false;
+    // S136 Layer 2: record WHY we killed so the exit handler can distinguish a
+    // recoverable duration cap-kill from a cost-cap kill (which stays fail-fast).
+    let killReason: KillReason = "NONE";
     let tickCount = 0;
 
     const deadlineCheck = setInterval(() => {
@@ -1586,6 +1642,7 @@ function waitForProcess(
 
       if (activeMs > maxDuration && !killAttempted) {
         killAttempted = true;
+        killReason = "DURATION";
         log(job.id, `Job exceeded max active duration (${maxDuration}ms; active ${Math.round(activeMs / 60000)}min) — killing`);
         child.kill("SIGTERM");
         setTimeout(() => child.kill("SIGKILL"), 10_000);
@@ -1605,6 +1662,7 @@ function waitForProcess(
         const estCents = estimateInFlightCostCents(getStdout());
         if (estCents > MAX_JOB_COST_CENTS) {
           killAttempted = true;
+          killReason = "COST";
           log(
             job.id,
             `Job exceeded cost cap (est $${(estCents / 100).toFixed(2)} > $${(MAX_JOB_COST_CENTS / 100).toFixed(2)}) — killing`,
@@ -1617,7 +1675,7 @@ function waitForProcess(
 
     child.on("exit", (code) => {
       clearInterval(deadlineCheck);
-      resolve(code ?? 1);
+      resolve({ code: code ?? 1, killReason });
     });
 
     child.on("error", (err) => {
@@ -1686,6 +1744,22 @@ function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
 // e18e1931 (a completed phase-6 run shadowed by a stale phase-0 state.json). S87.
 
 // ── Pipeline completion verifier (Bug 35) ──────────────────────────
+
+/**
+ * S136 Layer 2: read the parsed state.json for a cap-killed run so the recovery
+ * branch can synthesize a success verdict + drive enforceStudioCompleteness.
+ * Returns null on any IO/parse failure or absent state (→ not recovery-eligible,
+ * since shouldRecoverAfterDurationKill requires a notebook_id).
+ */
+async function readStateForRecovery(workDir: string): Promise<PipelineState | null> {
+  try {
+    const stateFile = await findStateFile(workDir);
+    if (!stateFile) return null;
+    return JSON.parse(await fs.readFile(stateFile, "utf-8")) as PipelineState;
+  } catch {
+    return null;
+  }
+}
 
 interface CompletionVerdict {
   success: boolean;
