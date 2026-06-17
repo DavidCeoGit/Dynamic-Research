@@ -150,6 +150,8 @@ For uploads from the worker, use `uploadWithAudit()` from the same helper — wr
 
 This project is a frequent producer of DESIGN + MERGE-gate artifacts. Honor the Event Gate × Risk Label × Severity Mode framework verbatim. Reviewer ORDER is **Gemini → integrate → Codex** (sequential). Codex catches code-grounded gaps Gemini missed on the integrated v2 every time. Do not invert this order without explicit reason.
 
+**HARD RULE (user, S141) — hold `agent/` PROD deploys until the FULL three-vendor gate clears BEFORE merge.** Any `agent/` change that reaches the production worker (`DynamicResearchWorker` cron → DR-Deploy clone → live daemon) must have **Gemini + Codex + Claude-author all reviewed and cleared BEFORE the merge/deploy — never after.** The MRPF "required-reviewer-unavailable fallback" (run substitutes now, proceed, owe the real Codex pass as a <24h follow-up) is **NOT acceptable for `agent/` prod code** — if Codex is quota-out/offline, **WAIT** (or use the §1a API-key flip to get the REAL Codex now), do not merge with substitutes. Origin: S141 deployed an `agent/` worker fix under the reduced two-lens path (Gemini + Claude-grounded both ENDORSED); the owed Codex pass then BLOCKED on a CRITICAL the two lenses missed — already LIVE in prod. Substitutes de-risk the WAIT; they never replace the gate. This tightening is specific to `agent/` PROD deploys — slash-prompt edits (live-immediately) and DESIGN/AUDIT gates keep normal MRPF latitude. See `feedback_hold_agent_prod_deploys_until_full_tri_vendor_gate.md` + `feedback_studio_snapshot_diff_concurrent_foreign_exact1.md`.
+
 Synthesis artifacts live under `Documentation/` named `<topic>-peer-review.md` or `<topic>-merge-gate-peer-review.md`.
 
 ---
