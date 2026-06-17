@@ -108,3 +108,59 @@ the lib extraction fidelity.
 - `agent/lib/studio-snapshot-diff.ts` (new — pure resolution logic)
 - `agent/test/studio-snapshot-diff.test.ts` (new — 11 tests)
 - Raw Gemini log: `c:/tmp/s141-gemini.log`. Packet: `c:/tmp/s141-gate-final.md`.
+
+---
+
+## Codex grounded-adversarial pass (the owed <24h follow-up) — 2026-06-17 ~9:46 PM, after quota reset
+
+**Reviewer:** Codex `gpt-5.x-codex` via `codex exec -s workspace-write` (workspace-write used to bypass
+the Windows read-only `Get-Content` file-body block). Read the real files at `242cedf`; ran the unit
+tests itself (studio-snapshot-diff 11/11, studio-completeness 15/15).
+
+**Verdict: BLOCK — 1 CRITICAL (+ a widening edge). This was MISSED by both substitute lenses (Gemini
+holistic + Claude grounded) — the exact cross-vendor catch the MRPF predicts.**
+
+### CRITICAL — exact-one FOREIGN artifact accepted as this run's product
+`freshCompleted` (reliable branch, studio-snapshot-diff.ts:52) treats "exactly one completed id not in
+the before-set, created_at ≥ floor" as PROOF it is ours. But studio_only runs against a **shared parent
+notebook**. If a CONCURRENT/foreign generation of the SAME type completes **while our own is still
+rendering**, that foreign artifact is the only "new" one → resolved as ours
+(regenerate-studio-products.ts:607,630), persisted (:633), **downloaded by that wrong id** (:702),
+marked completed (:640), exit 0 (:673) → `runStudioOnly` → `completeJob` (executor.ts:1181).
+The `>1 new` guard never fires (only 1 is new); the floor doesn't help (foreign is also post-floor).
+This is S31 in a narrower form: `>1 new` is handled, **`exactly 1 new but not ours` is not.**
+Concrete input Codex verified locally: before={old-completed}, snapshotOk=true; list later returns
+`other-run-video`(12:01) + `old-completed`(yesterday) → `freshCompleted` returns `["other-run-video"]`.
+
+### Widening edge — degraded snapshot
+With snapshotOk=false (empty before-set), the degraded branch correctly rejects null/stale dates but
+still accepts ANY parseable `created_at ≥ floor` — so a foreign parent artifact created 2s after the
+floor is accepted. Same root cause, larger surface.
+
+### Codex confirmations (cross-checks that PASSED)
+- `task_id` is the correct persisted key (`expectedArtifactId` reads it first) — confirms the Gemini
+  MINOR-1 rejection.
+- Extraction fidelity intact — no signature/semantics drift from moving `freshCompleted` to the lib.
+- studio_only is its own branch, NOT wrapped by S136 Layer-2 (executor.ts:560 vs :656); `waitForProcess`
+  still applies the cap but fails closed.
+- `Math.max(...tasks.map())` safe (empty-tasks guarded at :573); `cycle > maxPolls` is not a
+  false-success.
+
+## REVISED VERDICT — gate is NOT clear; CRITICAL residual on a DEPLOYED change
+The "CLEAR TO MERGE" above stood only under the reduced two-lens review. Codex's pass **overturns it**:
+there is an unresolved CRITICAL false-success path. **However:** (a) it is a NET IMPROVEMENT over
+pre-S141 (the old bare `download <type>` default-latest was strictly worse on this exact axis), and
+(b) no active exposure (no studio_only job running; it only triggers under concurrent same-parent
+generation) → **not an emergency revert.** Reverting would restore worse behavior + the cap-stall.
+
+### Required follow-up (TOP next-session priority — design needed, do NOT rush unattended)
+Deterministically disambiguate OUR artifact from a foreign same-type one. Options:
+1. **Unique title/name marker** — if `notebooklm generate <type>` supports naming the artifact, stamp a
+   per-(run,product) nonce and require `artifact.title` to match it in resolution. (Verify the CLI flag
+   + that NLM doesn't rewrite the title.)
+2. **Parent-notebook single-flight lock** — refuse/serialize concurrent studio_only (and full-pipeline)
+   generation against the same notebook. Architectural; closes it completely.
+3. **Interim hardening** — snapshot ALL-status (not completed-only) artifacts before generation so a
+   foreign generate already in-progress at our start is excluded (narrows, doesn't close, the window).
+Whatever the fix, add a unit test for the concurrent-foreign exact-1 case (the gap these 11 tests
+missed) and re-run a full Gemini→Codex gate.
