@@ -2,20 +2,27 @@
  * GET /api/runs/[slug]/manifest
  *
  * S35 Clone & Edit — returns the form-shaped payload for a run so the
- * new-research wizard can pre-fill from `?clone=<slug>`. Sourced from the
- * project's state.json with runtime-only fields (vendorsDiscovered, file
- * paths, phase tracking, extracted-context cache) stripped out.
+ * new-research wizard can pre-fill from `?clone=<slug>`.
  *
- * Output matches `researchJobPayloadSchema` so the frontend can do
- * `form.reset(manifest)` in one call without remapping.
+ * S133 prefill fix — the form fields (topic, userContext.*, customizations.*,
+ * selectedProducts, vendorEvaluation, ajiDnaEnabled) are now sourced from the
+ * **research_queue row** (the authoritative, form-shaped record the submit
+ * route wrote), NOT state.json. The worker's state.json stores only a SHORT
+ * 52-char title in `topic` and OMITS userContext/customizations entirely, so
+ * the old state.json-sourced manifest filled the topic box with a title and
+ * left every customization field blank. The row carries the full prompt — the
+ * same columns replay/route.ts reads. For legacy storage-only runs whose queue
+ * row was deleted (storage remains), we FALL BACK to state.json per-field, so
+ * the S56 "clone still works when the queue row is gone" guarantee holds.
  *
  * S56 Phase 2 — replaces resolveOrgForSlug stopgap with session-or-env
  * orgId from getOrgContextDualPath(). Cross-tenant isolation is the
  * storage path prefix <orgId>/<slug>/ in projectExists + findStateFile +
- * readStateJson — a user with org-A's session/env can never resolve a
- * path under org-B/. No research_queue DB check (Gemini F1, S56 — that
- * check would have blocked legacy runs whose queue row was deleted but
- * storage remained).
+ * readStateJson, AND the .eq("organization_id", orgId) tenant boundary on
+ * the research_queue read below — a user with org-A's session/env can never
+ * resolve a path or a row under org-B/. No research_queue existence gate
+ * (Gemini F1, S56 — that check would have blocked legacy runs whose queue
+ * row was deleted but storage remained; the row read here is best-effort).
  */
 
 import {
@@ -29,6 +36,14 @@ import { resolveClonePublishRequired } from "@/lib/publish-flag";
 import type { AttachmentMeta } from "@/lib/types/queue";
 
 export const dynamic = "force-dynamic";
+
+type Json = Record<string, unknown>;
+
+// Mirror replay/route.ts: coerce a JSONB column / nested value to a plain
+// object, never throwing on null / array / scalar.
+function asJson(v: unknown): Json {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Json) : {};
+}
 
 interface ManifestResponse {
   topic: string;
@@ -65,8 +80,8 @@ interface ManifestResponse {
   // S102 file-upload — the parent run's stored attachments (plain
   // AttachmentMeta, origin stripped). Clone & Edit re-tags these origin:"parent"
   // so the submit route copies their bytes from the parent's sources/ folder.
-  // Sourced from the research_queue row (not state.json), org-scoped. [] when
-  // the parent has none / is a pre-S102 row.
+  // Sourced from the research_queue row, org-scoped. [] when the parent has
+  // none / is a pre-S102 row / is a legacy storage-only run.
   attachments: AttachmentMeta[];
   // Lineage — the slug being cloned. Form re-sends this as parentSlug on submit.
   parentSlug: string;
@@ -108,78 +123,87 @@ export async function GET(
     );
   }
 
-  // S102 file-upload — attachments are NOT in state.json; they live on the
-  // research_queue row. Read them org-scoped (the `.eq("organization_id")` is
-  // the cross-tenant boundary, matching plan-review/route.ts + replay/route.ts).
-  // Defaults to [] when the column is null/absent or the row is gone (legacy
-  // storage-only run) — never fails the manifest just because attachments
-  // couldn't be loaded.
-  // Gemini MERGE-gate BLOCKING #2 — distinguish "no queue row" (legacy
-  // storage-only run → [] is correct, must still clone) from "DB query errored"
-  // (transient → must NOT silently drop the parent's attachments, which would
-  // permanently truncate the clone). .maybeSingle() returns error:null + data:
-  // null when the row is simply absent, so a populated error is a genuine
-  // failure → fail closed with 500 rather than returning [].
-  // S120 Defect C — also select user_context here: it is the AUTHORITATIVE
-  // durable publishRequired source (set at submit), and the worker never echoes
-  // publishRequired into state.json's userContext. The S118 fix read
-  // state.userContext.publishRequired (never written) → a no-op that silently
-  // downgraded every clone of a publish parent out of the gate. The clone
-  // prefill (below) ORs this DB source with the state flags via the canonical
-  // predicate. .maybeSingle() returns data:null for legacy storage-only runs
-  // with no queue row — handled by the OR (state flag carries those).
-  let attachments: AttachmentMeta[] = [];
-  let attachRowUserContext: { publishRequired?: unknown } | null = null;
+  // The AUTHORITATIVE, form-shaped prompt lives on the research_queue row, not
+  // state.json. Read it org-scoped (the `.eq("organization_id")` is the
+  // cross-tenant boundary, matching replay/route.ts). This SAME row also
+  // carries the parent's attachments (S102) and the durable publishRequired
+  // (S120). Defaults / fallback-to-state.json apply when the row is absent —
+  // a legacy storage-only run (queue row deleted, storage remains).
+  //
+  // Gemini MERGE-gate BLOCKING #2 (S56) — distinguish "no queue row" (legacy
+  // storage-only run → fall back to state.json, must still clone) from "DB query
+  // errored" (transient → must NOT silently drop the parent's real prompt /
+  // attachments). .maybeSingle() returns error:null + data:null when the row is
+  // simply absent, so a populated error is a genuine failure → fail closed 500.
   const supabase = getSupabase();
-  const { data: attachRow, error: attachErr } = await supabase
+  const { data: queueRow, error: rowErr } = await supabase
     .from("research_queue")
-    .select("attachments, user_context")
+    .select(
+      "attachments, user_context, topic, customizations, selected_products, vendor_evaluation, aji_dna_enabled",
+    )
     .eq("topic_slug", slug)
     .eq("organization_id", orgId)
     .maybeSingle();
-  if (attachErr) {
+  if (rowErr) {
     return Response.json(
-      { error: "Failed to read attachments", detail: attachErr.message },
+      { error: "Failed to read run row", detail: rowErr.message },
       { status: 500, headers: orgHeaders },
     );
   }
-  attachments = (attachRow?.attachments as AttachmentMeta[] | null) ?? [];
-  attachRowUserContext =
-    (attachRow?.user_context as { publishRequired?: unknown } | null | undefined) ?? null;
+  const attachments: AttachmentMeta[] =
+    (queueRow?.attachments as AttachmentMeta[] | null) ?? [];
 
-  // Strip runtime-only fields. The form ingests userContext sans contextFilePath
-  // + localSourcePath; vendorEvaluation sans vendorsDiscovered/Shortlisted/Excluded
-  // + preScreeningComplete. Per-product customizations + notebookLM/perplexity
-  // shapes pass through as-is.
-  const uc = (state.userContext as Record<string, unknown>) ?? {};
-  const ve = (state.vendorEvaluation as Record<string, unknown>) ?? {};
-  const cust = (state.customizations as Record<string, unknown>) ?? {};
-  const sp = (state.selectedProducts as Record<string, unknown>) ?? {};
-  const px = (cust.perplexity as Record<string, unknown>) ?? {};
-  const nlm = (cust.notebookLM as Record<string, unknown>) ?? {};
+  // Source the form fields from the DB row when present; fall back to state.json
+  // per-field for legacy storage-only runs (row absent). State.json keeps a
+  // separate ref because publishRequired ORs the DB + state + legacy echo
+  // sources via the canonical predicate (do not collapse them).
+  const hasRow = queueRow != null;
+  const ucState = (state.userContext as Record<string, unknown>) ?? {};
+
+  // Prefer the authoritative row topic, but fall back to state.json's
+  // (truncated but non-empty) title when the row's topic is null/empty —
+  // a present-but-empty row field must NOT shadow a usable state title
+  // (Gemini S144 CRITICAL). `||` selects the first non-empty string; both
+  // empty → "" (same as the prior per-branch behavior). parentTopic derives
+  // from this same `topic`, so lineage stays consistent.
+  const stateTopic = (state.topic as string | null) ?? "";
+  const rowTopic = hasRow ? ((queueRow.topic as string | null) ?? "") : "";
+  const topic = rowTopic || stateTopic;
+  const uc = hasRow
+    ? asJson(queueRow.user_context)
+    : ucState;
+  const ve = hasRow
+    ? asJson(queueRow.vendor_evaluation)
+    : ((state.vendorEvaluation as Record<string, unknown>) ?? {});
+  const cust = hasRow
+    ? asJson(queueRow.customizations)
+    : ((state.customizations as Record<string, unknown>) ?? {});
+  const sp = hasRow
+    ? asJson(queueRow.selected_products)
+    : ((state.selectedProducts as Record<string, unknown>) ?? {});
+  const px = asJson(cust.perplexity);
+  const nlm = asJson(cust.notebookLM);
 
   const manifest: ManifestResponse = {
-    topic: (state.topic as string) ?? "",
+    topic,
     userContext: {
       domainKnowledge: (uc.domainKnowledge as string[]) ?? [],
       constraints: (uc.constraints as string[]) ?? [],
       additionalUrls: (uc.additionalUrls as string[]) ?? [],
       claimsToVerify: (uc.claimsToVerify as string[]) ?? [],
-      // MRPF PUBLISH gate (S118 Codex MERGE-gate HIGH; S120 Defect C fix): a
-      // Clone & Edit of a publish-bound parent must default the new run's
-      // checkbox CHECKED, not drop it. The S118 fix read only
-      // state.userContext.publishRequired — which the worker NEVER writes — a
-      // no-op that silently downgraded every clone (confirmed live, job
-      // 97906d8c). The fix ORs every available source through the canonical
-      // strict predicate: the authoritative DB user_context (covers normal
-      // runs + the exact 97906d8c shape), the top-level state flag (covers
-      // legacy storage-only runs with no queue row), and the legacy state echo.
-      // Stays user-EDITABLE (default, not sticky) — a clone for internal
-      // follow-up can still uncheck it.
+      // MRPF PUBLISH gate (S118 Codex HIGH; S120 Defect C): a Clone & Edit of a
+      // publish-bound parent must default the new run's checkbox CHECKED, not
+      // drop it. Route every available source through the canonical strict
+      // predicate: the authoritative DB user_context (queueRow.user_context),
+      // the top-level state flag (legacy storage-only runs, no queue row), and
+      // the legacy state.userContext echo. Stays user-EDITABLE (default, not
+      // sticky). Uses the STATE userContext for the echo arg, not the merged
+      // `uc`, so DB-vs-state sources stay independent in the OR.
       publishRequired: resolveClonePublishRequired({
-        queueRowUserContext: attachRowUserContext,
+        queueRowUserContext:
+          (queueRow?.user_context as { publishRequired?: unknown } | null | undefined) ?? null,
         statePublishRequired: state.publish_required,
-        stateUserContextPublishRequired: uc.publishRequired,
+        stateUserContextPublishRequired: ucState.publishRequired,
       }),
     },
     vendorEvaluation: {
@@ -191,12 +215,13 @@ export async function GET(
       maxVendorsDiscovered: (ve.maxVendorsDiscovered as number) ?? 10,
       maxVendorsEnriched: (ve.maxVendorsEnriched as number) ?? 5,
     },
-    // aji_dna_enabled is snake_case in state.json (worker pipeline) but ajiDnaEnabled
-    // in the form schema. Map here.
-    ajiDnaEnabled:
-      (state.aji_dna_enabled as boolean | undefined) ??
-      (state.ajiDnaEnabled as boolean | undefined) ??
-      false,
+    // aji_dna_enabled is snake_case on the DB row + in state.json (worker
+    // pipeline) but ajiDnaEnabled in the form schema. Map here.
+    ajiDnaEnabled: hasRow
+      ? !!(queueRow.aji_dna_enabled as boolean | undefined)
+      : (((state.aji_dna_enabled as boolean | undefined) ??
+          (state.ajiDnaEnabled as boolean | undefined)) ??
+        false),
     selectedProducts: {
       audio: !!sp.audio,
       video: !!sp.video,
@@ -220,10 +245,12 @@ export async function GET(
       },
       studio: (cust.studio as Record<string, Record<string, unknown>>) ?? {},
     },
+    // notifyEmail intentionally left blank — not part of the prompt-edit prefill,
+    // and leaving the email out of the manifest response avoids exposing it.
     notifyEmail: "",
     attachments,
     parentSlug: slug,
-    parentTopic: (state.topic as string) ?? "",
+    parentTopic: topic,
   };
 
   return Response.json(manifest, { headers: orgHeaders });
