@@ -1,91 +1,66 @@
 /**
- * S141 — unit tests for the studio_only snapshot-diff resolution
- * (agent/lib/studio-snapshot-diff.ts). Covers the fail-closed anti-S31
- * contract: reliable vs degraded snapshot × null/parseable/stale created_at ×
- * ambiguity. These are the cases the MERGE-gate reviewers reasoned about
- * (Gemini MAJOR: chained-failure wrong-artifact; grounded subagent: no
- * false-success path).
+ * S142 — unit tests for studio_only id-primary resolution
+ * (agent/lib/studio-snapshot-diff.ts). The resolver matches OUR generate-submit
+ * task_id exactly against the COMPLETED artifact list. Because that id is unique
+ * per generation, this is immune to the concurrent-foreign class (a foreign
+ * artifact on a shared parent notebook can never equal our submit id); an
+ * unparseable submit id resolves to null so the caller fails closed.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createdAtMs, freshCompleted } from "../lib/studio-snapshot-diff.js";
+import { resolveBySubmitId, hasUsableSubmitId } from "../lib/studio-snapshot-diff.js";
 import type { NlmArtifactRef } from "../lib/studio-completeness.js";
 
-const FLOOR = Date.parse("2026-06-17T12:00:00Z");
-const AFTER = "2026-06-17T12:05:00Z"; // > floor
-const BEFORE = "2026-06-17T11:50:00Z"; // < floor
+const AFTER = "2026-06-17T12:05:00Z";
+const BEFORE = "2026-06-17T11:50:00Z";
 
 function art(id: string, created_at: string): NlmArtifactRef {
   return { id, title: `title-${id}`, created_at };
 }
 
-test("createdAtMs parses ISO and rejects junk", () => {
-  assert.equal(createdAtMs(art("a", AFTER)), Date.parse(AFTER));
-  assert.equal(createdAtMs({ id: "a", title: "t", created_at: "" }), null);
-  assert.equal(createdAtMs({ id: "a", title: "t", created_at: "not-a-date" }), null);
+test("hasUsableSubmitId: real id usable; null / empty / (unparsed) sentinel are not", () => {
+  assert.equal(hasUsableSubmitId("00fbc0ac-d232-4ad4-bb33-b1738c9f9f17"), true);
+  assert.equal(hasUsableSubmitId(""), false);
+  assert.equal(hasUsableSubmitId(null), false);
+  assert.equal(hasUsableSubmitId(undefined), false);
+  assert.equal(hasUsableSubmitId("(unparsed)"), false);
 });
 
-test("reliable snapshot: a single new id after the floor resolves", () => {
-  const arts = [art("new", AFTER)];
-  const fresh = freshCompleted(arts, new Set(["old"]), FLOOR, true);
-  assert.deepEqual(fresh.map((a) => a.id), ["new"]);
+test("resolveBySubmitId: our submit id present in the completed list resolves THAT artifact", () => {
+  const arts = [art("ours-id", AFTER), art("foreign-id", AFTER)];
+  assert.equal(resolveBySubmitId(arts, "ours-id")?.id, "ours-id");
 });
 
-test("reliable snapshot: an id already in the before-set is NOT fresh", () => {
-  const arts = [art("old", AFTER)];
-  const fresh = freshCompleted(arts, new Set(["old"]), FLOOR, true);
-  assert.deepEqual(fresh, []);
+test("CRITICAL: a foreign artifact (started after our snapshot, completed first) is NOT resolved — its id ≠ our submit id", () => {
+  // The Codex S141/S142 concurrent-foreign case: on a shared parent notebook the
+  // completed list holds only a foreign artifact while OURS still renders. Its id
+  // can never equal our unique submit id → null → the caller keeps waiting for
+  // OUR id (never a wrong download).
+  const arts = [art("foreign-started-after-snapshot", AFTER)];
+  assert.equal(resolveBySubmitId(arts, "ours-still-processing"), null);
 });
 
-test("reliable snapshot: provably-new id with NO created_at is admitted", () => {
-  // not in before-set on a reliable snapshot ⇒ genuinely new; null date is fine.
-  const arts: NlmArtifactRef[] = [{ id: "new", title: "t", created_at: "" }];
-  const fresh = freshCompleted(arts, new Set(["old"]), FLOOR, true);
-  assert.deepEqual(fresh.map((a) => a.id), ["new"]);
+test("resolveBySubmitId: ours not yet completed (absent from completed list) → null (keep waiting)", () => {
+  const arts = [art("old-parent-completed", BEFORE)];
+  assert.equal(resolveBySubmitId(arts, "ours-still-processing"), null);
 });
 
-test("reliable snapshot: a new-but-STALE parseable date is rejected (defense-in-depth)", () => {
-  const arts = [art("new", BEFORE)];
-  const fresh = freshCompleted(arts, new Set(["old"]), FLOOR, true);
-  assert.deepEqual(fresh, []);
+test("resolveBySubmitId: unparseable / missing submit id → null (caller fails closed)", () => {
+  const arts = [art("something", AFTER)];
+  assert.equal(resolveBySubmitId(arts, "(unparsed)"), null);
+  assert.equal(resolveBySubmitId(arts, null), null);
+  assert.equal(resolveBySubmitId(arts, ""), null);
 });
 
-test("DEGRADED snapshot: stale parent artifact (parseable, < floor) rejected — no S31", () => {
-  // before-set empty because the snapshot failed; floor must do all the work.
-  const arts = [art("stale-parent", BEFORE)];
-  const fresh = freshCompleted(arts, new Set(), FLOOR, false);
-  assert.deepEqual(fresh, []);
+test("resolveBySubmitId: strict equality only — a prefix of our id does NOT match", () => {
+  // NLM CLI supports partial-id matching elsewhere; resolution must NOT, or a
+  // foreign artifact whose id is a prefix/superstring could be mistaken for ours.
+  const arts = [art("00fbc0ac", AFTER), art("00fbc0ac-d232-4ad4-bb33-b1738c9f9f17-EXTRA", AFTER)];
+  assert.equal(resolveBySubmitId(arts, "00fbc0ac-d232-4ad4-bb33-b1738c9f9f17"), null);
 });
 
-test("DEGRADED snapshot: artifact with NULL created_at is REJECTED — the Gemini MAJOR fix", () => {
-  // The chained-failure that would otherwise reintroduce S31: empty before-set
-  // + unparseable date. Must be rejected (unprovable freshness → fail-closed).
-  const arts: NlmArtifactRef[] = [{ id: "ghost", title: "t", created_at: "" }];
-  const fresh = freshCompleted(arts, new Set(), FLOOR, false);
-  assert.deepEqual(fresh, []);
-});
-
-test("DEGRADED snapshot: a genuinely-new artifact after the floor still resolves", () => {
-  const arts = [art("new", AFTER)];
-  const fresh = freshCompleted(arts, new Set(), FLOOR, false);
-  assert.deepEqual(fresh.map((a) => a.id), ["new"]);
-});
-
-test("ambiguity: TWO new completed ids both surface (caller fail-closes on >1)", () => {
-  const arts = [art("new1", AFTER), art("new2", AFTER)];
-  const fresh = freshCompleted(arts, new Set(["old"]), FLOOR, true);
-  assert.equal(fresh.length, 2, "both returned so the caller can detect ambiguity and refuse to guess");
-});
-
-test("empty id is never fresh", () => {
-  const arts: NlmArtifactRef[] = [{ id: "", title: "t", created_at: AFTER }];
-  assert.deepEqual(freshCompleted(arts, new Set(), FLOOR, true), []);
-  assert.deepEqual(freshCompleted(arts, new Set(), FLOOR, false), []);
-});
-
-test("created_at exactly AT the floor is admitted (>= boundary)", () => {
-  const atFloor = new Date(FLOOR).toISOString();
-  const arts = [art("edge", atFloor)];
-  assert.deepEqual(freshCompleted(arts, new Set(), FLOOR, false).map((a) => a.id), ["edge"]);
+test("resolveBySubmitId: picks the exact id even when other completed artifacts exist", () => {
+  const arts = [art("other-1", AFTER), art("ours", AFTER), art("other-2", BEFORE)];
+  assert.equal(resolveBySubmitId(arts, "ours")?.id, "ours");
 });

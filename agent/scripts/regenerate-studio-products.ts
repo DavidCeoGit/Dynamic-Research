@@ -28,19 +28,17 @@
  * The parent_run_id pointer (CE-1) is the lineage link. Surfacing v1/v2 of a
  * product side-by-side in ONE gallery is a documented v2 enhancement.
  *
- * S141 — Layer 1 snapshot-diff poll + download-by-id port.
- *   This path previously polled `notebooklm artifact poll <taskId>`, which lies
- *   `in_progress` even AFTER an artifact renders (S129/S135 cap-stall), and
- *   downloaded BARE `download <type>` = NLM default-latest = the S31
- *   wrong-artifact bug. Both are now closed by porting the full-pipeline Layer 1
- *   contract (~/.claude/commands/research-compare.md, S138) into this script:
- *   snapshot each product type's completed-artifact ids BEFORE generation, then
- *   resolve each product's NEW completed artifact by DIFFING the type's
- *   completed list against that snapshot (created_at-floor-filtered), persist the
- *   resolved id to state.artifacts[product], and DOWNLOAD BY ID (`-a <id>`).
- *   The list+download seams are reused verbatim from the worker's shipped,
- *   MERGE-gate-reviewed studio-completeness.ts (realListArtifacts /
- *   realDownloadArtifact — status_id===3, `-a`, backslash-path fallback).
+ * Resolution history (S129 → S142). This path once polled `notebooklm artifact
+ *   poll <taskId>`, which lies `in_progress` even AFTER an artifact renders
+ *   (S129/S135 cap-stall), and downloaded BARE `download <type>` = NLM
+ *   default-latest = the S31 wrong-artifact bug. S141 replaced the lying poll
+ *   with a SNAPSHOT-DIFF against `artifact list` + download-by-id; S142 then
+ *   replaced the snapshot-diff ENTIRELY with an exact submit-task_id match (see
+ *   the S142 note below), because the diff could not distinguish OUR artifact
+ *   from a concurrent FOREIGN one on a shared notebook. The list+download seams
+ *   are still reused verbatim from the worker's shipped, MERGE-gate-reviewed
+ *   studio-completeness.ts (realListArtifacts / realDownloadArtifact —
+ *   status_id===3, `-a`, backslash-path fallback).
  *
  *   Backstop difference vs the full pipeline: studio_only is its OWN executor
  *   exit path (runStudioOnly) and is NOT wrapped by the S136 Layer-2 cap-kill
@@ -49,6 +47,21 @@
  *   an unresolved or AMBIGUOUS product rides its own per-product poll timeout and
  *   then fails the run (the executor failJobs it) — we NEVER guess an artifact id
  *   (that would reintroduce S31). A partial set is already a failed run below.
+ *
+ * S142 — concurrent-FOREIGN exact-1 CLOSED (Codex S141 CRITICAL + its residual).
+ *   Resolution is an exact submit-task_id match ONLY: the NLM
+ *   `generate <type> --json` task_id IS the eventual Artifact.id for every product
+ *   type (grounded-verified in the CLI source — all types route through
+ *   `_call_generate`; `_parse_generation_result` returns `task_id = result[0][0]`;
+ *   `Artifact.from_api_response` sets `id = data[0]`; the full-pipeline poll loop
+ *   resolves identically). Since that id is unique per generation, a CONCURRENT or
+ *   FOREIGN artifact on the SHARED parent notebook can never equal ours — matching
+ *   by id is immune to the entire concurrent-foreign class (both the
+ *   already-in-flight-at-snapshot one AND the starts-after-snapshot residual). The
+ *   S141 snapshot-diff was REMOVED: without our submit id it cannot prove
+ *   ours-vs-foreign, so it could only ever guess (a guess that grabs a foreign
+ *   exactly-1 is the bug). If `generate --json` ever yields no parseable task_id,
+ *   that product FAILS CLOSED at launch (we never guess) — see §5.
  */
 
 import * as fs from "node:fs/promises";
@@ -63,7 +76,7 @@ import {
   realDownloadArtifact,
   type NlmArtifactRef,
 } from "../lib/studio-completeness.js";
-import { freshCompleted } from "../lib/studio-snapshot-diff.js";
+import { resolveBySubmitId, hasUsableSubmitId } from "../lib/studio-snapshot-diff.js";
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -260,10 +273,12 @@ function buildInstruction(
 //
 // `generate <type> ... --json` returns a task id; the exact JSON shape isn't
 // contractually fixed, so try the common field names, then fall back to a
-// raw-text regex before giving up. S141: the submit task_id is now LOG-ONLY —
-// completion + download are resolved by snapshot-diff against `artifact list`,
-// because the submit id is an ALIAS that `artifact poll` reports `in_progress`
-// on forever after render (S129/S135). We keep extracting it purely for traceability.
+// raw-text regex before giving up. S142: this submit task_id IS the eventual
+// Artifact.id (CLI source: `_parse_generation_result` returns `result[0][0]`,
+// the same value `Artifact.from_api_response` sets as `id = data[0]`), so it is
+// the SOLE resolution key — the completed artifact whose `id` equals it is ours.
+// (The S129/S135 "lying poll" was the `artifact poll` ENDPOINT returning stale
+// `in_progress`; it never meant the id itself differed.)
 
 function extractTaskId(stdout: string): string | null {
   try {
@@ -299,14 +314,14 @@ function compactTimestamp(d = new Date()): string {
   );
 }
 
-// ── Snapshot-diff resolution ────────────────────────────────────────
+// ── Artifact resolution ─────────────────────────────────────────────
 //
-// realListArtifacts returns ONLY status_id===3 (COMPLETED) artifacts, newest-
-// first. So an artifact that is NEW vs the pre-generation snapshot AND passes
-// the created_at floor is, in one shot, both resolved (we know its id) and done
-// (it is in the completed list). We never trust the lying `artifact poll`.
-// The pure decision logic lives in ../lib/studio-snapshot-diff.ts (unit-tested
-// without self-executing this script); `freshCompleted` is imported above.
+// realListArtifacts returns ONLY status_id===3 (COMPLETED) artifacts. The one
+// whose `id` equals our submit task_id is, in one shot, both resolved (it is
+// ours) and done (it is in the completed list). We never trust the lying
+// `artifact poll`. The pure decision logic lives in
+// ../lib/studio-snapshot-diff.ts (unit-tested without self-executing this
+// script); `resolveBySubmitId` is imported above.
 
 // ── Main ────────────────────────────────────────────────────────────
 
@@ -501,49 +516,13 @@ async function main(): Promise<void> {
     );
   }
 
-  // 4.5. S141 Layer 1 — PRE-GENERATION SNAPSHOT. For each selected product,
-  //      record the set of completed-artifact ids that ALREADY exist for its
-  //      type, BEFORE we launch any generate. The run floor (now − 5s skew
-  //      buffer) is captured before the snapshot reads so a freshly-rendered
-  //      artifact's created_at can never fall below it. A definitively-failed
-  //      list (3 tries) degrades to an EMPTY before-set — the created_at floor
-  //      then guards against admitting a stale prior-run artifact.
-  const runFloorMs = Date.now() - 5_000;
-  const beforeIds: Record<string, Set<string>> = {};
-  // Whether the snapshot for each product SUCCEEDED. A degraded (failed-3×)
-  // snapshot makes the before-diff non-authoritative, so freshCompleted must
-  // then prove freshness by the created_at floor alone (Gemini MERGE MAJOR).
-  const snapshotOk: Record<string, boolean> = {};
-  for (const product of products) {
-    const def = PRODUCT_DEFS[product];
-    let ids: string[] | null = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const arts = realListArtifacts(notebookId, def.cliType);
-      if (arts) {
-        ids = arts.map((a) => a.id).filter(Boolean);
-        break;
-      }
-      await sleep(3_000);
-    }
-    beforeIds[product] = new Set(ids ?? []);
-    snapshotOk[product] = ids !== null;
-    if (ids === null) {
-      console.error(
-        `[studio-only] WARN: snapshot list for ${product} failed after 3 tries — ` +
-          `before-set EMPTY + DEGRADED; freshness now requires a parseable created_at ` +
-          `≥ floor ${runFloorMs} (fail-closed, never the S31 wrong artifact)`,
-      );
-    }
-  }
-  console.log(
-    `[studio-only] snapshot floor=${runFloorMs} before=` +
-      JSON.stringify(Object.fromEntries(products.map((p) => [p, beforeIds[p].size]))),
-  );
-
   // 5. Launch every selected product's generate (fast — returns a task_id).
   //    5s spacing between launches avoids server-side queue congestion (Bug 20).
-  //    The returned task_id is LOG-ONLY now (S141) — completion is detected by
-  //    snapshot-diff, not by polling this (lying) id.
+  //    The returned task_id IS the eventual Artifact.id (S142) — it is the sole
+  //    resolution key. A generate that succeeds but yields NO parseable task_id
+  //    cannot be safely resolved on a shared parent notebook (snapshot-diff would
+  //    have to guess and could grab a concurrent foreign artifact), so that product
+  //    FAILS CLOSED here rather than risk the S31 wrong-artifact bug.
   await writeState("5.5", `Launching ${products.length} Studio product(s)`);
   interface Task {
     product: string;
@@ -563,10 +542,19 @@ async function main(): Promise<void> {
       launchFailures.push(`${product}: generate exited ${gen.status} — ${(gen.stderr || gen.stdout).slice(0, 200)}`);
       continue;
     }
-    const taskId = extractTaskId(gen.stdout) ?? "(unparsed)";
+    const taskId = extractTaskId(gen.stdout);
+    if (!hasUsableSubmitId(taskId)) {
+      // No id to match → fail-closed (never guess via snapshot-diff). Should be
+      // rare: generate --json returns {task_id} via _parse_generation_result.
+      launchFailures.push(
+        `${product}: generate succeeded but --json had no parseable task_id — cannot resolve safely (fail-closed)`,
+      );
+      console.error(`[studio-only]   ✗ ${product}: no parseable submit task_id — failing closed`);
+      continue;
+    }
     // 30s poll interval → polls needed = minutes * 2.
-    tasks.push({ product, cliType: def.cliType, taskId, maxPolls: def.maxPollMin * 2 });
-    console.log(`[studio-only]   → launched ${product} (submit task ${taskId}, log-only)`);
+    tasks.push({ product, cliType: def.cliType, taskId: taskId!, maxPolls: def.maxPollMin * 2 });
+    console.log(`[studio-only]   → launched ${product} (submit task ${taskId})`);
     await sleep(5_000);
   }
 
@@ -574,12 +562,16 @@ async function main(): Promise<void> {
     await fail(`no products could be launched. ${launchFailures.join(" | ")}`);
   }
 
-  // 6. Unified poll loop (S141 snapshot-diff). Each cycle, for every still-
-  //    running task: list the type's COMPLETED artifacts, diff against the
-  //    snapshot + floor. A unique new completed artifact = resolved AND done
-  //    in one shot → persist its id → download BY ID → upload. 30s between cycles.
-  //    AMBIGUOUS (>1 new) or not-yet-surfaced (0 new) products keep waiting and
-  //    FAIL-CLOSED at their per-product timeout — we never guess an id (S31).
+  // 6. Poll loop (S142 id-only). Each cycle, for every still-running task: list
+  //    the type's COMPLETED artifacts and resolve the one whose id EQUALS our
+  //    submit task_id (the generate-submit id IS the Artifact.id for every product
+  //    type — a unique per-generation id that can never collide with a foreign/
+  //    concurrent artifact on the shared parent notebook → immune to the S141
+  //    concurrent-foreign CRITICAL and its starts-after-snapshot residual). Our id
+  //    not yet in the completed list means OUR artifact is still rendering → keep
+  //    waiting; a product still unresolved at its per-product timeout FAILS CLOSED.
+  //    There is NO snapshot-diff guess — that is what reintroduced S31. (Every task
+  //    here has a usable submit id; §5 fails closed at launch on an unparsed one.)
   const POLL_INTERVAL_MS = 30_000;
   const done = new Set<string>();
   const failedProducts: string[] = [...launchFailures];
@@ -604,34 +596,23 @@ async function main(): Promise<void> {
         console.error(`[studio-only] cycle ${cycle} | ${task.product}: artifact list error — retry next cycle`);
         continue;
       }
-      const fresh = freshCompleted(
-        arts,
-        beforeIds[task.product] ?? new Set(),
-        runFloorMs,
-        snapshotOk[task.product] ?? false,
-      );
 
-      if (fresh.length === 0) {
-        console.log(`[studio-only] cycle ${cycle} | ${task.product}: awaiting completion (none new yet)`);
-        continue;
-      }
-      if (fresh.length > 1) {
-        // Two+ new completed artifacts of this type since the snapshot. Studio
-        // launched exactly one generate per product, so this is a concurrent
-        // run / reused notebook. Do NOT guess (S31) — keep waiting; the product
-        // fails-closed at its timeout rather than risk downloading the wrong file.
-        console.error(
-          `[studio-only] cycle ${cycle} | ${task.product}: AMBIGUOUS — ${fresh.length} new completed ids ` +
-            `[${fresh.map((a) => a.id).join(", ")}] — NOT guessing; will fail-closed at timeout`,
+      // Exact submit-id match (deterministic; immune to concurrent-foreign).
+      const winner = resolveBySubmitId(arts, task.taskId);
+      if (!winner) {
+        console.log(
+          `[studio-only] cycle ${cycle} | ${task.product}: awaiting completion ` +
+            `(submit id ${task.taskId} not yet in completed list)`,
         );
         continue;
       }
+      console.log(
+        `[studio-only] cycle ${cycle} | ${task.product}: completed → artifact ${winner.id} (submit-id match)`,
+      );
 
-      const winner = fresh[0];
       // Persist the resolved id immediately (fail-closed diagnostics + the
       // expectedArtifactId a future studio_only completeness gate would read).
       resolvedArtifacts[task.product] = { task_id: winner.id };
-      console.log(`[studio-only] cycle ${cycle} | ${task.product}: completed → artifact ${winner.id}`);
       const result = await downloadAndUpload(task, winner, sb, timestamp);
       if (result.ok) {
         // Only on successful UPLOAD does the gallery count this product complete.
