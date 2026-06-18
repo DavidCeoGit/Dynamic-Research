@@ -31,6 +31,41 @@
 
 import type { NlmArtifactRef } from "./studio-completeness.js";
 
+/**
+ * S142 PRIMARY resolution — the completed artifact whose id equals OUR
+ * generate-submit task_id, or null if it has not completed yet / no usable
+ * submit id.
+ *
+ * The NotebookLM `generate <type> --json` task_id IS the eventual `Artifact.id`
+ * for EVERY product type (verified empirically across audio/video/slides/report/
+ * infographic from a live run's submit-*.json vs the artifact list ids; the
+ * library documents it at notebooklm/types.py GenerationStatus, and the
+ * full-pipeline poll loop resolves the same way — `id == task_id`). Because the
+ * id is unique per generation, a CONCURRENT or FOREIGN artifact on a shared
+ * parent notebook can NEVER equal our submit id. So whenever the submit id is
+ * parseable, this is the sole, deterministic resolver and it is IMMUNE to every
+ * concurrent-foreign case the snapshot-diff is vulnerable to (Codex S141
+ * CRITICAL + its residual). The caller falls back to snapshot-diff ONLY when the
+ * submit id could not be parsed.
+ *
+ * `arts` is the COMPLETED list (realListArtifacts, status_id===3), so a non-null
+ * return is BOTH "this is ours" AND "it is done." A null return on a parseable
+ * id means our artifact is still rendering → keep waiting (never snapshot-diff,
+ * which could grab a foreign exactly-1 during the render window).
+ */
+export function resolveBySubmitId(
+  arts: NlmArtifactRef[],
+  submitTaskId: string | null | undefined,
+): NlmArtifactRef | null {
+  if (!submitTaskId || submitTaskId === "(unparsed)") return null;
+  return arts.find((a) => a.id === submitTaskId) ?? null;
+}
+
+/** Whether a submit task_id is usable for resolveBySubmitId (parseable, real). */
+export function hasUsableSubmitId(submitTaskId: string | null | undefined): boolean {
+  return !!submitTaskId && submitTaskId !== "(unparsed)";
+}
+
 /** created_at → epoch ms, or null if absent/unparseable (mirror of
  * studio-completeness.ts artifactCreatedAtMs, which is not exported). */
 export function createdAtMs(a: NlmArtifactRef): number | null {

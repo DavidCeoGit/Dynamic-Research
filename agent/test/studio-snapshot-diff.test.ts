@@ -15,7 +15,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createdAtMs, freshCompleted } from "../lib/studio-snapshot-diff.js";
+import {
+  createdAtMs,
+  freshCompleted,
+  resolveBySubmitId,
+  hasUsableSubmitId,
+} from "../lib/studio-snapshot-diff.js";
 import type { NlmArtifactRef } from "../lib/studio-completeness.js";
 
 const FLOOR = Date.parse("2026-06-17T12:00:00Z");
@@ -121,4 +126,39 @@ test("S142: OURS resolves even when a foreign in-flight artifact also completes 
   const beforeAll = new Set(["foreign"]);
   const fresh = freshCompleted(arts, beforeAll, FLOOR, true);
   assert.deepEqual(fresh.map((a) => a.id), ["ours"]);
+});
+
+// ── S142 — PRIMARY resolver: exact submit-task_id match (closes the residual) ──
+
+test("hasUsableSubmitId: real id usable; null / empty / (unparsed) sentinel are not", () => {
+  assert.equal(hasUsableSubmitId("00fbc0ac-d232"), true);
+  assert.equal(hasUsableSubmitId(""), false);
+  assert.equal(hasUsableSubmitId(null), false);
+  assert.equal(hasUsableSubmitId(undefined), false);
+  assert.equal(hasUsableSubmitId("(unparsed)"), false);
+});
+
+test("resolveBySubmitId: our submit id present in the completed list resolves THAT artifact", () => {
+  const arts = [art("ours-id", AFTER), art("foreign-id", AFTER)];
+  assert.equal(resolveBySubmitId(arts, "ours-id")?.id, "ours-id");
+});
+
+test("resolveBySubmitId CRITICAL: a foreign exactly-1 is NOT resolved — its id ≠ our submit id", () => {
+  // Codex S141 residual (foreign starts AFTER snapshot, completes before ours):
+  // the completed list holds only the foreign artifact, but it can never match
+  // our unique submit id → null → caller keeps waiting for OUR id (never a wrong download).
+  const arts = [art("foreign-started-after-snapshot", AFTER)];
+  assert.equal(resolveBySubmitId(arts, "ours-still-processing"), null);
+});
+
+test("resolveBySubmitId: ours not yet completed (absent from completed list) → null (keep waiting)", () => {
+  const arts = [art("old-completed", BEFORE)];
+  assert.equal(resolveBySubmitId(arts, "ours-still-processing"), null);
+});
+
+test("resolveBySubmitId: unparseable / missing submit id → null (caller uses snapshot-diff fallback)", () => {
+  const arts = [art("something", AFTER)];
+  assert.equal(resolveBySubmitId(arts, "(unparsed)"), null);
+  assert.equal(resolveBySubmitId(arts, null), null);
+  assert.equal(resolveBySubmitId(arts, ""), null);
 });

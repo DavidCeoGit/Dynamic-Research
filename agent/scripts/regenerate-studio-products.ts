@@ -50,16 +50,19 @@
  *   then fails the run (the executor failJobs it) — we NEVER guess an artifact id
  *   (that would reintroduce S31). A partial set is already a failed run below.
  *
- * S142 — concurrent-FOREIGN exact-1 hardening (Codex S141 CRITICAL). The S141
- *   snapshot was COMPLETED-only, so a foreign generation of the same type that
- *   was already IN-PROGRESS on the SHARED parent notebook at our start was not in
- *   the before-set; when it finished it was the only "new" completed id and got
- *   resolved as ours. The snapshot is now ALL-STATUS (realListAllArtifactIds —
- *   includes in-progress/pending), so already-in-flight foreign work is excluded.
- *   A degraded (failed-3×) snapshot now fully fail-closes (resolves nothing) —
- *   closing Codex's degraded "widening edge." Residual (narrowed, not closed): a
- *   foreign generate that STARTS strictly after our snapshot — still guarded by
- *   the >1-new fail-closed rule when both artifacts complete.
+ * S142 — concurrent-FOREIGN exact-1 CLOSED (Codex S141 CRITICAL + its residual).
+ *   PRIMARY resolution is now an exact submit-task_id match: the NLM
+ *   `generate <type> --json` task_id IS the eventual Artifact.id for every product
+ *   type (verified across audio/video/slides/report/infographic; the full-pipeline
+ *   poll loop resolves identically). Since that id is unique per generation, a
+ *   CONCURRENT or FOREIGN artifact on the SHARED parent notebook can never equal
+ *   ours — resolving by id is immune to every concurrent-foreign case (both the
+ *   already-in-flight-at-snapshot one AND the starts-after-snapshot residual). The
+ *   snapshot-diff (now ALL-STATUS — realListAllArtifactIds — with a fully
+ *   fail-closed degraded path) is retained ONLY as a fallback for the rare case
+ *   where the submit id could not be parsed. When the submit id IS parseable we
+ *   wait for OUR exact id and never fall back to snapshot-diff (which could grab a
+ *   foreign exactly-1 during the render window).
  */
 
 import * as fs from "node:fs/promises";
@@ -75,7 +78,11 @@ import {
   realDownloadArtifact,
   type NlmArtifactRef,
 } from "../lib/studio-completeness.js";
-import { freshCompleted } from "../lib/studio-snapshot-diff.js";
+import {
+  freshCompleted,
+  resolveBySubmitId,
+  hasUsableSubmitId,
+} from "../lib/studio-snapshot-diff.js";
 
 // ── Args ────────────────────────────────────────────────────────────
 
@@ -592,12 +599,19 @@ async function main(): Promise<void> {
     await fail(`no products could be launched. ${launchFailures.join(" | ")}`);
   }
 
-  // 6. Unified poll loop (S141 snapshot-diff). Each cycle, for every still-
-  //    running task: list the type's COMPLETED artifacts, diff against the
-  //    snapshot + floor. A unique new completed artifact = resolved AND done
-  //    in one shot → persist its id → download BY ID → upload. 30s between cycles.
-  //    AMBIGUOUS (>1 new) or not-yet-surfaced (0 new) products keep waiting and
-  //    FAIL-CLOSED at their per-product timeout — we never guess an id (S31).
+  // 6. Unified poll loop (S142 id-primary, S141 snapshot-diff fallback). Each
+  //    cycle, for every still-running task: list the type's COMPLETED artifacts.
+  //    PRIMARY — if we have a parseable submit task_id, resolve the completed
+  //    artifact whose id EQUALS it (the generate-submit id IS the Artifact.id for
+  //    every product type; a unique per-generation id can never collide with a
+  //    foreign/concurrent artifact → immune to the S141 concurrent-foreign
+  //    CRITICAL and its residual). A submit id that is not yet in the completed
+  //    list means OUR artifact is still rendering → keep waiting; we do NOT fall
+  //    back to snapshot-diff there (that could grab a foreign exactly-1 during the
+  //    render window). FALLBACK — only when the submit id was unparseable, use the
+  //    all-status snapshot-diff (S142): a unique new completed id (created_at-floor
+  //    + before-set filtered) resolves; AMBIGUOUS (>1 new) or not-yet-surfaced
+  //    keep waiting and FAIL-CLOSED at the per-product timeout (never guess; S31).
   const POLL_INTERVAL_MS = 30_000;
   const done = new Set<string>();
   const failedProducts: string[] = [...launchFailures];
@@ -622,34 +636,53 @@ async function main(): Promise<void> {
         console.error(`[studio-only] cycle ${cycle} | ${task.product}: artifact list error — retry next cycle`);
         continue;
       }
-      const fresh = freshCompleted(
-        arts,
-        beforeAllIds[task.product] ?? new Set(),
-        runFloorMs,
-        snapshotOk[task.product] ?? false,
-      );
 
-      if (fresh.length === 0) {
-        console.log(`[studio-only] cycle ${cycle} | ${task.product}: awaiting completion (none new yet)`);
-        continue;
-      }
-      if (fresh.length > 1) {
-        // Two+ new completed artifacts of this type since the snapshot. Studio
-        // launched exactly one generate per product, so this is a concurrent
-        // run / reused notebook. Do NOT guess (S31) — keep waiting; the product
-        // fails-closed at its timeout rather than risk downloading the wrong file.
-        console.error(
-          `[studio-only] cycle ${cycle} | ${task.product}: AMBIGUOUS — ${fresh.length} new completed ids ` +
-            `[${fresh.map((a) => a.id).join(", ")}] — NOT guessing; will fail-closed at timeout`,
+      let winner: NlmArtifactRef;
+      if (hasUsableSubmitId(task.taskId)) {
+        // PRIMARY — exact submit-id match (deterministic; immune to concurrent-foreign).
+        const byId = resolveBySubmitId(arts, task.taskId);
+        if (!byId) {
+          console.log(
+            `[studio-only] cycle ${cycle} | ${task.product}: awaiting completion ` +
+              `(submit id ${task.taskId} not yet in completed list)`,
+          );
+          continue;
+        }
+        winner = byId;
+        console.log(
+          `[studio-only] cycle ${cycle} | ${task.product}: completed → artifact ${winner.id} (submit-id match)`,
         );
-        continue;
+      } else {
+        // FALLBACK — submit id was unparseable; resolve via all-status snapshot-diff.
+        const fresh = freshCompleted(
+          arts,
+          beforeAllIds[task.product] ?? new Set(),
+          runFloorMs,
+          snapshotOk[task.product] ?? false,
+        );
+        if (fresh.length === 0) {
+          console.log(`[studio-only] cycle ${cycle} | ${task.product}: awaiting completion (none new yet; no submit id)`);
+          continue;
+        }
+        if (fresh.length > 1) {
+          // Two+ new completed artifacts of this type since the snapshot, and no
+          // submit id to disambiguate. Concurrent run / reused notebook. Do NOT
+          // guess (S31) — keep waiting; fails-closed at the per-product timeout.
+          console.error(
+            `[studio-only] cycle ${cycle} | ${task.product}: AMBIGUOUS — ${fresh.length} new completed ids ` +
+              `[${fresh.map((a) => a.id).join(", ")}] + no submit id — NOT guessing; will fail-closed at timeout`,
+          );
+          continue;
+        }
+        winner = fresh[0];
+        console.log(
+          `[studio-only] cycle ${cycle} | ${task.product}: completed → artifact ${winner.id} (snapshot-diff fallback, no submit id)`,
+        );
       }
 
-      const winner = fresh[0];
       // Persist the resolved id immediately (fail-closed diagnostics + the
       // expectedArtifactId a future studio_only completeness gate would read).
       resolvedArtifacts[task.product] = { task_id: winner.id };
-      console.log(`[studio-only] cycle ${cycle} | ${task.product}: completed → artifact ${winner.id}`);
       const result = await downloadAndUpload(task, winner, sb, timestamp);
       if (result.ok) {
         // Only on successful UPLOAD does the gallery count this product complete.
