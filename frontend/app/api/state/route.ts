@@ -6,12 +6,13 @@
  * caller's org. With slug: returns state.json for the specified project.
  *
  * S29 hotfix: normalize the state so missing nested fields don't throw.
- * S56 Phase 2 — org resolution via per-request getOrgContextDualPath().
+ * S146 Phase 4 — org resolved from the SESSION via requireOrgOr401() (the
+ * Phase-2 env fallback is retired); an unauthenticated request returns 401.
  *
  * S92 v4 org-scoped hide: the no-slug "latest across all projects" path skips
- * runs hidden for the resolved org (env or session), fetched via service-role
- * scoped to the org — so a hidden newest run does not leak into the dashboard
- * summary. The WITH-slug direct-link path is deliberately NOT filtered.
+ * runs hidden for the resolved org, fetched via service-role scoped to the org —
+ * so a hidden newest run does not leak into the dashboard summary. The WITH-slug
+ * direct-link path is deliberately NOT filtered.
  */
 
 import {
@@ -20,7 +21,7 @@ import {
   listFiles,
   readStateJson,
 } from "@/lib/storage";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -92,8 +93,9 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const slugParam = searchParams.get("slug");
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   // ── Slug-specific lookup (NOT hide-filtered — direct access by URL) ──
   if (slugParam) {
@@ -101,16 +103,16 @@ export async function GET(request: Request) {
     if (!stateFilename) {
       return Response.json(
         { error: `No state.json found for project: ${slugParam}` },
-        { status: 404, headers: orgHeaders },
+        { status: 404 },
       );
     }
     try {
       const state = await readStateJson(orgId, slugParam, stateFilename);
-      return Response.json(normalizeState(state as StateLike), { headers: orgHeaders });
+      return Response.json(normalizeState(state as StateLike));
     } catch (err) {
       return Response.json(
         { error: "Failed to read state.json", detail: String(err) },
-        { status: 500, headers: orgHeaders },
+        { status: 500 },
       );
     }
   }
@@ -122,12 +124,12 @@ export async function GET(request: Request) {
   } catch (err) {
     return Response.json(
       { error: "Failed to list projects", detail: String(err) },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 
-  // Exclude runs hidden for this org (env or session) so a hidden newest run
-  // does not surface in the dashboard summary. Service-role, org-scoped.
+  // Exclude runs hidden for this org so a hidden newest run does not surface in
+  // the dashboard summary. Service-role, org-scoped.
   try {
     const supabase = getSupabase();
     const { data } = await supabase
@@ -143,7 +145,7 @@ export async function GET(request: Request) {
   if (slugs.length === 0) {
     return Response.json(
       { error: "No projects found in storage" },
-      { status: 404, headers: orgHeaders },
+      { status: 404 },
     );
   }
 
@@ -169,17 +171,17 @@ export async function GET(request: Request) {
   if (!newestSlug || !newestFilename) {
     return Response.json(
       { error: "No state.json found in any project" },
-      { status: 404, headers: orgHeaders },
+      { status: 404 },
     );
   }
 
   try {
     const state = await readStateJson(orgId, newestSlug, newestFilename);
-    return Response.json(normalizeState(state as StateLike), { headers: orgHeaders });
+    return Response.json(normalizeState(state as StateLike));
   } catch (err) {
     return Response.json(
       { error: "Failed to read state.json", detail: String(err) },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 }

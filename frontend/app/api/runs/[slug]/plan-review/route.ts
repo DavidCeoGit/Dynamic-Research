@@ -4,22 +4,19 @@
  * S60 — surfaces the plan-review gate state (per migration
  * 20260527_plan_review_gate.sql §1) for a given run slug, so the
  * runs/[slug]/page.tsx UI can render a derived-display banner from the
- * (status, plan_review_status) tuple. Phase 2 will add reviewer-call
- * details + finding rendering; this endpoint is intentionally minimal
- * for dark-launch.
+ * (status, plan_review_status) tuple.
  *
  * S60.3 — also returns `topic` so the page can show a meaningful
- * "pending pickup" view when state.json hasn't been written yet (the
- * window between queue-row insert and worker-claim → first state.json
- * write).
+ * "pending pickup" view when state.json hasn't been written yet.
  *
- * Cross-tenant boundary: `.eq('organization_id', orgId)` is load-bearing
- * — research_queue is queried directly (not via storage-path scoping).
- * Pattern matches /api/queue/route.ts + /api/queue/[id]/route.ts.
+ * S146 Phase 4 — org resolved from the SESSION via requireOrgOr401() (the
+ * Phase-2 env fallback is retired); unauthenticated → 401. Cross-tenant
+ * boundary: `.eq('organization_id', orgId)` is load-bearing — research_queue is
+ * queried directly (not via storage-path scoping).
  */
 
 import { getSupabase } from "@/lib/supabase";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -39,8 +36,9 @@ export async function GET(
 ) {
   const { slug } = await params;
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   const supabase = getSupabase();
   const { data, error } = await supabase
@@ -55,14 +53,14 @@ export async function GET(
   if (error) {
     return Response.json(
       { error: "Failed to query research_queue", detail: error.message },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 
   if (!data) {
     return Response.json(
       { error: `No queue row found for slug in your org: ${slug}` },
-      { status: 404, headers: orgHeaders },
+      { status: 404 },
     );
   }
 
@@ -79,5 +77,5 @@ export async function GET(
     plan_review_error: (data.plan_review_error as string | null) ?? null,
   };
 
-  return Response.json(body, { headers: orgHeaders });
+  return Response.json(body);
 }

@@ -5,24 +5,18 @@
  * new-research wizard can pre-fill from `?clone=<slug>`.
  *
  * S133 prefill fix — the form fields (topic, userContext.*, customizations.*,
- * selectedProducts, vendorEvaluation, ajiDnaEnabled) are now sourced from the
+ * selectedProducts, vendorEvaluation, ajiDnaEnabled) are sourced from the
  * **research_queue row** (the authoritative, form-shaped record the submit
  * route wrote), NOT state.json. The worker's state.json stores only a SHORT
- * 52-char title in `topic` and OMITS userContext/customizations entirely, so
- * the old state.json-sourced manifest filled the topic box with a title and
- * left every customization field blank. The row carries the full prompt — the
- * same columns replay/route.ts reads. For legacy storage-only runs whose queue
- * row was deleted (storage remains), we FALL BACK to state.json per-field, so
- * the S56 "clone still works when the queue row is gone" guarantee holds.
+ * 52-char title in `topic` and OMITS userContext/customizations entirely. For
+ * legacy storage-only runs whose queue row was deleted (storage remains), we
+ * FALL BACK to state.json per-field.
  *
- * S56 Phase 2 — replaces resolveOrgForSlug stopgap with session-or-env
- * orgId from getOrgContextDualPath(). Cross-tenant isolation is the
- * storage path prefix <orgId>/<slug>/ in projectExists + findStateFile +
- * readStateJson, AND the .eq("organization_id", orgId) tenant boundary on
- * the research_queue read below — a user with org-A's session/env can never
- * resolve a path or a row under org-B/. No research_queue existence gate
- * (Gemini F1, S56 — that check would have blocked legacy runs whose queue
- * row was deleted but storage remained; the row read here is best-effort).
+ * S146 Phase 4 — org resolved from the SESSION via requireOrgOr401() (the
+ * Phase-2 env fallback is retired); unauthenticated → 401. Cross-tenant
+ * isolation is the storage path prefix <orgId>/<slug>/ in projectExists +
+ * findStateFile + readStateJson, AND the .eq("organization_id", orgId) tenant
+ * boundary on the research_queue read below.
  */
 
 import {
@@ -30,7 +24,7 @@ import {
   readStateJson,
   projectExists,
 } from "@/lib/storage";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 import { resolveClonePublishRequired } from "@/lib/publish-flag";
 import type { AttachmentMeta } from "@/lib/types/queue";
@@ -94,22 +88,20 @@ export async function GET(
 ) {
   const { slug } = await params;
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   const exists = await projectExists(orgId, slug);
   if (!exists) {
-    return Response.json(
-      { error: `Run not found: ${slug}` },
-      { status: 404, headers: orgHeaders },
-    );
+    return Response.json({ error: `Run not found: ${slug}` }, { status: 404 });
   }
 
   const stateFilename = await findStateFile(orgId, slug);
   if (!stateFilename) {
     return Response.json(
       { error: `No state.json found for run: ${slug}` },
-      { status: 404, headers: orgHeaders },
+      { status: 404 },
     );
   }
 
@@ -119,7 +111,7 @@ export async function GET(
   } catch (err) {
     return Response.json(
       { error: "Failed to read state.json", detail: String(err) },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 
@@ -147,7 +139,7 @@ export async function GET(
   if (rowErr) {
     return Response.json(
       { error: "Failed to read run row", detail: rowErr.message },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
   const attachments: AttachmentMeta[] =
@@ -253,5 +245,5 @@ export async function GET(
     parentTopic: topic,
   };
 
-  return Response.json(manifest, { headers: orgHeaders });
+  return Response.json(manifest);
 }

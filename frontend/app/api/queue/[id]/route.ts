@@ -1,16 +1,17 @@
 /**
- * GET  /api/queue/[id] — Poll job status (user-facing, session/env scoped)
+ * GET  /api/queue/[id] — Poll job status (user-facing, session-scoped)
  * PATCH /api/queue/[id] — Update job progress (agent only, X-Agent-Key)
  *
- * S56 Phase 2 — GET adds .eq('organization_id', orgId) so users can only
- * poll jobs in their own org (Pattern A per design §4.1). PATCH is the
- * worker's progress-update path and stays on X-Agent-Key auth — proxy.ts
- * §2.5 short-circuits PATCH so it never reaches the session layer.
+ * S146 Phase 4 — GET resolves org from the SESSION via requireOrgOr401()
+ * (the Phase-2 env fallback is retired) and keeps .eq('organization_id', orgId)
+ * so users can only poll jobs in their own org; unauthenticated → 401. PATCH is
+ * the worker's progress-update path and stays on X-Agent-Key auth — proxy.ts
+ * short-circuits PATCH so it never reaches the session layer.
  */
 
 import { getSupabase } from "@/lib/supabase";
 import { agentUpdateSchema } from "@/lib/validate";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -22,8 +23,9 @@ export async function GET(
 ) {
   const { id } = await params;
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   const supabase = getSupabase();
   const { data, error } = await supabase
@@ -36,17 +38,14 @@ export async function GET(
   if (error) {
     return Response.json(
       { error: "Failed to fetch job", detail: error.message },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
   if (!data) {
-    return Response.json(
-      { error: "Job not found" },
-      { status: 404, headers: orgHeaders },
-    );
+    return Response.json({ error: "Job not found" }, { status: 404 });
   }
 
-  return Response.json(data, { headers: orgHeaders });
+  return Response.json(data);
 }
 
 // ── PATCH — Agent progress update ───────────────────────────────────
