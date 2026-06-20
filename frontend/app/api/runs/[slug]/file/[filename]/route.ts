@@ -10,20 +10,18 @@
  *   signed URL) for media — a cross-origin `<a download>` is otherwise ignored
  *   and media opens inline (S132 Bug-1). Inline viewers omit the param.
  *
- * S56 Phase 2 — replaces resolveOrgForSlug stopgap with session-or-env
- * orgId from getOrgContextDualPath(). Cross-tenant isolation is the storage
- * path prefix <orgId>/<slug>/<filename> in scopedStoragePath +
- * projectExists + getSignedUrl — a user with org-A's session/env can never
- * resolve a path under org-B/. No research_queue DB check (Gemini F1, S56).
- * Early-400 path-traversal response carries X-Org-Source:none for
- * telemetry completeness (Gemini F3, S56).
+ * S146 Phase 4 — org resolved from the SESSION via requireOrgOr401() (the
+ * Phase-2 env fallback is retired); unauthenticated → 401. Cross-tenant
+ * isolation is the storage path prefix <orgId>/<slug>/<filename> in
+ * scopedStoragePath + projectExists + getSignedUrl — a user with org-A's session
+ * can never resolve a path under org-B/. No research_queue DB check (Gemini F1).
  */
 
 import { getSignedUrl, projectExists } from "@/lib/storage";
 import { scopedStoragePath } from "@/lib/storage-paths";
 import { CONTENT_TYPE_MAP, isTextFile } from "@/lib/files";
 import { getSupabase } from "@/lib/supabase";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -37,21 +35,19 @@ export async function GET(
 
   // ── Validate filename (no path traversal) ──────────────────
   if (filename.includes("/") || filename.includes("\\") || filename.includes("..")) {
-    return Response.json(
-      { error: "Invalid filename" },
-      { status: 400, headers: { "X-Org-Source": "none" } },
-    );
+    return Response.json({ error: "Invalid filename" }, { status: 400 });
   }
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   // ── Verify project exists ──────────────────────────────────
   const exists = await projectExists(orgId, slug);
   if (!exists) {
     return Response.json(
       { error: `Project not found: ${slug}` },
-      { status: 404, headers: orgHeaders },
+      { status: 404 },
     );
   }
 
@@ -69,7 +65,7 @@ export async function GET(
       if (error) {
         return Response.json(
           { error: `File not found: ${filename}` },
-          { status: 404, headers: orgHeaders },
+          { status: 404 },
         );
       }
 
@@ -79,13 +75,12 @@ export async function GET(
         headers: {
           "Content-Type": contentType,
           "Cache-Control": "public, max-age=60",
-          "X-Org-Source": source,
         },
       });
     } catch (err) {
       return Response.json(
         { error: "Failed to download file", detail: String(err) },
-        { status: 500, headers: orgHeaders },
+        { status: 500 },
       );
     }
   }
@@ -105,13 +100,12 @@ export async function GET(
       headers: {
         Location: signedUrl,
         "Cache-Control": "private, max-age=3500",
-        "X-Org-Source": source,
       },
     });
   } catch (err) {
     return Response.json(
       { error: "Failed to generate signed URL", detail: String(err) },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 }

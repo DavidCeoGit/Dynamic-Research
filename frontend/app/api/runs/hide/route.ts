@@ -2,8 +2,7 @@
  * POST   /api/runs/hide   — hide one or more runs from the org's view
  * DELETE /api/runs/hide   — unhide (restore to the org's view)
  *
- * v4 (S92): ORG-SCOPED soft hide that works on the env-fallback path (the live
- * dashboard has no session). UI-only, reversible, non-destructive.
+ * v4 (S92): ORG-SCOPED soft hide. UI-only, reversible, non-destructive.
  *
  * S93: extended to FAILED + CANCELLED queue jobs (the Active Pipelines section).
  * A completed run is a STORAGE slug; a failed/cancelled job is a research_queue
@@ -22,13 +21,9 @@
  * Storage `.list()` calls for a full bulk body (Gemini MAJOR residual). The
  * realistic caller ("Hide all completed") hides slugs the gallery just listed,
  * so one `listProjects(orgId)` — which shares the gallery's 10s cache — resolves
- * them with zero-to-one Storage calls. Slugs absent from that set (org with
- * runs beyond `listProjects`'s first-100 `name asc` window, or a run created
- * after the 10s cache snapshot) fall back to a bounded per-slug `projectExists`,
- * so a large org can't silently drop a valid target. Cost: the common
- * gallery-visible case collapses ~500 calls -> 1; the worst case (no target in
- * the first-100 window) is 1 + the v2 fallback (still concurrency-8 + 500-capped,
- * so never worse than v2).
+ * them with zero-to-one Storage calls. Slugs absent from that set fall back to a
+ * bounded per-slug `projectExists`, so a large org can't silently drop a valid
+ * target.
  *
  * Equivalence note (Codex MINOR, S95): `listProjects` membership is FOLDER-PREFIX
  * existence (`<org>/<slug>/` exists as a prefix), whereas `projectExists` is
@@ -42,12 +37,13 @@
  * and never a false NEGATIVE (a real owned run is never dropped).
  *
  * Invariants (v4 MERGE-gate review, Gemini->Codex; S93 extends the same shape):
- *  - Org context via getOrgContextDualPath() (env or session) — the SAME tenant
- *    boundary the dashboard reads use. NOT requireOrgContext() (which would 401
- *    the env path and make hide unusable).
+ *  - S146 Phase 4: org context via requireOrgOr401() (SESSION; the Phase-2 env
+ *    fallback is retired). Hide now REQUIRES a session — an unauthenticated
+ *    request returns 401 rather than mutating the SYSTEM_DEFAULT_ORG's hidden
+ *    set. This is the intended Phase-4 posture: the dashboard is no longer
+ *    anonymously reachable, so there is no anonymous hide to support.
  *  - DB via the service-role client (getSupabase), ALWAYS scoped
- *    .eq("organization_id", orgId). The env path has no auth.uid(), so the RLS/
- *    anon client cannot be used; RLS on the table is enabled with no policies
+ *    .eq("organization_id", orgId). RLS on the table is enabled with no policies
  *    (service-role-only). Route-level org-scoping is the load-bearing boundary.
  *  - No user_id (table is org-scoped). onConflict "organization_id,slug".
  *  - Rate-limited FIRST (before body parse): 429 + Retry-After + X-RateLimit-Remaining.
@@ -58,7 +54,7 @@
  * See Documentation/runs-hide-from-view-env-path-revision.md +
  *     Documentation/runs-hide-failed-cancelled-peer-review.md.
  */
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 import { listProjects, projectExists } from "@/lib/storage";
 import { parseHideBody, partitionHideTargets } from "@/lib/hidden-runs";
@@ -163,7 +159,9 @@ export async function POST(request: Request) {
   const limited = await rateLimited(request);
   if (limited) return limited;
 
-  const { orgId } = await getOrgContextDualPath();
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   const targets = await readSlugs(request);
   if (targets instanceof Response) return targets;
@@ -223,7 +221,9 @@ export async function DELETE(request: Request) {
   const limited = await rateLimited(request);
   if (limited) return limited;
 
-  const { orgId } = await getOrgContextDualPath();
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   const slugs = await readSlugs(request);
   if (slugs instanceof Response) return slugs;

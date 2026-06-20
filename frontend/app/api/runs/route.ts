@@ -4,13 +4,13 @@
  * Returns { runs, hiddenCount, canHide } for every project that contains a
  * state.json in the caller's organization.
  *
- * v4 (S92): ORG-SCOPED hide that works on the env-fallback path. The hidden set
- * is fetched for the resolved org ALWAYS (env or session) via the service-role
- * client, scoped .eq("organization_id", orgId). `canHide` is always true — the
- * dashboard can always hide within its resolved org. `?show_hidden=1` includes
- * hidden runs annotated `hidden: true`.
+ * v4 (S92): ORG-SCOPED hide. The hidden set is fetched for the resolved org via
+ * the service-role client, scoped .eq("organization_id", orgId). `canHide` is
+ * always true — the dashboard can always hide within its org. `?show_hidden=1`
+ * includes hidden runs annotated `hidden: true`.
  *
- * S56 Phase 2 — org resolution via per-request getOrgContextDualPath().
+ * S146 Phase 4 — org resolved from the SESSION via requireOrgOr401() (the
+ * Phase-2 env fallback is retired); an unauthenticated request returns 401.
  */
 
 import {
@@ -19,7 +19,7 @@ import {
   listFiles,
   readStateJson,
 } from "@/lib/storage";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -41,8 +41,9 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const showHidden = searchParams.get("show_hidden") === "1";
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   let slugs: string[];
   try {
@@ -50,12 +51,12 @@ export async function GET(request: Request) {
   } catch (err) {
     return Response.json(
       { error: "Failed to list projects", detail: String(err) },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 
-  // Org-scoped hidden set — fetched ALWAYS (env or session) via service-role,
-  // explicitly scoped to the resolved org (the load-bearing tenant boundary).
+  // Org-scoped hidden set — fetched via service-role, explicitly scoped to the
+  // resolved org (the load-bearing tenant boundary).
   let hiddenSlugs = new Set<string>();
   try {
     const supabase = getSupabase();
@@ -105,8 +106,5 @@ export async function GET(request: Request) {
   // Most recent first
   summaries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 
-  return Response.json(
-    { runs: summaries, hiddenCount, canHide: true },
-    { headers: orgHeaders },
-  );
+  return Response.json({ runs: summaries, hiddenCount, canHide: true });
 }

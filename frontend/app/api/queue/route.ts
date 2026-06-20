@@ -7,37 +7,34 @@
  * Validates inputs via Zod, generates a unique slug, calculates
  * estimated completion time, and inserts into research_queue.
  *
- * S56 Phase 2 — per design §4.1 (Pattern A) + §4.4 (Codex C-C1 BLOCKING fix
- * for cross-tenant parent_run_id leak):
+ * S146 Phase 4 — org resolved from the SESSION via requireOrgOr401() (the
+ * Phase-2 env fallback is retired); an unauthenticated request returns 401.
+ * Because reaching the handler body now implies an authenticated session, the
+ * former `source !== "session"` attachment guard is gone (it can never fire).
  *
- *   1. Derive orgId FIRST via getOrgContextDualPath() — before any DB lookup.
+ *   1. Derive orgId FIRST via requireOrgOr401() — before any DB lookup.
  *   2. Parent slug → parent_run_id lookup adds .eq('organization_id', orgId)
- *      so a user cannot reference another org's run as a parent.
+ *      so a user cannot reference another org's run as a parent (§4.4 C-C1).
  *   3. Insert adds explicit `organization_id: orgId` — replaces reliance on
  *      the Phase A schema DEFAULT (which Phase 5 will DROP).
- *   4. studio_only error message updated to reflect same-org scope.
- *   5. GET filters .eq('organization_id', orgId) so users only see jobs in
+ *   4. GET filters .eq('organization_id', orgId) so users only see jobs in
  *      their own org.
  *
- * S93 — GET now returns { jobs, hiddenCount, canHide } (was a bare array),
- * mirroring /api/runs. Failed/cancelled jobs the org has hidden (a row in
- * user_hidden_runs keyed by the job UUID) are filtered out unless ?show_hidden=1,
- * in which case they are returned annotated `hidden: true`. The hidden set is
- * org-scoped via the service-role client — the SAME tenant boundary as the
- * list query itself.
+ * S93 — GET returns { jobs, hiddenCount, canHide } (was a bare array),
+ * mirroring /api/runs. Failed/cancelled jobs the org has hidden are filtered
+ * out unless ?show_hidden=1, in which case they are returned annotated
+ * `hidden: true`. The hidden set is org-scoped via the service-role client.
  *
  * Note: unlike the storage routes, the queue routes query research_queue
  * directly (no storage-path scoping). The .eq('organization_id', orgId)
  * IS the cross-tenant boundary here — load-bearing, not redundant.
- * Early-400 responses (invalid JSON, Zod failures) carry X-Org-Source:none
- * for telemetry completeness (Gemini F3, S56).
  */
 
 import { getSupabase } from "@/lib/supabase";
 import { researchJobPayloadSchema, generateSlug } from "@/lib/validate";
 import { estimateMinutes } from "@/lib/estimates";
 import type { SelectedProducts, AttachmentMeta } from "@/lib/types/queue";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 import { clientIp, checkRateLimit } from "@/lib/rate-limit";
 import {
   verifyAndCopyAttachments,
@@ -52,31 +49,23 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return Response.json(
-      { error: "Invalid JSON body" },
-      { status: 400, headers: { "X-Org-Source": "none" } },
-    );
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
   const parsed = researchJobPayloadSchema.safeParse(body);
   if (!parsed.success) {
     return Response.json(
       { error: "Validation failed", details: parsed.error.flatten() },
-      { status: 400, headers: { "X-Org-Source": "none" } },
+      { status: 400 },
     );
   }
 
-  // S102/Phase-2 attachments: the S103 fail-CLOSED guard that lived here is now
-  // REPLACED by real staging→sources verify+copy. That work runs further down,
-  // AFTER the slug and parent_run_id are resolved (the copy destination is
-  // <orgId>/<slug>/sources/, and parent-origin files copy out of the parent
-  // run's sources/). See the "attachments verify+copy" block before the insert.
-
-  // §4.4 (C-C1): derive orgId FIRST, before any DB lookup. The parent
-  // lookup in step 2 below depends on knowing the caller's org so it can
-  // refuse cross-org parent references.
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  // §4.4 (C-C1): derive orgId FIRST, before any DB lookup. The parent lookup
+  // below depends on knowing the caller's org so it can refuse cross-org parent
+  // references. Phase 4: session-only; unauthenticated → 401.
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   const data = parsed.data;
 
@@ -84,13 +73,9 @@ export async function POST(request: Request) {
   // the same verify+copy storage fan-out as replay (up to 5 copies + audit
   // rows per call) whenever it carries staging attachments OR a parentSlug
   // (origin:"parent" carry-overs copied out of the parent run's sources/).
-  // Replay gained a per-IP limiter for exactly this; submit was the open
-  // path. GATED on copy-bearing submits only (the audit's amplifier is the
-  // copy fan-out, which a text-only submit never triggers) so the common
-  // path never draws from the shared 20-token/IP bucket — a wizard flow
-  // already spends ~extract + generate + N mints, and the terminal submit
-  // must not 429 (review S109). Plain text submits stay unthrottled here,
-  // matching the route's pre-feature behavior.
+  // GATED on copy-bearing submits only so the common text-only path never
+  // draws from the shared 20-token/IP bucket (a wizard flow already spends
+  // ~extract + generate + N mints, and the terminal submit must not 429).
   const triggersCopyFanout =
     (Array.isArray(data.attachments) && data.attachments.length > 0) ||
     typeof data.parentSlug === "string";
@@ -99,13 +84,7 @@ export async function POST(request: Request) {
     if (!rl.allowed) {
       return Response.json(
         { error: "Rate limit exceeded", detail: `Try again in ${rl.retryAfterSec}s.` },
-        {
-          status: 429,
-          headers: {
-            "Retry-After": String(rl.retryAfterSec),
-            "X-Org-Source": "none",
-          },
-        },
+        { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
       );
     }
   }
@@ -121,9 +100,8 @@ export async function POST(request: Request) {
   // S35 Clone & Edit — if parentSlug present, resolve to UUID for the
   // parent_run_id FK. Unknown slug for a full-pipeline submission is fine
   // (the user's brief is still valid); but for studio_only it's fatal —
-  // the worker needs the parent's NLM notebook id and would otherwise be
-  // told to do something it cannot do. .maybeSingle() avoids the .single()
-  // zero-rows throw (S33 adversarial #11).
+  // the worker needs the parent's NLM notebook id. .maybeSingle() avoids the
+  // .single() zero-rows throw (S33 adversarial #11).
   //
   // §4.4 (C-C1 BLOCKING): same-org scope. Without .eq('organization_id', orgId)
   // a user could craft a studio-only POST referencing another org's run; the
@@ -146,7 +124,7 @@ export async function POST(request: Request) {
     if (parentLookupError) {
       return Response.json(
         { error: "Failed to resolve parent run", detail: parentLookupError.message },
-        { status: 500, headers: orgHeaders },
+        { status: 500 },
       );
     }
     parentRunId = parentRow?.id ?? null;
@@ -166,30 +144,23 @@ export async function POST(request: Request) {
           "Studio-only regeneration requires the parent run to have an active queue row (with the parent NLM notebook) in your organization. The slug you provided does not match any research_queue.topic_slug owned by your org. Re-submit as a full pipeline, or pick a different parent run.",
         parentSlug: data.parentSlug ?? null,
       },
-      { status: 400, headers: orgHeaders },
+      { status: 400 },
     );
   }
 
   // pipeline_mode is NOT NULL with a 'full' default and CHECK ('full',
-  // 'studio_only'); we always write an explicit string (an explicit NULL
-  // would fail the constraint — DEFAULT only applies on column omission).
+  // 'studio_only'); we always write an explicit string.
   const pipelineMode: "full" | "studio_only" =
     parentRunId && data.pipelineMode === "studio_only" ? "studio_only" : "full";
 
   // Attachments verify+copy (Phase 2). Run AFTER slug + parent resolution and
   // BEFORE the insert, so the run folder is self-contained and a failed copy is
-  // retry-safe (no row references the slug). Session-required: an env-fallback
-  // submit cannot own staged bytes (the mint route is session-only), so reject
-  // attachments unless org came from a real session. On any verify/copy failure
-  // we return that status and insert NO row.
+  // retry-safe (no row references the slug). Reaching here implies an
+  // authenticated session (Phase 4: the env path that could not own staged
+  // bytes no longer exists), so no separate session check is needed. On any
+  // verify/copy failure we return that status and insert NO row.
   let verifiedAttachments: AttachmentMeta[] = [];
   if (data.attachments.length > 0) {
-    if (source !== "session") {
-      return Response.json(
-        { error: "Authentication required to submit attachments" },
-        { status: 401, headers: orgHeaders },
-      );
-    }
     const copyResult = await verifyAndCopyAttachments({
       orgId,
       newSlug: slug,
@@ -201,7 +172,7 @@ export async function POST(request: Request) {
     if (!copyResult.ok) {
       return Response.json(
         { error: "Attachment processing failed", detail: copyResult.error },
-        { status: copyResult.status ?? 500, headers: orgHeaders },
+        { status: copyResult.status ?? 500 },
       );
     }
     verifiedAttachments = copyResult.verified ?? [];
@@ -238,16 +209,15 @@ export async function POST(request: Request) {
     }
     return Response.json(
       { error: "Failed to create job", detail: error.message },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 
   // Codex MERGE-gate MAJOR — the row is committed and the bytes now live under
   // <orgId>/<slug>/sources/, so the consumed staging copies are dead weight.
-  // Best-effort delete them now (never throws), bounding the common case; the
-  // Phase-3 24h TTL sweep is the backstop for ABANDONED drafts. Only
-  // staging-origin items have a staging object to reclaim; parent carry-overs
-  // must be left intact (they belong to the parent run).
+  // Best-effort delete them now (never throws); the Phase-3 24h TTL sweep is the
+  // backstop for ABANDONED drafts. Only staging-origin items have a staging
+  // object to reclaim; parent carry-overs must be left intact.
   if (data.attachmentsDraftId) {
     const stagedNames = data.attachments
       .filter((a) => a.origin === "staging")
@@ -257,7 +227,7 @@ export async function POST(request: Request) {
 
   return Response.json(
     { id: row.id, slug: row.topic_slug, estimatedMinutes: row.estimated_minutes },
-    { status: 201, headers: orgHeaders },
+    { status: 201 },
   );
 }
 
@@ -265,8 +235,9 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const showHidden = searchParams.get("show_hidden") === "1";
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   const supabase = getSupabase();
 
@@ -280,7 +251,7 @@ export async function GET(request: Request) {
   if (error) {
     return Response.json(
       { error: "Failed to fetch queue", detail: error.message },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 
@@ -313,8 +284,5 @@ export async function GET(request: Request) {
     jobs.push(isHidden ? { ...job, hidden: true } : job);
   }
 
-  return Response.json(
-    { jobs, hiddenCount, canHide: true },
-    { headers: orgHeaders },
-  );
+  return Response.json({ jobs, hiddenCount, canHide: true });
 }

@@ -5,16 +5,17 @@
  * the new run's slug so the client can navigate to `/runs/<new-slug>`.
  * Lineage: parentSlug on the new row points at the slug being replayed.
  *
- * S60.1 — optional body `{ selectedProducts: { audio, video, slides,
- * report, infographic } }` lets the caller override which Studio products
- * are generated. When absent or empty, the parent's selected_products
- * passes through unchanged. Lets dark-launch testing be cheap: replay
- * with only `report` checked instead of all 5.
+ * S60.1 — optional body `{ selectedProducts: {...} }` lets the caller override
+ * which Studio products are generated. When absent or empty, the parent's
+ * selected_products passes through unchanged.
  *
- * pipelineMode is always "full" for replay v1 (even if parent was
- * studio_only — that chain adds complexity not needed here). Insert
- * logic mirrors POST /api/queue intentionally; future refactor: extract
- * createJobFromPayload() helper.
+ * pipelineMode is always "full" for replay v1. Insert logic mirrors POST
+ * /api/queue intentionally.
+ *
+ * S146 Phase 4 — org resolved from the SESSION via requireOrgOr401() (the
+ * Phase-2 env fallback is retired); an unauthenticated request returns 401.
+ * Reaching the handler body implies an authenticated session, so the former
+ * `source !== "session"` attachment guard is gone (it can never fire).
  */
 
 import { getSupabase } from "@/lib/supabase";
@@ -25,7 +26,7 @@ import {
 } from "@/lib/validate";
 import { estimateMinutes } from "@/lib/estimates";
 import type { SelectedProducts, AttachmentMeta } from "@/lib/types/queue";
-import { getOrgContextDualPath } from "@/lib/auth";
+import { requireOrgOr401 } from "@/lib/auth";
 import { isPublishFlagSet } from "@/lib/publish-flag";
 import { verifyAndCopyAttachments, removeRunSources } from "@/lib/storage";
 import { mapDbAttachmentsToParentPayload } from "@/lib/attachments-copy";
@@ -56,12 +57,12 @@ export async function POST(
     );
   }
 
-  const { orgId, source } = await getOrgContextDualPath();
-  const orgHeaders = { "X-Org-Source": source };
+  const auth = await requireOrgOr401();
+  if (!auth.ok) return auth.res;
+  const { orgId } = auth;
 
   // Optional body — `{ selectedProducts?: {...} }`. Tolerate empty/no body
-  // so the bare-fetch case still works (current Replay flow before any
-  // override UI lands).
+  // so the bare-fetch case still works.
   let overrideSelectedProducts: SelectedProducts | undefined;
   try {
     const text = await request.text();
@@ -75,17 +76,14 @@ export async function POST(
               error: "Invalid selectedProducts override",
               details: parsed.error.flatten(),
             },
-            { status: 400, headers: orgHeaders },
+            { status: 400 },
           );
         }
         overrideSelectedProducts = parsed.data;
       }
     }
   } catch {
-    return Response.json(
-      { error: "Invalid JSON body" },
-      { status: 400, headers: orgHeaders },
-    );
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
   const supabase = getSupabase();
@@ -106,13 +104,13 @@ export async function POST(
   if (fetchErr) {
     return Response.json(
       { error: "Failed to fetch parent run", detail: fetchErr.message },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
   if (!parent) {
     return Response.json(
       { error: `No queue row found for slug in your org: ${slug}` },
-      { status: 404, headers: orgHeaders },
+      { status: 404 },
     );
   }
 
@@ -190,7 +188,7 @@ export async function POST(
           "Parent payload no longer validates against current schema; rerun via /new?clone=<slug> and resolve the offending fields manually.",
         details: parsed.error.flatten(),
       },
-      { status: 422, headers: orgHeaders },
+      { status: 422 },
     );
   }
   const data = parsed.data;
@@ -207,16 +205,10 @@ export async function POST(
 
   // §3b — verify the parent's attachments still exist under its sources/ and
   // copy them into the new run's sources/ BEFORE inserting the row (same
-  // submit-time verify+copy the /api/queue route uses). Session-required when
-  // attachments are present, mirroring submit. On any failure: no row inserted.
+  // submit-time verify+copy the /api/queue route uses). Reaching here implies
+  // an authenticated session (Phase 4). On any failure: no row inserted.
   let verifiedAttachments: AttachmentMeta[] = [];
   if (data.attachments.length > 0) {
-    if (source !== "session") {
-      return Response.json(
-        { error: "Authentication required to replay a run with attachments" },
-        { status: 401, headers: orgHeaders },
-      );
-    }
     const copyResult = await verifyAndCopyAttachments({
       orgId,
       newSlug,
@@ -228,7 +220,7 @@ export async function POST(
     if (!copyResult.ok) {
       return Response.json(
         { error: "Attachment processing failed", detail: copyResult.error },
-        { status: copyResult.status ?? 500, headers: orgHeaders },
+        { status: copyResult.status ?? 500 },
       );
     }
     verifiedAttachments = copyResult.verified ?? [];
@@ -263,7 +255,7 @@ export async function POST(
     }
     return Response.json(
       { error: "Failed to create replay job", detail: insertErr.message },
-      { status: 500, headers: orgHeaders },
+      { status: 500 },
     );
   }
 
@@ -273,6 +265,6 @@ export async function POST(
       slug: row.topic_slug,
       estimatedMinutes: row.estimated_minutes,
     },
-    { status: 201, headers: orgHeaders },
+    { status: 201 },
   );
 }
