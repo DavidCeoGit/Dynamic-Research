@@ -1,11 +1,11 @@
 # Phase 5 (parent-same-org trigger + executable RLS-bypass harness) — DESIGN-gate v3 (FINAL)
 
-> **Status:** DESIGN-gate **v3-FINAL — gate CLOSED**. Sequential MRPF: Gemini holistic-adversarial (BLOCK → integrated v2) → Codex grounded-adversarial (BLOCK → integrated v3) → Codex sequential-QA fidelity pass (BLOCK on **residual stale phrasing only** — all 5 substantive resolutions confirmed RESOLVED/correct; the 3 stale-text spots it enumerated at §exec-summary/§2.2/§2.3/§open-Q swept per the mechanical-fix fidelity-skip precedent). Authored 2026-06-20 UTC (S148). Companion audit trail: `Documentation/phase5-rls-canonicalization-design-gate-peer-review.md`.
+> **Status:** DESIGN-gate **v3-FINAL — gate CLOSED**. Sequential MRPF: Gemini holistic-adversarial (BLOCK → integrated v2) → Codex grounded-adversarial (BLOCK → integrated v3) → Codex sequential-QA fidelity pass (BLOCK on **residual stale phrasing only** — all 5 substantive resolutions confirmed RESOLVED/correct; the 3 stale-text spots it enumerated at §exec-summary/§2.2/§2.3/§open-Q swept per the mechanical-fix fidelity-skip precedent). Authored 2026-06-20 UTC (S148). Companion audit trail: `Documentation/phase5-parent-same-org-and-rls-harness-design-gate-peer-review.md`.
 >
 > **Implementation PARKED** for a human-present session (the migration is DATA + SECURITY, prod-affecting; the harness needs a non-prod target — open-Q #3). The eventual MERGE gate is a separate full tri-vendor gate per project §11.
 > **Target migration:** `supabase/migrations/<YYYYMMDD>_phase5_parent_same_org_trigger.sql` (implementation — PARKED for a human-present session; DATA + SECURITY, prod-affecting).
 > **Target harness:** `agent/scripts/test-ssr-auth-cutover.sh` (new; executable tenant-isolation proof).
-> **Companion peer-review file:** `Documentation/phase5-rls-canonicalization-design-gate-peer-review.md` (forthcoming — Gemini holistic-adversarial → Codex grounded-adversarial).
+> **Companion peer-review file:** `Documentation/phase5-parent-same-org-and-rls-harness-design-gate-peer-review.md` (forthcoming — Gemini holistic-adversarial → Codex grounded-adversarial).
 > **Predecessors:** Phase A — `20260522_phase_a_multi_tenancy.sql`; Phase B-1 — `20260523_phase_b_auth_rls_helpers.sql`; Phase B-2 — `20260602_phase_b_2_rls_enable.sql` (APPLIED, verified live S97).
 > **Relationship to "Phase C":** prior docs label the `SET NOT NULL` canonicalisation of `research_queue.organization_id` as "Phase C." That column canonicalisation is **explicitly OUT of scope here** (see §2.3) — B-2's `research_queue_org_id_not_null` CHECK already bridges it. "Phase 5" is this session's label for the next tenant-isolation hardening wave: the parent-same-org trigger + the executable RLS-bypass harness that were both deferred from the Phase B plan (`multi-tenancy-phase-b-plan.md` §6.2/§6.3).
 
@@ -420,7 +420,7 @@ v2 wrongly stated the harness inserts `auth.users` rows directly with a "known-g
 
 ## 7. MRPF classification
 
-- **Event Gate:** DESIGN (new DB trigger on the tenant boundary + a security test harness; architectural). → Gemini + Codex mandatory, sequential, both-lenses-adversarial. Companion `Documentation/phase5-rls-canonicalization-design-gate-peer-review.md`.
+- **Event Gate:** DESIGN (new DB trigger on the tenant boundary + a security test harness; architectural). → Gemini + Codex mandatory, sequential, both-lenses-adversarial. Companion `Documentation/phase5-parent-same-org-and-rls-harness-design-gate-peer-review.md`.
 - **Risk Labels:** SECURITY (tenant isolation — blocking semantics on CRITICAL), DATA (trigger gates `research_queue` inserts), ARCHITECTURE (tenant-boundary contract). AGENT BEHAVIOR / PRIVACY / INFRA / DEPENDENCY: no.
 - **Severity:** NORMAL.
 - **Topology:** Gemini holistic-adversarial (whole-artifact "strongest case to BLOCK") → integrate → Codex grounded-adversarial (file:line against the migrations/code this references) → integrate → v-final. Per project §11, the eventual **MERGE gate** for the migration is a separate full tri-vendor gate that must clear **before** any prod apply (agent/prod-deploy HARD RULE) — but Phase 5's migration is **PARKED** for a human-present session regardless.
@@ -436,5 +436,5 @@ v2 wrongly stated the harness inserts `auth.users` rows directly with a "known-g
 2. **God-mode GUC hardening scope** (§3.3, G-MAJ-1) — accept keeping the bare `app.allow_org_migration` GUC for Phase 5 (with the client-unreachability mitigation) and tracking the admin-gated-enabler hardening as a B-1-touching fast-follow, or insist the hardening lands *with* Phase 5?
 3. **Non-prod target provisioning** (§5.1) — v3 requires a NON-PROD Supabase project for the committed seed (users via Admin API, real storage objects). Does a suitable non-prod project/branch exist, or does Phase 5 implementation need to stand one up first? (This is now the harness's main prerequisite, replacing the resolved v2 `auth.users`-SQL-shape question — C-MAJ-1 settled it on the Admin API.)
 4. **Storage Tier-1 target** (§5.3) — run the required authenticated cross-org route probe against localhost dev (session-mint) only, or also against a non-prod deployed target? (Prod is excluded — no fixture orgs there.)
-5. **Naming** — the file is `phase5-rls-canonicalization-design.md` but the content is the trigger + harness (canonicalisation is OUT, §2.3). Keep the handoff-continuity name, or rename to `phase5-parent-same-org-and-rls-harness-design.md`?
+5. **Naming** — the file is `phase5-parent-same-org-and-rls-harness-design.md` but the content is the trigger + harness (canonicalisation is OUT, §2.3). Keep the handoff-continuity name, or rename to `phase5-parent-same-org-and-rls-harness-design.md`?
 ```

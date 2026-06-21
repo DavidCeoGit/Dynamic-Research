@@ -1,4 +1,4 @@
-# Phase 5 DESIGN-gate — peer-review synthesis (companion to `phase5-rls-canonicalization-design.md`)
+# Phase 5 DESIGN-gate — peer-review synthesis (companion to `phase5-parent-same-org-and-rls-harness-design.md`)
 
 > **Gate:** DESIGN. **Risk labels:** SECURITY (tenant isolation), DATA, ARCHITECTURE. **Severity:** NORMAL.
 > **Topology:** sequential, both-lenses-adversarial — Gemini holistic-adversarial → integrate (v2) → Codex grounded-adversarial → integrate (v3) → Codex sequential-QA fidelity → sweep → v3-FINAL.
