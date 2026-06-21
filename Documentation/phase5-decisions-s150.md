@@ -5,8 +5,8 @@
 > Phase 5 DESIGN gate (v3-FINAL, S148) so the eventual implementation session starts
 > warm. Authored 2026-06-21 (S150).
 >
-> **Source design:** `Documentation/phase5-rls-canonicalization-design.md` (v3-FINAL).
-> **Companion gate trail:** `Documentation/phase5-rls-canonicalization-design-gate-peer-review.md`.
+> **Source design:** `Documentation/phase5-parent-same-org-and-rls-harness-design.md` (v3-FINAL).
+> **Companion gate trail:** `Documentation/phase5-parent-same-org-and-rls-harness-design-gate-peer-review.md`.
 >
 > **Implementation remains PARKED** for a human-present session (the migration is
 > DATA + SECURITY, prod-irreversible). The eventual MERGE gate is a separate full
@@ -149,7 +149,7 @@ explicitly OUT of scope.
   reviewer prefers the extra clarity; either honors the intent.
 - **Execute the rename in the implementation session, not this one.** The physical
   `git mv` must be done together with a reference-sweep — the companion peer-review file
-  (`phase5-rls-canonicalization-design-gate-peer-review.md`), the
+  (`phase5-parent-same-org-and-rls-harness-design-gate-peer-review.md`), the
   `[[project_phase5_design_gate_s148]]` memory, and the handoff all point at the current
   name. Doing the rename now would either leave dangling references or trigger a
   multi-file churn cascade beyond this decisions-only scope. The implementation session
