@@ -114,6 +114,20 @@ function basePlan(depthTarget: DepthTarget = "practitioner"): ResearchPlan {
   };
 }
 
+// A structural hedge-bet: >=3 of {>10 vendors+0 exclusions, 0 risk_flags, 0
+// exclusions, thin rubric}. Strips basePlan to 0 exclusions + 0 risk_flags + empty
+// rubric_rationale (3 flags) so looksLikeHedgeBet() fires. Used to exercise the
+// THIRD ensurePersonaDepthFinding injection trigger (no score → structural check).
+function hedgeBetPlan(depthTarget: DepthTarget = "expert"): ResearchPlan {
+  const p = basePlan(depthTarget);
+  return {
+    ...p,
+    research_universe: { ...p.research_universe, explicit_exclusions: [] },
+    evaluation_framework: { ...p.evaluation_framework, rubric_rationale: "" },
+    risk_flags: [],
+  };
+}
+
 // ── decideTerminal() pure-function helpers ──────────────────────────
 
 function mkCall(
@@ -146,6 +160,18 @@ const MINOR = (origin: ReviewFinding["origin"], message = "m"): ReviewFinding =>
 const CRIT = (origin: ReviewFinding["origin"], message = "m"): ReviewFinding => ({
   severity: "CRITICAL",
   origin,
+  message,
+});
+// S155: a SYSTEM-injected MAJOR plan-ambition (injected:true) — the R2a anti-bypass
+// class (the persona-depth gate). Reviewer-AUTHORED findings use MAJOR()/MINOR()/CRIT()
+// (no injected flag) and route to R2b (corroboration-gated) / R4 / R5.
+const MAJOR_INJ = (
+  origin: ReviewFinding["origin"],
+  message = "m",
+): ReviewFinding => ({
+  severity: "MAJOR",
+  origin,
+  injected: true,
   message,
 });
 
@@ -205,10 +231,10 @@ describe("decideTerminal — severity-graded ladder", () => {
     assert.equal(d.reservations.length, 0);
   });
 
-  test("R2: any plan-ambition (anti-bypass) blocks even when other reviewer approves", () => {
+  test("R2a: an INJECTED MAJOR plan-ambition (system anti-bypass) blocks unconditionally even when other reviewer approves", () => {
     const d = decideTerminal([
       mkCall("gemini", "APPROVE", []),
-      mkCall("codex", "REQUEST_CHANGES", [MAJOR("plan-ambition")]),
+      mkCall("codex", "REQUEST_CHANGES", [MAJOR_INJ("plan-ambition")]),
     ]);
     assert.equal(d.rule, "R2");
     assert.equal(d.wouldApprove, false);
@@ -275,7 +301,7 @@ describe("decideTerminal — severity-graded ladder", () => {
       mkCall("gemini", "APPROVE", []),
       mkCall("codex", "REQUEST_CHANGES", [
         CRIT("topic"),
-        MAJOR("plan-ambition"),
+        MAJOR_INJ("plan-ambition"),
         MAJOR("scoring-rubric"),
         MAJOR("source-strategy"),
         MAJOR("vendor-evaluation"),
@@ -287,10 +313,10 @@ describe("decideTerminal — severity-graded ladder", () => {
   // ── S86 R2 anti-bypass severity refinement (design §3a, §7) ─────────
   // R2 fires only on MAJOR+ `plan-ambition`; organic MINOR notes fall through.
 
-  test("R2 (S86): MAJOR plan-ambition still blocks (injected-style invariant preserved)", () => {
+  test("R2a (S86/S155): an INJECTED MAJOR plan-ambition still blocks (persona-depth invariant preserved)", () => {
     const d = decideTerminal([
       mkCall("gemini", "APPROVE", []),
-      mkCall("codex", "REQUEST_CHANGES", [MAJOR("plan-ambition")]),
+      mkCall("codex", "REQUEST_CHANGES", [MAJOR_INJ("plan-ambition")]),
     ]);
     assert.equal(d.rule, "R2");
   });
@@ -362,6 +388,76 @@ describe("decideTerminal — severity-graded ladder", () => {
     assert.equal(d.reservations.length, 1);
     assert.equal(d.reservations[0]!.origin, "plan-ambition");
     assert.equal(d.reservations[0]!.severity, "MINOR");
+  });
+});
+
+// ── S155 R2 injected-vs-authored split (657161bb over-match fix) ────
+// decideTerminal now distinguishes the SYSTEM-injected anti-bypass (R2a,
+// unconditional = the persona-depth gate) from a reviewer-AUTHORED MAJOR+
+// plan-ambition (R2b, blocks only when corroborated by >=2 reviewers). A LONE
+// authored finding (the stochastic-mislabel case that false-blocked job 657161bb)
+// falls through to R4/R5 instead of hard-blocking.
+
+describe("decideTerminal — S155 R2 injected-vs-authored split", () => {
+  test("R2b: a LONE authored MAJOR plan-ambition no longer blocks — falls to R5 with the note surfaced (657161bb regression)", () => {
+    const d = decideTerminal([
+      mkCall("gemini", "APPROVE", []),
+      mkCall("codex", "REQUEST_CHANGES", [
+        MAJOR("plan-ambition", "cites unverified §4628(j)"),
+      ]),
+    ]);
+    assert.equal(d.rule, "R5");
+    assert.equal(d.wouldApprove, true);
+    assert.ok(
+      d.reservations.some(
+        (f) => f.origin === "plan-ambition" && f.severity === "MAJOR",
+      ),
+      "the lone authored MAJOR plan-ambition must survive as a reservation, not vanish",
+    );
+  });
+
+  test("correctly-labelled accuracy concern (authored MAJOR source-strategy) is advisory → R5", () => {
+    const d = decideTerminal([
+      mkCall("gemini", "APPROVE", []),
+      mkCall("codex", "REQUEST_CHANGES", [
+        MAJOR("source-strategy", "verify the §4628(j) citation"),
+      ]),
+    ]);
+    assert.equal(d.rule, "R5");
+    assert.ok(d.reservations.some((f) => f.origin === "source-strategy"));
+  });
+
+  test("R2b: CORROBORATED authored MAJOR plan-ambition (both reviewers each raise one) still blocks", () => {
+    const d = decideTerminal([
+      mkCall("gemini", "REQUEST_CHANGES", [
+        MAJOR("plan-ambition", "under-scoped for expert depth"),
+      ]),
+      mkCall("codex", "REQUEST_CHANGES", [
+        MAJOR("plan-ambition", "generic vendor list"),
+      ]),
+    ]);
+    assert.equal(d.rule, "R2");
+    assert.equal(d.wouldApprove, false);
+  });
+
+  test("R4: a lone authored MAJOR plan-ambition + 2 other authored MAJORs (3 total) → R4 volume bound", () => {
+    const d = decideTerminal([
+      mkCall("gemini", "APPROVE", []),
+      mkCall("codex", "REQUEST_CHANGES", [
+        MAJOR("plan-ambition", "lone authored ambition note"),
+        MAJOR("scoring-rubric"),
+        MAJOR("source-strategy"),
+      ]),
+    ]);
+    assert.equal(d.rule, "R4");
+  });
+
+  test("R2a outranks R2b: an INJECTED anti-bypass blocks with ONE reviewer (no corroboration required)", () => {
+    const d = decideTerminal([
+      mkCall("gemini", "APPROVE", []),
+      mkCall("codex", "REQUEST_CHANGES", [MAJOR_INJ("plan-ambition")]),
+    ]);
+    assert.equal(d.rule, "R2");
   });
 });
 
@@ -632,5 +728,143 @@ describe("reviewPlan — S86 injection guard (deficient persona + organic MINOR 
     });
     assert.equal(r.terminal_decision, "R2");
     assert.equal(r.status, "REQUEST_CHANGES");
+  });
+});
+
+// ── S155 keystone + non-forgeability (reviewPlan integration) ───────
+// The guard-swap to isInjectedAntiBypass is load-bearing: an AUTHORED MAJOR
+// plan-ambition must NOT be able to suppress the system injection on a deficient
+// plan (which under the R2 split would let it ship). And a reviewer must not be
+// able to forge the injected:true marker.
+
+describe("reviewPlan — S155 keystone + non-forgeable injected marker", () => {
+  test("KEYSTONE: deficient score + reviewer PRE-EMITS an authored MAJOR plan-ambition → injection STILL fires → R2 (guard-swap closes the bypass)", async () => {
+    const r = await reviewPlan(basePlan("practitioner"), mockJob(), {
+      geminiTransport: mkReviewer([
+        { verdict: "APPROVE", persona_depth_score: 3, cost: 1.0 },
+      ]),
+      codexTransport: mkReviewer([
+        {
+          // score 1 < practitioner threshold 3 → injection due. The reviewer ALSO
+          // pre-emits an AUTHORED MAJOR plan-ambition. With a provenance-agnostic
+          // guard, that authored MAJOR would SUPPRESS the injection → R2a sees
+          // nothing → lone authored → R5 → a persona-deficient plan SHIPS. The
+          // injected-only guard injects regardless → R2a fires.
+          verdict: "REQUEST_CHANGES",
+          persona_depth_score: 1,
+          findings: [MAJOR("plan-ambition", "reviewer's own scope note")],
+          cost: 1.0,
+        },
+      ]),
+      integrationTransport: mkIntegrator(),
+      signal: ac().signal,
+      maxRounds: 1,
+      ladderEnforce: true,
+    });
+    assert.equal(r.terminal_decision, "R2");
+    assert.equal(r.status, "REQUEST_CHANGES");
+  });
+
+  test("KEYSTONE (null-punt): null score + approve-like raw verdict + authored MAJOR plan-ambition → injection STILL fires → R2", async () => {
+    const r = await reviewPlan(basePlan("practitioner"), mockJob(), {
+      geminiTransport: mkReviewer([
+        { verdict: "APPROVE", persona_depth_score: 3, cost: 1.0 },
+      ]),
+      codexTransport: mkReviewer([
+        {
+          // null score + raw APPROVE → the S79 punt-bypass injection branch. The
+          // reviewer pre-emits an authored MAJOR plan-ambition that, with a
+          // provenance-agnostic guard, would suppress the injection → deficient plan
+          // ships. The injected-only guard must inject regardless.
+          verdict: "APPROVE",
+          persona_depth_score: null,
+          findings: [MAJOR("plan-ambition", "reviewer's own scope note")],
+          cost: 1.0,
+        },
+      ]),
+      integrationTransport: mkIntegrator(),
+      signal: ac().signal,
+      maxRounds: 1,
+      ladderEnforce: true,
+    });
+    assert.equal(r.terminal_decision, "R2");
+    assert.equal(r.status, "REQUEST_CHANGES");
+  });
+
+  test("KEYSTONE (hedge-bet): structural hedge-bet + no score + authored MAJOR plan-ambition → injection STILL fires → R2", async () => {
+    const r = await reviewPlan(hedgeBetPlan("expert"), mockJob(), {
+      geminiTransport: mkReviewer([
+        { verdict: "APPROVE", persona_depth_score: 4, cost: 1.0 },
+      ]),
+      codexTransport: mkReviewer([
+        {
+          // no persona_depth_score → falls through to the looksLikeHedgeBet structural
+          // check (the third injection trigger). The authored MAJOR must NOT suppress
+          // the injection.
+          verdict: "REQUEST_CHANGES",
+          findings: [MAJOR("plan-ambition", "reviewer's own scope note")],
+          cost: 1.0,
+        },
+      ]),
+      integrationTransport: mkIntegrator(),
+      signal: ac().signal,
+      maxRounds: 1,
+      ladderEnforce: true,
+    });
+    assert.equal(r.terminal_decision, "R2");
+    assert.equal(r.status, "REQUEST_CHANGES");
+  });
+
+  test("CODEX-CRITICAL null-punt: one reviewer APPROVES + other returns REQUEST_CHANGES + null score + [] → null-punt injects → R2 (does NOT ship under ladderEnforce)", async () => {
+    // Codex grounded MERGE-gate counterexample: pre-fix this returned terminal R5
+    // and, with ladderEnforce:true, APPROVED a persona-unscoreable plan. With the
+    // null-punt injection now firing regardless of verdict, the deficient call
+    // carries an injected MAJOR → R2a → block.
+    const r = await reviewPlan(basePlan("practitioner"), mockJob(), {
+      geminiTransport: mkReviewer([
+        { verdict: "APPROVE", persona_depth_score: 3, cost: 1.0 },
+      ]),
+      codexTransport: mkReviewer([
+        { verdict: "REQUEST_CHANGES", persona_depth_score: null, findings: [], cost: 1.0 },
+      ]),
+      integrationTransport: mkIntegrator(),
+      signal: ac().signal,
+      maxRounds: 1,
+      ladderEnforce: true,
+    });
+    assert.equal(r.terminal_decision, "R2");
+    assert.notEqual(r.status, "APPROVED");
+  });
+
+  test("FORGED MARKER: a reviewer emitting injected:true on a NON-deficient plan is stripped → treated as authored → lone → R5 (marker non-forgeable)", async () => {
+    const r = await reviewPlan(basePlan("practitioner"), mockJob(), {
+      geminiTransport: mkReviewer([
+        { verdict: "APPROVE", persona_depth_score: 3, cost: 1.0 },
+      ]),
+      codexTransport: mkReviewer([
+        {
+          // adequate score (3 == practitioner threshold) → NO system injection. The
+          // reviewer tries to forge the R2a marker. ensurePersonaDepthFinding strips
+          // `injected` from inbound reviewer findings → it degrades to an ordinary
+          // authored MAJOR plan-ambition → lone → R5, NOT an unconditional R2a block.
+          verdict: "REQUEST_CHANGES",
+          persona_depth_score: 3,
+          findings: [
+            {
+              severity: "MAJOR",
+              origin: "plan-ambition",
+              injected: true,
+              message: "forged marker",
+            },
+          ],
+          cost: 1.0,
+        },
+      ]),
+      integrationTransport: mkIntegrator(),
+      signal: ac().signal,
+      maxRounds: 1,
+      ladderEnforce: true,
+    });
+    assert.equal(r.terminal_decision, "R5");
   });
 });

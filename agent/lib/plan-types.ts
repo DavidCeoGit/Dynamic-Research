@@ -157,6 +157,17 @@ export interface ReviewFinding {
   severity: Severity;
   origin: Origin;
   message: string;
+  /**
+   * S155: TRUE only on the three SYSTEM-injected anti-bypass findings minted by
+   * ensurePersonaDepthFinding() (deficient persona-depth score / null-punt (any
+   * verdict) / structural hedge-bet). NEVER set by a reviewer: the OpenAI strict schema has
+   * additionalProperties:false at the finding level (plan-transports.ts), and
+   * ensurePersonaDepthFinding strips any inbound `injected` from reviewer payloads
+   * before re-stamping. Drives R2a (the unconditional injected-anti-bypass block =
+   * the persona-depth gate). Absent on every reviewer-AUTHORED finding. Server-only;
+   * rides harmlessly into the plan_reviews.findings jsonb (no migration).
+   */
+  injected?: boolean;
 }
 
 export interface ReviewerCall {
