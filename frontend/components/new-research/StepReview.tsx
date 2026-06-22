@@ -3,7 +3,7 @@
 import { useFormContext } from "react-hook-form";
 import type { FormData } from "@/lib/validate";
 import type { StepReviewProps } from "@/lib/types/queue";
-import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon, Sparkles, RefreshCw, Repeat } from "lucide-react";
+import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon, Sparkles, RefreshCw, Repeat, X } from "lucide-react";
 import { TimeEstimate } from "./Shared";
 
 const PRODUCT_META: Record<string, { label: string; icon: typeof Music }> = {
@@ -47,6 +47,26 @@ function FromTopicBadge() {
   );
 }
 
+type ContextListField = "domainKnowledge" | "constraints" | "additionalUrls" | "claimsToVerify";
+
+// Per-item remove control on the Review screen. Lets the user drop a
+// mis-extracted Research Context item (e.g. a non-URL "v1.1" that leaked into
+// the reference URLs and fails strict URL validation, blocking submit) and
+// decide for themselves whether it matters to the research.
+function RemoveButton({ onRemove, label }: { onRemove: () => void; label: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onRemove}
+      aria-label={`Remove ${label}`}
+      title="Remove this item"
+      className="shrink-0 rounded p-0.5 text-zinc-600 hover:text-red-400 hover:bg-red-400/10 transition"
+    >
+      <X className="h-3.5 w-3.5" />
+    </button>
+  );
+}
+
 export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSlug }: StepReviewProps) {
   const { watch, setValue, formState: { errors } } = useFormContext<FormData>();
   const topic = watch("topic");
@@ -61,6 +81,18 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
   const attachments = watch("attachments");
 
   const selectedProducts = Object.entries(products ?? {}).filter(([, v]) => v);
+
+  // Let the user drop a mis-extracted Research Context item from the Review
+  // screen. The auto-extractor / dynamic-question split can leak non-URL prose
+  // (e.g. a version label "v1.1") into additionalUrls, which then fails the
+  // strict URL validator and BLOCKS submit with no edit path. Removing the
+  // item re-validates immediately so the submit-block clears. The user decides
+  // whether the item materially affects the research.
+  const removeContextItem = (field: ContextListField, index: number) => {
+    const current = userContext?.[field] ?? [];
+    const next = current.filter((_, i) => i !== index);
+    setValue(`userContext.${field}`, next, { shouldValidate: true, shouldDirty: true });
+  };
 
   // Sets of items that came from extraction (for badge rendering).
   const fromTopic = {
@@ -125,6 +157,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
                     <span className="text-zinc-500 mt-0.5">•</span>
                     <span className="flex-1">{item}</span>
                     {fromTopic.domainKnowledge.has(item) && <FromTopicBadge />}
+                    <RemoveButton onRemove={() => removeContextItem("domainKnowledge", i)} label="domain knowledge item" />
                   </li>
                 ))}
               </ul>
@@ -140,6 +173,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
                     <span className="text-zinc-500 mt-0.5">•</span>
                     <span className="flex-1">{item}</span>
                     {fromTopic.constraints.has(item) && <FromTopicBadge />}
+                    <RemoveButton onRemove={() => removeContextItem("constraints", i)} label="constraint" />
                   </li>
                 ))}
               </ul>
@@ -157,6 +191,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
                       {item}
                     </a>
                     {fromTopic.additionalUrls.has(item) && <FromTopicBadge />}
+                    <RemoveButton onRemove={() => removeContextItem("additionalUrls", i)} label="reference URL" />
                   </li>
                 ))}
               </ul>
@@ -172,6 +207,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
                     <span className="text-zinc-500 mt-0.5">•</span>
                     <span className="flex-1">{item}</span>
                     {fromTopic.claimsToVerify.has(item) && <FromTopicBadge />}
+                    <RemoveButton onRemove={() => removeContextItem("claimsToVerify", i)} label="claim" />
                   </li>
                 ))}
               </ul>

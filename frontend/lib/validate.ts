@@ -62,9 +62,18 @@ export const userContextSchema = z.object({
         .filter((u) => u.length > 0)
         .map((u) => {
           if (/^https?:\/\//i.test(u)) return u;
-          // Bare-domain heuristic: at least one dot, and chars are URL-ish
-          if (/^[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)+(\/[^\s]*)?$/i.test(u)) {
-            return `https://${u}`;
+          // Bare-domain heuristic: strip a trailing dot (FQDN form like
+          // "example.com." — a legit absolute domain the URL validator rejects)
+          // then require a real ALPHABETIC TLD (>=2 letters) as the final label.
+          // This keeps genuine bare domains while DROPPING non-URL prose that
+          // merely contains a dot — e.g. the version label "v1.1" (final label
+          // "1" is numeric) would otherwise become "https://v1.1" and FAIL the
+          // strict Zod-4 URL validator, blocking submit with no edit path. A
+          // bare IPv4 literal also no longer auto-resolves here — prefix it with
+          // an explicit http(s):// to include one.
+          const bare = u.replace(/\.+$/, "");
+          if (/^[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)*\.[a-z]{2,}(\/[^\s]*)?$/i.test(bare)) {
+            return `https://${bare}`;
           }
           return null;
         })
