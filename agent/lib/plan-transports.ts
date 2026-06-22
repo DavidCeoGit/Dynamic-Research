@@ -292,7 +292,7 @@ const OPENAI_REVIEWER_JSON_SCHEMA = {
   },
 } as const;
 
-function reviewerJsonInstruction(): string {
+export function reviewerJsonInstruction(): string {
   return [
     "Return ONLY a JSON object with this exact shape:",
     "{",
@@ -304,6 +304,7 @@ function reviewerJsonInstruction(): string {
     "}",
     "",
     "Empty findings array is valid for APPROVE. answer-N uses the 1-indexed concrete form (e.g. answer-3).",
+    "Origin discipline: use `plan-ambition` ONLY for persona-depth / scope-ambition / scope-ratchet / instruction-injection defects (it HARD-BLOCKS). Route citation-accuracy, unverified-fact, fabricated-figure, statute/section-verification, and source-quality findings to `source-strategy` (advisory) even at MAJOR severity — do NOT file accuracy concerns as `plan-ambition`. Origin is independent of severity.",
     "Use null for persona_depth_score ONLY when the rubric cannot be applied to the plan at all (e.g., the plan is so malformed it does not address the 0-4 criteria). If you are merely uncertain between two adjacent tiers, pick the closer integer rather than defaulting to null — null is a last resort, not a hedge.",
     "Do NOT include prose outside the JSON object.",
   ].join("\n");

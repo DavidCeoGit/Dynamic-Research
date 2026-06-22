@@ -216,6 +216,35 @@ describe("buildReviewerPromptBody", () => {
     assert.ok(p.includes('<untrusted_input type="plan">'));
     assert.ok(p.includes("Persona Depth"));
   });
+
+  // S155: the origin-selection rubric routes accuracy/citation findings to
+  // source-strategy (advisory) and reserves plan-ambition for scope/persona/injection
+  // (the hard R2a gate). Lock the wording so a future prompt edit cannot silently
+  // drop it (the fix for the job 657161bb R2 over-match).
+  test("carries the S155 origin-selection rubric (plan-ambition vs source-strategy)", () => {
+    const p = buildReviewerPromptBody(basePlan(), mockJob(), 1);
+    assert.ok(p.includes("Origin selection rubric"));
+    assert.ok(p.includes("source-strategy"));
+    assert.ok(p.includes("RESERVED for persona-depth"));
+    assert.ok(
+      p.includes("Do NOT use `plan-ambition` as a generic bucket"),
+      "must explicitly forbid plan-ambition as a generic serious-finding bucket",
+    );
+    assert.ok(
+      p.includes("an unverified statute or section is `source-strategy`"),
+      "must give the unverified-statute → source-strategy disambiguator",
+    );
+  });
+
+  test("rubric sits between the findings-enum line and the persona_depth_score line", () => {
+    const p = buildReviewerPromptBody(basePlan(), mockJob(), 1);
+    const rubricIdx = p.indexOf("Origin selection rubric");
+    const enumIdx = p.indexOf("Plus a list of findings");
+    const scoreIdx = p.indexOf("Plus a persona_depth_score");
+    assert.ok(enumIdx >= 0 && rubricIdx >= 0 && scoreIdx >= 0);
+    assert.ok(rubricIdx > enumIdx, "rubric must follow the origin enum");
+    assert.ok(rubricIdx < scoreIdx, "rubric must precede the persona_depth_score line");
+  });
 });
 
 describe("buildIntegrationPromptBody", () => {
@@ -488,11 +517,13 @@ describe("reviewPlan — Persona Depth rubric", () => {
     assert.match(codAmbition!.message, /no Persona Depth score|persona-depth gate/i);
   });
 
-  test("S79 G-MIN-1: REQUEST_CHANGES + persona_depth_score=null does NOT add plan-ambition (verdict already gates)", async () => {
-    // Counter-test: when the reviewer punts but ALSO returns a non-approve
-    // verdict, the new C-MAJ-1 guard should NOT fire — the verdict gates
-    // by itself. The hedge-bet defensive check still runs but basePlan is
-    // not a hedge-bet so no finding is added.
+  test("S155 (Codex CRITICAL): REQUEST_CHANGES + persona_depth_score=null NOW injects an anti-bypass plan-ambition (a null score fails closed regardless of verdict)", async () => {
+    // Pre-S155 this asserted NO injection on a non-approve null-punt ("the verdict
+    // gates by itself"). That premise is FALSE under the terminal ladder + ladderEnforce:
+    // a null-punt REQUEST_CHANGES with the other reviewer approving reaches R5 and,
+    // with enforcement on, SHIPS a persona-unscoreable plan. A null score means the
+    // rubric could not be applied at all, so we now inject the anti-bypass MAJOR
+    // (injected:true -> R2a) regardless of verdict.
     const r = await reviewPlan(basePlan("expert"), mockJob(), {
       geminiTransport: mkReviewer([
         { verdict: "REQUEST_CHANGES", persona_depth_score: null, cost: 1.0 },
@@ -504,13 +535,15 @@ describe("reviewPlan — Persona Depth rubric", () => {
       signal: ac().signal,
       maxRounds: 1,
     });
-    assert.notEqual(r.status, "APPROVED"); // REQUEST_CHANGES is the natural verdict
+    assert.notEqual(r.status, "APPROVED");
     const gem = r.reviewer_calls.find((c) => c.reviewer === "gemini");
-    assert.equal(gem?.verdict, "REQUEST_CHANGES");
-    // No synthetic plan-ambition finding when verdict is already non-approve
-    // AND the plan is not a hedge-bet structurally.
     const gemAmbition = gem?.findings.find((f) => f.origin === "plan-ambition");
-    assert.equal(gemAmbition, undefined);
+    assert.ok(gemAmbition, "a null persona_depth_score must now inject an anti-bypass plan-ambition");
+    assert.equal(
+      gemAmbition?.injected,
+      true,
+      "the null-punt injection must carry injected:true (drives R2a)",
+    );
   });
 
   test("hallucinated APPROVE_WITH_CHANGES + low score also rewritten", async () => {

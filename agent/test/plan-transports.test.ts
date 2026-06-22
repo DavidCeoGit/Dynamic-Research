@@ -18,6 +18,7 @@ import {
   makeClaudeIntegrationTransport,
   makeClaudeSynthesisTransport,
   makePlanReviewTransports,
+  reviewerJsonInstruction,
   __overrideSdkLoadersForTesting,
   __resetSdkOverridesForTesting,
 } from "../lib/plan-transports.js";
@@ -1391,5 +1392,23 @@ describe("fallback cost accounting", () => {
       signal: new AbortController().signal,
     });
     assert.equal(out.total_cost_usd, 0);
+  });
+});
+
+// ── S155 origin-discipline mirror (reviewerJsonInstruction) ─────────
+// Both reviewer transports append reviewerJsonInstruction() after
+// buildReviewerPromptBody(); this one-line mirror reinforces the origin rubric
+// (route accuracy/citation → source-strategy; reserve plan-ambition for the hard
+// R2a gate). Lock the wording so a future edit cannot silently drop it.
+describe("reviewerJsonInstruction — S155 origin discipline mirror", () => {
+  test("routes accuracy/citation findings to source-strategy, not plan-ambition", () => {
+    const s = reviewerJsonInstruction();
+    assert.ok(s.includes("Origin discipline"));
+    assert.ok(s.includes("source-strategy"));
+    assert.ok(
+      s.includes("do NOT file accuracy concerns as `plan-ambition`"),
+      "must forbid filing accuracy concerns as plan-ambition",
+    );
+    assert.ok(s.includes("Origin is independent of severity"));
   });
 });
