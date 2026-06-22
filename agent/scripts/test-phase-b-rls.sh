@@ -446,6 +446,78 @@ run_postmerge() {
     else
       fail "T7c: escape hatch did not permit mutation" "output: $trg_escape_out"
     fi
+
+    # T7d (Phase 5 GUC-hardening, 20260622): the bare GUC is NO LONGER sufficient.
+    # A NON-member session (service_role) WITH the GUC set is STILL blocked --- the
+    # second factor is pg_has_role(session_user,'tenancy_admin'). T7c above keeps
+    # passing only because it runs over the postgres connection (session_user =
+    # postgres, an explicit tenancy_admin member); this negative sibling is what
+    # actually asserts the hardening. SET SESSION AUTHORIZATION changes
+    # session_user (SET ROLE would not) and needs a TRUE superuser, so T7d runs
+    # over SUPERUSER_DATABASE_URL (supabase_admin; postgres is not superuser on
+    # Supabase). Absent / non-super / prod-pointing --- FAIL, never skip-as-pass.
+    local prod_ref="mfjgoghlpqgxcycxoxio"
+    local su_url="${SUPERUSER_DATABASE_URL:-}"
+    if [[ -z "$su_url" ]]; then
+      fail "T7d: SUPERUSER_DATABASE_URL not set" "the GUC-hardening negative sibling needs a TRUE superuser connection (supabase_admin) for SET SESSION AUTHORIZATION; refusing to skip the hardening assertion"
+    elif [[ "$su_url" == *"$prod_ref"* ]]; then
+      fail "T7d: SUPERUSER_DATABASE_URL references prod" "prod-ref guard tripped ($prod_ref)"
+    else
+      local is_su
+      is_su=$(psql "$su_url" --no-psqlrc --quiet --tuples-only --no-align --pset=footer=off -c "SHOW is_superuser" 2>/dev/null | tr -d '[:space:]')
+      if [[ "$is_su" != "on" ]]; then
+        fail "T7d: SUPERUSER_DATABASE_URL is not a superuser connection" "SHOW is_superuser='$is_su' (expected 'on') --- SET SESSION AUTHORIZATION would error; use the supabase_admin URL"
+      else
+        local trg_hard_out
+        trg_hard_out=$(psql "$su_url" --no-psqlrc --quiet --tuples-only --no-align --pset=footer=off -c "
+          BEGIN;
+          -- Self-seed a sacrificial org + research_queue row (as the superuser
+          -- connection role) so T7d is INDEPENDENTLY load-bearing on ANY target,
+          -- including an empty / schema-only replica with no pre-existing rows
+          -- (Codex MERGE-gate MINOR, S154 -- T7d must not pass-as-skip). The row id
+          -- is handed to the post-auth-switch block via a session GUC. All ROLLBACKs.
+          DO \$\$
+          DECLARE v_org uuid; v_rid uuid;
+          BEGIN
+            INSERT INTO organizations (name, slug)
+            VALUES ('Phase 5 T7d', 'test-phase-b-t7d-' || left(gen_random_uuid()::text, 8))
+            RETURNING id INTO v_org;
+            INSERT INTO research_queue (organization_id, topic, topic_slug)
+            VALUES (v_org, 't7d', 'test-phase-b-t7d-' || left(gen_random_uuid()::text, 8))
+            RETURNING id INTO v_rid;
+            PERFORM set_config('app.t7d_rid', v_rid::text, false);
+          END
+          \$\$;
+          SET SESSION AUTHORIZATION service_role;
+          SET LOCAL app.allow_org_migration = 'true';
+          DO \$\$
+          DECLARE v_rid uuid;
+          BEGIN
+            IF session_user <> 'service_role' THEN
+              RAISE EXCEPTION 'PRECOND-FAIL: session_user=% (expected service_role)', session_user;
+            END IF;
+            v_rid := current_setting('app.t7d_rid')::uuid;
+            -- Mutate org_id to a fresh uuid. If hardening holds, B-1 blocks
+            -- ('immutable') BEFORE the FK is checked; if it regressed, the UPDATE
+            -- proceeds (success or FK error) -- neither says 'immutable', so the
+            -- else-branch correctly flags a regression.
+            UPDATE research_queue SET organization_id = gen_random_uuid() WHERE id = v_rid;
+            RAISE NOTICE 'BUG: service_role org_id mutation permitted with only the GUC';
+          EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'RESULT: %', SQLERRM;
+          END
+          \$\$;
+          ROLLBACK;
+        " 2>&1)
+        if echo "$trg_hard_out" | grep -q "PRECOND-FAIL"; then
+          fail "T7d: precondition failed (session_user not service_role)" "$trg_hard_out"
+        elif echo "$trg_hard_out" | grep -qi "immutable"; then
+          pass "T7d: service_role + GUC STILL blocked from org_id mutation (two-factor hardening holds -- bare GUC no longer sufficient)"
+        else
+          fail "T7d: service_role + GUC was NOT blocked by B-1 (HARDENING REGRESSION)" "$trg_hard_out"
+        fi
+      fi
+    fi
   fi
 
   # T8: all 14 RLS policies created (research_queue 4 + org_members 4 + org_invitations 3 + organizations 2 + audit_storage_writes 1 = 14)

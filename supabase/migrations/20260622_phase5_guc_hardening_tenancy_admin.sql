@@ -98,26 +98,40 @@ $$;
 COMMENT ON FUNCTION private.org_migration_enabled() IS
   'Phase 5 GUC-hardening: TRUE only when app.allow_org_migration=true AND session_user is a member of tenancy_admin. The role-membership second factor decouples "can set the GUC" from "authorized to migrate a tenant boundary". Anchored on session_user so a SECURITY DEFINER caller cannot satisfy it via the definer identity.';
 
--- GRANTS (v3, Codex C-CRIT-1/C-CRIT-2 + self-probe S152): the helper is ONLY ever
--- invoked from inside the two trigger functions, BOTH of which are SECURITY
--- DEFINER (B-1 made DEFINER in §3 for exactly this reason) and execute as their
--- OWNER. The shipped trigger fns are owned by `postgres` (verified: pg_proc.proowner;
--- CREATE OR REPLACE PRESERVES the existing owner, so they stay postgres-owned), and
--- postgres holds `private` USAGE (ntfy migration: `grant usage on schema private to
--- postgres, service_role`).
---   BUT the helper's OWNER is whoever RUNS this migration (CREATE OR REPLACE assigns
--- ownership to the creator) — which may NOT be postgres (e.g. a local apply as
--- supabase_admin). With REVOKE ALL FROM PUBLIC and no grant, a postgres-owned trigger
--- then hits "permission denied for function org_migration_enabled" at fire time
--- (empirically reproduced S152). So GRANT EXECUTE to postgres explicitly — the
--- confirmed trigger-owner — making the trigger→helper call work regardless of the
--- migration-runner identity. NO grant to app roles: authenticated/service_role never
--- call the helper directly (the DEFINER triggers do, as postgres), and re-granting
--- `private` USAGE to authenticated would silently undo the ntfy hardening.
--- IMPL-VERIFY at the MERGE gate: confirm prod trigger-fn ownership == postgres; if
--- Supabase owns them as another role, grant EXECUTE to that role instead/also.
-REVOKE ALL ON FUNCTION private.org_migration_enabled() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION private.org_migration_enabled() TO postgres;
+-- GRANTS — PUBLIC EXECUTE (the default for a function), set EXPLICITLY here.
+--
+-- The helper is a NON-SENSITIVE boolean predicate: it returns
+--   (GUC='true' AND pg_has_role(session_user,'tenancy_admin','MEMBER'))
+-- and grants NO capability. The enforcement point is the two SECURITY DEFINER
+-- triggers, which call it internally as their OWNER; a direct call by any app
+-- role just yields `false` (non-members) and lets them DO nothing. So leaving it
+-- world-executable is security-neutral, and the gate's boundary is unchanged.
+--
+-- WHY NOT `REVOKE ALL FROM PUBLIC` (the v3 design's posture, REVERSED at the S154
+-- MERGE gate, Gemini CRITICAL + MAJOR):
+--   1. DoS landmine (CRITICAL). On PostgreSQL 17.x a DIRECT call to a non-inlinable
+--      SQL function in `private` by a role that LACKS EXECUTE does not raise a clean
+--      "permission denied" — it SEGFAULTS the backend (signal 11). Reproduced and
+--      root-caused at S154 to a GENERIC platform behavior (even a trivial
+--      `SELECT true` with a SET clause crashes on the EXECUTE-denied path), NOT to
+--      this function's body. With REVOKE-FROM-PUBLIC, any future reuse of this helper
+--      — e.g. a new RLS policy `USING (... OR private.org_migration_enabled())`
+--      evaluated as service_role — would crash the DB instead of erroring. (Verified
+--      S154: making the helper SECURITY DEFINER does NOT prevent it — the EXECUTE
+--      check is on the CALLER regardless of DEFINER/INVOKER; only GRANTING execute
+--      removes the crashing permission-denied path.) PUBLIC EXECUTE eliminates that
+--      path for every caller. Roles without `private` schema USAGE (anon/authenticated
+--      after the ntfy hardening) still get a CLEAN schema-permission error, not a crash
+--      (verified S154) — so this does NOT re-grant them private USAGE and does NOT undo
+--      the ntfy hardening.
+--   2. Owner-agnostic (MAJOR). The trigger->helper call must succeed whatever role
+--      OWNS the triggers in prod. A `GRANT EXECUTE TO postgres` only works if the owner
+--      is exactly postgres; if a platform change / restore / future migration made the
+--      owner supabase_admin (or anything else), EVERY research_queue INSERT/UPDATE would
+--      fail permission-denied -> total outage. PUBLIC includes any owner, so the call
+--      works regardless. (The owner question therefore no longer needs an IMPL-VERIFY
+--      gate; it is mooted by PUBLIC EXECUTE.)
+GRANT EXECUTE ON FUNCTION private.org_migration_enabled() TO PUBLIC;
 
 -- -----------------------------------------------------------------------------
 -- §3 — Swap B-1's immutable-org trigger onto the two-factor gate.

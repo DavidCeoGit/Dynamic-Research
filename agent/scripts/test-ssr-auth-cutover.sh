@@ -14,7 +14,9 @@
 #   - anon is default-denied across the whole perimeter (A1-A2),
 #   - the Component-1 trigger fences cross-org lineage even for the GENUINE
 #     service_role that BYPASSes RLS (P1/P1b), allows same-org lineage (P2),
-#     and honours the app.allow_org_migration escape hatch (P3),
+#     and honours the TWO-FACTOR escape hatch (20260622 GUC-hardening): a
+#     tenancy_admin MEMBER overrides (P3) but a NON-member is still blocked even
+#     with the GUC set (P3b), and B-1's message no longer leaks the flag (P3c),
 #   - storage is private + has no permissive object policy (Tier-2 S1/S2),
 #   - [when a session is supplied] the file-serving routes keep orgId
 #     session-derived so a foreign-org slug 404s (Tier-1 T1-T4).
@@ -32,9 +34,15 @@
 # Usage:
 #   DR_TEST_ENV=nonprod \
 #   DATABASE_URL=<non-prod psql URL> \
+#   SUPERUSER_DATABASE_URL=<non-prod TRUE-superuser URL> \    # supabase_admin on local Supabase; required for Regime 1b (P3/P3b)
 #   NEXT_PUBLIC_SUPABASE_URL=<non-prod> SUPABASE_SERVICE_ROLE_KEY=<non-prod> \
 #   [BASE_URL=http://127.0.0.1:3000 SESSION='sb-...=...; ...'] \
 #   bash agent/scripts/test-ssr-auth-cutover.sh [--http]
+#
+# SUPERUSER_DATABASE_URL (e.g. postgresql://supabase_admin:postgres@127.0.0.1:54322/postgres)
+# is required by the GUC-hardening escape-hatch arm: SET SESSION AUTHORIZATION
+# needs a true superuser, and on Supabase `postgres` is NOT one. Absent/non-super
+# → P3/P3b FAIL (never skip-as-pass).
 #
 # Exit codes: 0 all-pass · 1 one+ fail · 2 env/dependency/guard error.
 #
@@ -226,17 +234,145 @@ END \$\$;
 ROLLBACK;")"
 echo "$p2" | grep -q 'OK: same-org' && pass "P2: same-org child insert succeeds (trigger does not over-block)" || fail "P2: same-org lineage wrongly rejected" "$p2"
 
-# P3 — escape hatch permits cross-org lineage
-p3="$(capture "
-BEGIN; SET LOCAL ROLE service_role; SET LOCAL app.allow_org_migration='true';
+# ---- Regime 1b: GUC-hardening two-factor escape hatch (P3/P3b/P3c) ----------
+# After 20260622, the escape hatch is private.org_migration_enabled() =
+#   app.allow_org_migration='true' AND pg_has_role(session_user,'tenancy_admin','MEMBER').
+# It keys on SESSION_USER, which `SET LOCAL ROLE` does NOT change — so the bare
+# GUC is no longer sufficient. To faithfully exercise the role factor we must
+# change session_user via SET SESSION AUTHORIZATION, which requires a TRUE
+# superuser connection. On local Supabase `postgres` is NOT a superuser
+# (supabase_admin is), so the escape-hatch arm runs over SUPERUSER_DATABASE_URL.
+# A missing / non-superuser / prod-pointing connection FAILS this arm (never a
+# silent skip — it is the load-bearing hardening proof, per C-MAJ-1 discipline).
+echo "--- Regime 1b: GUC-hardening escape hatch (two-factor: GUC + tenancy_admin) ---"
+SU_URL="${SUPERUSER_DATABASE_URL:-}"
+PSQL_SU=(psql "$SU_URL" --no-psqlrc --quiet --tuples-only --no-align --pset=footer=off)
+capture_su() { "${PSQL_SU[@]}" -c "$1" 2>&1; }
+
+su_ok=0
+if [[ -z "$SU_URL" ]]; then
+  fail "P3/P3b: SUPERUSER_DATABASE_URL not set" "the two-factor escape-hatch arm needs a TRUE superuser connection (supabase_admin on local Supabase) for SET SESSION AUTHORIZATION; refusing to skip a load-bearing hardening assertion"
+elif [[ "$SU_URL" == *"$PROD_REF"* ]]; then
+  fail "P3/P3b: SUPERUSER_DATABASE_URL references prod" "prod-ref guard tripped on the superuser connection ($PROD_REF)"
+else
+  is_su="$(printf '%s' "$(capture_su "SHOW is_superuser")" | tr -d '[:space:]')"
+  if [[ "$is_su" == "on" ]]; then
+    su_ok=1
+  else
+    fail "P3/P3b: SUPERUSER_DATABASE_URL is not a superuser connection" "SHOW is_superuser='$is_su' (expected 'on') — SET SESSION AUTHORIZATION would error; use the supabase_admin URL"
+  fi
+fi
+
+if [[ "$su_ok" == "1" ]]; then
+  # P3 (RETARGET, positive) — a tenancy_admin MEMBER (postgres) + GUC → cross-org
+  # lineage PERMITTED (break-glass works for a member). The old P3 used SET LOCAL
+  # ROLE service_role, which left session_user=postgres (a member) and so passed
+  # for the WRONG reason — it never exercised the new role factor.
+  p3="$(capture_su "
+BEGIN;
+SET SESSION AUTHORIZATION postgres;
+SET LOCAL app.allow_org_migration='true';
 DO \$\$ BEGIN
+  IF session_user <> 'postgres' THEN
+    RAISE EXCEPTION 'PRECOND-FAIL: session_user=% (expected postgres)', session_user;
+  END IF;
   INSERT INTO public.research_queue (organization_id, topic, topic_slug, parent_run_id)
   VALUES ('$orgA','p3','dr-test-p3-'||left(gen_random_uuid()::text,8),'$runB');
-  RAISE NOTICE 'OK: escape hatch permitted cross-org lineage';
-EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'BUG: escape hatch failed % %', SQLSTATE, SQLERRM;
+  RAISE NOTICE 'OK: member escape hatch permitted cross-org lineage';
+EXCEPTION
+  WHEN OTHERS THEN RAISE NOTICE 'RESULT: % %', SQLSTATE, SQLERRM;
 END \$\$;
 ROLLBACK;")"
-echo "$p3" | grep -q 'OK: escape hatch' && pass "P3: app.allow_org_migration=true permits cross-org lineage (escape hatch works)" || fail "P3: escape hatch did not permit" "$p3"
+  if echo "$p3" | grep -q 'PRECOND-FAIL'; then
+    fail "P3: precondition failed (session_user not postgres under SET SESSION AUTHORIZATION)" "$p3"
+  elif echo "$p3" | grep -q 'OK: member escape hatch'; then
+    pass "P3: tenancy_admin member (postgres) + GUC permits cross-org lineage (member break-glass works)"
+  else
+    fail "P3: member (postgres) + GUC did NOT permit cross-org lineage (break-glass broken)" "$p3"
+  fi
+
+  # P3b-i (NEW, negative — THE load-bearing hardening assertion) — a non-member
+  # session (service_role: the app's real session identity after authenticator →
+  # SET ROLE) WITH the GUC set is STILL blocked from cross-org lineage. This is
+  # exactly what the bare-GUC predicate used to permit; membership is now required.
+  p3bi="$(capture_su "
+BEGIN;
+SET SESSION AUTHORIZATION service_role;
+SET LOCAL app.allow_org_migration='true';
+DO \$\$ BEGIN
+  IF session_user <> 'service_role' THEN
+    RAISE EXCEPTION 'PRECOND-FAIL: session_user=% (expected service_role)', session_user;
+  END IF;
+  INSERT INTO public.research_queue (organization_id, topic, topic_slug, parent_run_id)
+  VALUES ('$orgA','p3b','dr-test-p3b-'||left(gen_random_uuid()::text,8),'$runB');
+  RAISE NOTICE 'BUG: service_role escape hatch permitted cross-org lineage despite non-membership';
+EXCEPTION
+  WHEN check_violation THEN RAISE NOTICE 'OK: trigger blocked service_role despite GUC (check_violation)';
+  WHEN OTHERS THEN RAISE NOTICE 'OTHER: % %', SQLSTATE, SQLERRM;
+END \$\$;
+ROLLBACK;")"
+  if echo "$p3bi" | grep -q 'PRECOND-FAIL'; then
+    fail "P3b(INSERT): precondition failed (session_user not service_role)" "$p3bi"
+  elif echo "$p3bi" | grep -q 'OK: trigger blocked service_role'; then
+    pass "P3b(INSERT): service_role + GUC STILL blocked from cross-org lineage (membership is the necessary 2nd factor — the hardening win)"
+  else
+    fail "P3b(INSERT): service_role escaped the gate with only the GUC (HARDENING REGRESSION)" "$p3bi"
+  fi
+
+  # P3b-ii (NEW, negative — B-1 UPDATE arm) — the same non-member + GUC cannot
+  # mutate organization_id either; B-1's two-factor gate holds symmetrically.
+  # Mutates to a REAL org (orgB) so a regression surfaces as a clear success, not
+  # an ambiguous FK error.
+  p3bii="$(capture_su "
+BEGIN;
+SET SESSION AUTHORIZATION service_role;
+SET LOCAL app.allow_org_migration='true';
+DO \$\$ DECLARE rid uuid; BEGIN
+  IF session_user <> 'service_role' THEN
+    RAISE EXCEPTION 'PRECOND-FAIL: session_user=% (expected service_role)', session_user;
+  END IF;
+  SELECT id INTO rid FROM public.research_queue WHERE organization_id='$orgA' LIMIT 1;
+  IF rid IS NULL THEN RAISE EXCEPTION 'PRECOND-FAIL: no org-A row to mutate'; END IF;
+  UPDATE public.research_queue SET organization_id='$orgB' WHERE id=rid;
+  RAISE NOTICE 'BUG: service_role org_id mutation permitted despite non-membership';
+EXCEPTION
+  WHEN OTHERS THEN RAISE NOTICE 'RESULT: % %', SQLSTATE, SQLERRM;
+END \$\$;
+ROLLBACK;")"
+  if echo "$p3bii" | grep -q 'PRECOND-FAIL'; then
+    fail "P3b(UPDATE/B-1): precondition failed" "$p3bii"
+  elif echo "$p3bii" | grep -q 'BUG: service_role org_id mutation permitted'; then
+    fail "P3b(UPDATE/B-1): service_role mutated org_id with only the GUC (B-1 HARDENING REGRESSION)" "$p3bii"
+  elif echo "$p3bii" | grep -qi 'immutable'; then
+    pass "P3b(UPDATE/B-1): service_role + GUC STILL blocked from org_id mutation (B-1 two-factor holds)"
+  else
+    fail "P3b(UPDATE/B-1): unexpected outcome (expected B-1 'immutable' block)" "$p3bii"
+  fi
+fi
+
+# P3c (NEW, negative — B-1 message de-oracle). Runs over the regular (non-super)
+# connection: fire B-1 with NO GUC at all and assert the exception (a) blocks and
+# (b) no longer leaks the bypass-flag name (the shipped B-1 text leaked
+# 'set app.allow_org_migration=true to override').
+p3c="$(capture "
+BEGIN; SET LOCAL ROLE service_role;
+DO \$\$ DECLARE rid uuid; BEGIN
+  SELECT id INTO rid FROM public.research_queue WHERE organization_id='$orgA' LIMIT 1;
+  IF rid IS NULL THEN RAISE EXCEPTION 'PRECOND-FAIL: no org-A row'; END IF;
+  UPDATE public.research_queue SET organization_id='$orgB' WHERE id=rid;
+  RAISE NOTICE 'BUG: org_id mutation succeeded without escape hatch';
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'B1MSG: %', SQLERRM;
+END \$\$;
+ROLLBACK;")"
+if echo "$p3c" | grep -q 'PRECOND-FAIL'; then
+  fail "P3c: precondition failed (no org-A row)" "$p3c"
+elif echo "$p3c" | grep -qi 'allow_org_migration'; then
+  fail "P3c: B-1 exception STILL leaks the bypass-flag name (oracle not removed)" "$p3c"
+elif echo "$p3c" | grep -q 'B1MSG:' && echo "$p3c" | grep -qi 'immutable'; then
+  pass "P3c: B-1 blocks org_id mutation with a generic message — no allow_org_migration oracle leaked"
+else
+  fail "P3c: B-1 did not block as expected, or message unexpected" "$p3c"
+fi
 
 # P4/P4b/P5 — UPDATE arm of the trigger (G-CRIT-1: the trigger fires on
 # BEFORE INSERT OR UPDATE OF parent_run_id; the INSERT path alone is insufficient).
