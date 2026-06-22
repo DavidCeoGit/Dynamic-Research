@@ -5,6 +5,7 @@ import type { FormData } from "@/lib/validate";
 import type { StepProps } from "@/lib/types/queue";
 import { ArrowLeft, ArrowRight, Sparkles, ShieldCheck } from "lucide-react";
 import { TagInput } from "./Shared";
+import { ResearchContextEditor } from "./ResearchContextEditor";
 
 // Path C (S29): subtle hint above pre-filled fields. Sparkles icon matches
 // the FromTopicBadge in StepReview for visual consistency.
@@ -36,6 +37,10 @@ export function StepCustomize({ onNext, onPrev }: StepProps) {
           Fine-tune how each research tool operates. All fields are optional.
         </p>
       </div>
+
+      {/* S153 — editable Research Context (auto-extracted + user-added). Per-item
+          URL validation lives here; goNext blocks advancing on an invalid URL. */}
+      <ResearchContextEditor />
 
       {/* Perplexity */}
       <fieldset className="rounded-lg border border-zinc-800 p-4 space-y-3">

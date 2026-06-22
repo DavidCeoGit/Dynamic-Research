@@ -2,6 +2,7 @@
 
 import { useFormContext } from "react-hook-form";
 import type { FormData } from "@/lib/validate";
+import type { ContextSource } from "@/lib/context-items";
 import type { StepReviewProps } from "@/lib/types/queue";
 import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon, Sparkles, RefreshCw, Repeat, X } from "lucide-react";
 import { TimeEstimate } from "./Shared";
@@ -33,16 +34,18 @@ function humanSize(bytes: number): string {
   return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
 }
 
-// Path C (S29): "from topic" pill marks items that the LLM extracted from
-// the topic field, distinguishing them from items the user typed via dynamic
-// question answers. Helps the user spot misextractions before submission.
-function FromTopicBadge() {
+// Path C (S29) / S153: "from topic" pill marks items the LLM extracted from the
+// topic field, distinguishing them from items the user typed. An item edited on
+// the Customize step shows "from topic · edited" (source user_edited_extracted).
+function FromTopicBadge({ source }: { source: ContextSource }) {
+  if (source === "user") return null;
+  const label = source === "user_edited_extracted" ? "from topic · edited" : "from topic";
   return (
     <span
       className="inline-flex items-center gap-1 rounded-full bg-[#c8a951]/10 border border-[#c8a951]/30 px-1.5 py-0.5 text-[10px] font-medium text-[#c8a951]"
-      title="Inferred from your topic. Edit your topic to change this."
+      title="Inferred from your topic. Edit on the Customize step to change this."
     >
-      <Sparkles className="h-2.5 w-2.5" /> from topic
+      <Sparkles className="h-2.5 w-2.5" /> {label}
     </span>
   );
 }
@@ -94,13 +97,7 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
     setValue(`userContext.${field}`, next, { shouldValidate: true, shouldDirty: true });
   };
 
-  // Sets of items that came from extraction (for badge rendering).
-  const fromTopic = {
-    domainKnowledge: new Set(extractedContext?.domainKnowledge ?? []),
-    constraints: new Set(extractedContext?.constraints ?? []),
-    additionalUrls: new Set(extractedContext?.additionalUrls ?? []),
-    claimsToVerify: new Set(extractedContext?.claimsToVerify ?? []),
-  };
+  // S153 — provenance now lives on each item (it.source); no value-Set needed.
 
   const hasContext =
     (userContext?.domainKnowledge?.length ?? 0) > 0 ||
@@ -152,11 +149,11 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
             <div>
               <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Domain Knowledge</p>
               <ul className="space-y-1">
-                {userContext!.domainKnowledge.map((item, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                {userContext!.domainKnowledge.map((it, i) => (
+                  <li key={it.id} className="flex items-start gap-2 text-sm text-zinc-300">
                     <span className="text-zinc-500 mt-0.5">•</span>
-                    <span className="flex-1">{item}</span>
-                    {fromTopic.domainKnowledge.has(item) && <FromTopicBadge />}
+                    <span className="flex-1">{it.value}</span>
+                    <FromTopicBadge source={it.source} />
                     <RemoveButton onRemove={() => removeContextItem("domainKnowledge", i)} label="domain knowledge item" />
                   </li>
                 ))}
@@ -168,11 +165,11 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
             <div>
               <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Constraints</p>
               <ul className="space-y-1">
-                {userContext!.constraints.map((item, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                {userContext!.constraints.map((it, i) => (
+                  <li key={it.id} className="flex items-start gap-2 text-sm text-zinc-300">
                     <span className="text-zinc-500 mt-0.5">•</span>
-                    <span className="flex-1">{item}</span>
-                    {fromTopic.constraints.has(item) && <FromTopicBadge />}
+                    <span className="flex-1">{it.value}</span>
+                    <FromTopicBadge source={it.source} />
                     <RemoveButton onRemove={() => removeContextItem("constraints", i)} label="constraint" />
                   </li>
                 ))}
@@ -184,13 +181,13 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
             <div>
               <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Reference URLs</p>
               <ul className="space-y-1">
-                {userContext!.additionalUrls.map((item, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                {userContext!.additionalUrls.map((it, i) => (
+                  <li key={it.id} className="flex items-start gap-2 text-sm text-zinc-300">
                     <span className="text-zinc-500 mt-0.5">•</span>
-                    <a href={normalizeUrl(item)} target="_blank" rel="noopener noreferrer" className="flex-1 text-zinc-300 hover:text-[#c8a951] hover:underline truncate">
-                      {item}
+                    <a href={normalizeUrl(it.value)} target="_blank" rel="noopener noreferrer" className="flex-1 text-zinc-300 hover:text-[#c8a951] hover:underline truncate">
+                      {it.value}
                     </a>
-                    {fromTopic.additionalUrls.has(item) && <FromTopicBadge />}
+                    <FromTopicBadge source={it.source} />
                     <RemoveButton onRemove={() => removeContextItem("additionalUrls", i)} label="reference URL" />
                   </li>
                 ))}
@@ -202,11 +199,11 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
             <div>
               <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-1.5">Claims to Verify</p>
               <ul className="space-y-1">
-                {userContext!.claimsToVerify.map((item, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-zinc-300">
+                {userContext!.claimsToVerify.map((it, i) => (
+                  <li key={it.id} className="flex items-start gap-2 text-sm text-zinc-300">
                     <span className="text-zinc-500 mt-0.5">•</span>
-                    <span className="flex-1">{item}</span>
-                    {fromTopic.claimsToVerify.has(item) && <FromTopicBadge />}
+                    <span className="flex-1">{it.value}</span>
+                    <FromTopicBadge source={it.source} />
                     <RemoveButton onRemove={() => removeContextItem("claimsToVerify", i)} label="claim" />
                   </li>
                 ))}

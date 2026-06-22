@@ -14,6 +14,16 @@ import {
 import { estimateMinutes } from "@/lib/estimates";
 import type { FormStep, GeneratedQuestion } from "@/lib/types/queue";
 import { FORM_STEPS } from "@/lib/types/queue";
+// S153 — provenance-tagged context items (form-state only). Adapters bridge the
+// legacy/wire string[] shape at the clone, sessionStorage-restore, and submit
+// boundaries; replaceExtracted/addUserValue drive the re-extraction state model.
+import {
+  toFormUserContext,
+  serializeUserContext,
+  replaceExtracted,
+  addUserValue,
+} from "@/lib/context-items";
+import { isValidUrlItem, normalizeUrlCandidate } from "@/lib/url-normalize";
 // S102 file-upload — carry the parent run's attachments into a cloned draft
 // as origin:"parent" payload items so the submit route copies their bytes
 // from the parent run's sources/ folder.
@@ -78,7 +88,9 @@ export function useNewResearchForm() {
           form.reset({
             ...FORM_DEFAULT_VALUES,
             topic: manifest.topic ?? "",
-            userContext: manifest.userContext ?? FORM_DEFAULT_VALUES.userContext,
+            // S153 — manifest.userContext is the wire string[] shape; adapt to
+            // provenance ContextItem[] (legacy strings default to source:"user").
+            userContext: toFormUserContext(manifest.userContext),
             vendorEvaluation:
               manifest.vendorEvaluation ?? FORM_DEFAULT_VALUES.vendorEvaluation,
             ajiDnaEnabled: manifest.ajiDnaEnabled ?? false,
@@ -117,7 +129,12 @@ export function useNewResearchForm() {
       const saved = sessionStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        form.reset(parsed);
+        // S153 Codex MERGE-gate CRITICAL — a draft persisted before the
+        // provenance migration holds userContext as string[]; restoring it raw
+        // would render item.value === undefined and serialize null at submit.
+        // toFormUserContext accepts BOTH legacy string[] and new ContextItem[],
+        // so old and new drafts both restore correctly.
+        form.reset({ ...parsed, userContext: toFormUserContext(parsed?.userContext) });
       }
     } catch {
       // Ignore parse errors
@@ -152,56 +169,36 @@ export function useNewResearchForm() {
     vendorEnabled ?? false,
   );
 
-  // ── Apply / prune extracted context ────────────────────────────────
-  // Path B (S29): silently merge LLM-extracted dimensions into form state so
-  // (a) they reach userContext at submit time without the user re-typing,
-  // (b) downstream steps (Customize/Review) show the merged values.
-  // Path C (S29): when user re-edits the topic and triggers re-extraction,
-  // prune previously-extracted items from userContext so they don't linger
-  // as stale data. Items the user typed via dynamic-question answers are
-  // preserved (we only remove what matches the OLD extractedContext exactly).
-
-  const pruneStaleExtraction = useCallback((oldEC: ExtractedContext | null) => {
-    if (!oldEC) return;
-    const pruneArray = (
-      field: "domainKnowledge" | "constraints" | "additionalUrls" | "claimsToVerify",
-      items: string[] | null,
-    ) => {
-      if (!items || items.length === 0) return;
-      const toRemove = new Set(items);
-      const current = form.getValues(`userContext.${field}`) ?? [];
-      form.setValue(`userContext.${field}`, current.filter((x) => !toRemove.has(x)));
-    };
-    pruneArray("domainKnowledge", oldEC.domainKnowledge);
-    pruneArray("constraints", oldEC.constraints);
-    pruneArray("additionalUrls", oldEC.additionalUrls);
-    pruneArray("claimsToVerify", oldEC.claimsToVerify);
-    // Scalar fields (vendor*, ajiDnaEnabled) aren't pruned — once user has
-    // potentially edited them, reverting on re-extraction is more disruptive
-    // than leaving them. The new extraction will overwrite via applyExtractedContext.
-  }, [form]);
+  // ── Apply extracted context (S153 provenance model) ────────────────
+  // Path B (S29): merge LLM-extracted dimensions into form state so they reach
+  // userContext at submit without the user re-typing, and Customize/Review show
+  // them. Path C (S29): on re-extraction (topic edited), the prior extracted
+  // subset must be REPLACED, never accumulated.
+  //
+  // S153 — replaceExtracted runs UNCONDITIONALLY for each array (Codex MERGE-gate
+  // MAJOR-2): even when the new field is null/[] (topic changed to one with no
+  // URLs), prior extracted items are cleared. User + user_edited_extracted items
+  // are preserved by provenance, not by string identity — so a user-typed value
+  // identical to an extracted one is never destroyed (Gemini MERGE-gate CRITICAL).
+  // No previousEC read → no race; pruneStaleExtraction is retired.
 
   const applyExtractedContext = useCallback((ec: ExtractedContext) => {
-    if (ec.domainKnowledge && ec.domainKnowledge.length > 0) {
-      const current = form.getValues("userContext.domainKnowledge") ?? [];
-      const merged = Array.from(new Set([...current, ...ec.domainKnowledge]));
-      form.setValue("userContext.domainKnowledge", merged);
-    }
-    if (ec.constraints && ec.constraints.length > 0) {
-      const current = form.getValues("userContext.constraints") ?? [];
-      const merged = Array.from(new Set([...current, ...ec.constraints]));
-      form.setValue("userContext.constraints", merged);
-    }
-    if (ec.additionalUrls && ec.additionalUrls.length > 0) {
-      const current = form.getValues("userContext.additionalUrls") ?? [];
-      const merged = Array.from(new Set([...current, ...ec.additionalUrls]));
-      form.setValue("userContext.additionalUrls", merged);
-    }
-    if (ec.claimsToVerify && ec.claimsToVerify.length > 0) {
-      const current = form.getValues("userContext.claimsToVerify") ?? [];
-      const merged = Array.from(new Set([...current, ...ec.claimsToVerify]));
-      form.setValue("userContext.claimsToVerify", merged);
-    }
+    form.setValue(
+      "userContext.domainKnowledge",
+      replaceExtracted(form.getValues("userContext.domainKnowledge") ?? [], ec.domainKnowledge),
+    );
+    form.setValue(
+      "userContext.constraints",
+      replaceExtracted(form.getValues("userContext.constraints") ?? [], ec.constraints),
+    );
+    form.setValue(
+      "userContext.additionalUrls",
+      replaceExtracted(form.getValues("userContext.additionalUrls") ?? [], ec.additionalUrls),
+    );
+    form.setValue(
+      "userContext.claimsToVerify",
+      replaceExtracted(form.getValues("userContext.claimsToVerify") ?? [], ec.claimsToVerify),
+    );
     if (ec.vendorEvaluation) {
       if (ec.vendorEvaluation.enabled !== null) {
         form.setValue("vendorEvaluation.enabled", ec.vendorEvaluation.enabled);
@@ -224,12 +221,9 @@ export function useNewResearchForm() {
     const topic = form.getValues("topic");
     if (!topic || topic.length < 10) return;
 
-    // If user is re-extracting (came back to topic step, edited, advanced),
-    // remove items that came from the previous extraction before applying
-    // the new one. Avoids stale "Houston Texas" lingering after the user
-    // pivoted the topic to Dallas.
-    const previousEC = form.getValues("extractedContext");
-    pruneStaleExtraction(previousEC);
+    // S153 — re-extraction replacement is handled inside applyExtractedContext
+    // (replaceExtracted clears the prior extracted subset unconditionally). No
+    // separate prune pass, no previousEC read.
 
     setIsGenerating(true);
     let extracted: ExtractedContext | null = null;
@@ -267,7 +261,7 @@ export function useNewResearchForm() {
     } finally {
       setIsGenerating(false);
     }
-  }, [form, applyExtractedContext, pruneStaleExtraction]);
+  }, [form, applyExtractedContext]);
 
   // ── Apply dynamic answers to userContext / vendorEvaluation ────────
 
@@ -281,42 +275,40 @@ export function useNewResearchForm() {
 
       switch (q.mappedField) {
         case "domainKnowledge": {
+          // S153 — addUserValue creates a source:"user" item, or promotes a
+          // matching source:"extracted" item to user_edited_extracted (so a user
+          // re-affirming an extracted value survives the next re-extraction;
+          // Codex MERGE-gate MAJOR-3).
           const current = form.getValues("userContext.domainKnowledge") ?? [];
           const val = typeof answer === "string" ? answer : String(answer);
-          if (val && !current.includes(val)) {
-            form.setValue("userContext.domainKnowledge", [...current, val]);
-          }
+          form.setValue("userContext.domainKnowledge", addUserValue(current, val));
           break;
         }
         case "constraints": {
           const current = form.getValues("userContext.constraints") ?? [];
           const val = typeof answer === "string" ? answer : String(answer);
-          if (val && !current.includes(val)) {
-            form.setValue("userContext.constraints", [...current, val]);
-          }
+          form.setValue("userContext.constraints", addUserValue(current, val));
           break;
         }
         case "additionalUrls": {
           const current = form.getValues("userContext.additionalUrls") ?? [];
           const val = typeof answer === "string" ? answer : "";
-          // S130: only accept URL-shaped tokens. The split lets users paste
-          // several space/comma-separated URLs at once, but with no shape
-          // check ANY prose paste (e.g. a PDF's full text) shattered into
-          // hundreds of single-word "URLs". Require an http(s):// scheme OR a
-          // bare domain (a dot between word chars, no whitespace); plain words
-          // like "negotiating" have no dot and are dropped.
-          const isUrlish = (u: string) =>
-            /^https?:\/\/\S+$/i.test(u) || /^[\w-]+\.[\w.-]+(\/\S*)?$/i.test(u);
-          const urls = val.split(/[,\s]+/).filter(Boolean).filter(isUrlish);
-          form.setValue("userContext.additionalUrls", [...new Set([...current, ...urls])]);
+          // S130/S153: the split lets users paste several space/comma-separated
+          // URLs at once; normalizeUrlCandidate (the canonical helper) drops prose
+          // tokens and canonicalizes real URLs so a PDF paste can't shatter into
+          // hundreds of junk "URLs". Each surviving URL is added via addUserValue.
+          let next = current;
+          for (const tok of val.split(/[,\s]+/).filter(Boolean)) {
+            const url = normalizeUrlCandidate(tok);
+            if (url) next = addUserValue(next, url);
+          }
+          form.setValue("userContext.additionalUrls", next);
           break;
         }
         case "claimsToVerify": {
           const current = form.getValues("userContext.claimsToVerify") ?? [];
           const val = typeof answer === "string" ? answer : String(answer);
-          if (val && !current.includes(val)) {
-            form.setValue("userContext.claimsToVerify", [...current, val]);
-          }
+          form.setValue("userContext.claimsToVerify", addUserValue(current, val));
           break;
         }
         case "vendorEvaluation": {
@@ -380,6 +372,24 @@ export function useNewResearchForm() {
       applyDynamicAnswers();
     }
 
+    // S153 Defect 3 — step-boundary gate. Block advancing out of Customize while
+    // any reference URL is invalid, so a bad URL never reaches the (read-only)
+    // Review screen and dead-ends the submit. Each row on the Customize editor has
+    // an inline remove control, so the user is never wedged (D3). Per-item errors
+    // render live in the editor; this sets a summary error + holds the step.
+    if (step === "customize") {
+      const urls = form.getValues("userContext.additionalUrls") ?? [];
+      const firstBad = urls.findIndex((it) => !isValidUrlItem(it.value).ok);
+      if (firstBad !== -1) {
+        form.setError("userContext.additionalUrls", {
+          type: "manual",
+          message: "Fix or remove the highlighted reference URL before continuing",
+        });
+        return;
+      }
+      form.clearErrors("userContext.additionalUrls");
+    }
+
     const nextIdx = stepIndex + 1;
     if (nextIdx < FORM_STEPS.length) {
       setStep(FORM_STEPS[nextIdx]);
@@ -409,8 +419,15 @@ export function useNewResearchForm() {
       dynamicAnswers: _da,
       extractedContext: _ec,
       pipelineMode,
-      ...formPayload
+      userContext: _uc,
+      ...rest
     } = data;
+
+    // S153 — flatten the provenance-tagged form userContext back to the wire
+    // string[] shape (serializeUserContext) so /api/queue, researchJobPayloadSchema,
+    // the user_context jsonb, and the worker stay unchanged. Provenance never
+    // reaches the wire.
+    const formPayload = { ...rest, userContext: serializeUserContext(data.userContext) };
 
     // S35 Clone & Edit — stamp parentSlug if this submission is a clone.
     // Backend resolves slug→id and writes research_queue.parent_run_id.

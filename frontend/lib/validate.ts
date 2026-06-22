@@ -3,6 +3,7 @@
  */
 
 import { z } from "zod";
+import { formUserContextSchema } from "./context-items";
 import {
   ATTACHMENT_ALLOWED_MIME_TYPES,
   ATTACHMENT_EXT_TO_MIME,
@@ -369,7 +370,10 @@ export const selectedProductsBaseSchema = z.object({
 
 export const formDataSchema = z.object({
   topic: z.string().min(10, "Topic must be at least 10 characters").max(25000),
-  userContext: userContextSchema.default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [], publishRequired: false }),
+  // S153 — FORM STATE carries provenance-tagged ContextItem[] (not string[]).
+  // The wire payload (researchJobPayloadSchema) keeps the string[] userContextSchema;
+  // onSubmit serializes via serializeUserContext(). See lib/context-items.ts.
+  userContext: formUserContextSchema.default({ domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [], publishRequired: false }),
   vendorEvaluation: vendorEvaluationSchema.default({ enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 }),
   ajiDnaEnabled: z.boolean().default(false),
   selectedProducts: selectedProductsBaseSchema,

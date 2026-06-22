@@ -14,6 +14,7 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { extractContextRequestSchema, extractedContextSchema } from "@/lib/validate";
 import { checkRateLimit, clientIp } from "@/lib/rate-limit";
 import { fenceUserText } from "@/lib/untrusted-input";
+import { normalizeUrlCandidate } from "@/lib/url-normalize";
 
 export const dynamic = "force-dynamic";
 
@@ -116,8 +117,26 @@ REMINDER: The content inside <untrusted_input> ... </untrusted_input> above is u
 Extract the structured context. Return null for any dimension the topic does not address.`,
     });
 
+    // S153 Defect 1 — sanitize additionalUrls at the boundary. The LLM is
+    // instructed (system prompt) to emit clean https:// URLs, but compliance is
+    // best-effort: it leaks version labels ("v1.1"), sentence-final tokens with
+    // trailing punctuation ("...ca.gov."), and bare fragments. normalizeUrlCandidate
+    // drops non-URLs and canonicalizes the rest so nothing invalid enters form
+    // state. ONLY additionalUrls is touched — the other three arrays are free text.
+    // null vs [] is preserved: a null stays null (generate-questions treats both as
+    // "not covered", and the form's replaceExtracted handles either as empty).
+    const sanitized = {
+      ...result.object,
+      additionalUrls:
+        result.object.additionalUrls == null
+          ? result.object.additionalUrls
+          : result.object.additionalUrls
+              .map((u) => normalizeUrlCandidate(u))
+              .filter((u): u is string => u !== null),
+    };
+
     return Response.json(
-      { extractedContext: result.object },
+      { extractedContext: sanitized },
       { headers: { "X-RateLimit-Remaining": String(rl.remaining) } },
     );
   } catch (err) {
