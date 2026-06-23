@@ -119,13 +119,21 @@ export function serializeUserContext(fc: FormUserContext): {
   claimsToVerify: string[];
   publishRequired: boolean;
 } {
-  const vals = (items: ContextItem[]) => items.map((i) => i.value).filter((v) => v.length > 0);
+  // S159 — defensive flatten. Tolerate a non-array field or a non-string
+  // item.value so a malformed userContext shape can NEVER throw at submit.
+  // Before the onSubmit payload-build was moved inside try/catch, a throw here
+  // stranded the Submit button on "Submitting..." with no error (the prod
+  // silent-stuck bug). Well-formed data is unaffected.
+  const vals = (items: ContextItem[]) =>
+    (Array.isArray(items) ? items : [])
+      .map((i) => (typeof i?.value === "string" ? i.value : ""))
+      .filter((v) => v.length > 0);
   return {
-    domainKnowledge: vals(fc.domainKnowledge),
-    constraints: vals(fc.constraints),
-    additionalUrls: vals(fc.additionalUrls),
-    claimsToVerify: vals(fc.claimsToVerify),
-    publishRequired: fc.publishRequired,
+    domainKnowledge: vals(fc?.domainKnowledge),
+    constraints: vals(fc?.constraints),
+    additionalUrls: vals(fc?.additionalUrls),
+    claimsToVerify: vals(fc?.claimsToVerify),
+    publishRequired: Boolean(fc?.publishRequired),
   };
 }
 
