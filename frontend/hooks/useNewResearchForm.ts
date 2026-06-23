@@ -409,34 +409,40 @@ export function useNewResearchForm() {
     setIsSubmitting(true);
     setSubmitError(null);
 
-    // Strip transient fields before sending to API. pipelineMode is also
-    // stripped here so non-clone submissions don't ship a "full" default
-    // that ends up persisted to research_queue.pipeline_mode — keep that
-    // column NULL for fresh runs (CE-3 invariant: studio_only only with
-    // a parent_run_id).
-    const {
-      generatedQuestions: _gq,
-      dynamicAnswers: _da,
-      extractedContext: _ec,
-      pipelineMode,
-      userContext: _uc,
-      ...rest
-    } = data;
-
-    // S153 — flatten the provenance-tagged form userContext back to the wire
-    // string[] shape (serializeUserContext) so /api/queue, researchJobPayloadSchema,
-    // the user_context jsonb, and the worker stay unchanged. Provenance never
-    // reaches the wire.
-    const formPayload = { ...rest, userContext: serializeUserContext(data.userContext) };
-
-    // S35 Clone & Edit — stamp parentSlug if this submission is a clone.
-    // Backend resolves slug→id and writes research_queue.parent_run_id.
-    // CE-3 — pipelineMode rides alongside parentSlug; never sent without it.
-    const payload = cloneSlug
-      ? { ...formPayload, parentSlug: cloneSlug, pipelineMode }
-      : formPayload;
-
     try {
+      // Strip transient fields before sending to API. pipelineMode is also
+      // stripped here so non-clone submissions don't ship a "full" default
+      // that ends up persisted to research_queue.pipeline_mode — keep that
+      // column NULL for fresh runs (CE-3 invariant: studio_only only with
+      // a parent_run_id).
+      const {
+        generatedQuestions: _gq,
+        dynamicAnswers: _da,
+        extractedContext: _ec,
+        pipelineMode,
+        userContext: _uc,
+        ...rest
+      } = data;
+
+      // S153 — flatten the provenance-tagged form userContext back to the wire
+      // string[] shape (serializeUserContext) so /api/queue, researchJobPayloadSchema,
+      // the user_context jsonb, and the worker stay unchanged. Provenance never
+      // reaches the wire.
+      //
+      // S159 — payload construction (incl. serializeUserContext) lives INSIDE the
+      // try so any throw here surfaces as a visible submitError instead of
+      // stranding the button on "Submitting..." forever (setIsSubmitting(false)
+      // only runs in finally, which a pre-try throw would skip — the silent-stuck
+      // class the user hit in prod).
+      const formPayload = { ...rest, userContext: serializeUserContext(data.userContext) };
+
+      // S35 Clone & Edit — stamp parentSlug if this submission is a clone.
+      // Backend resolves slug→id and writes research_queue.parent_run_id.
+      // CE-3 — pipelineMode rides alongside parentSlug; never sent without it.
+      const payload = cloneSlug
+        ? { ...formPayload, parentSlug: cloneSlug, pipelineMode }
+        : formPayload;
+
       const res = await fetch("/api/queue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
