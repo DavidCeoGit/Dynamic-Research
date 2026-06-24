@@ -44,7 +44,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { studioFilename } from "./conventions.js";
 import { pickWinners } from "./studio-winner.js";
-import type { PipelineState, SelectedProducts } from "../types.js";
+import type {
+  PipelineState,
+  SelectedProducts,
+  StudioRecoveryProduct,
+} from "../types.js";
 
 // Canonical product order (matches SelectedProducts / conventions STUDIO_PRODUCTS).
 const STUDIO_ORDER = ["audio", "video", "slides", "report", "infographic"] as const;
@@ -73,18 +77,43 @@ export interface NlmArtifactRef {
   created_at: string;
 }
 
+/**
+ * S158 — the captured outcome of one download attempt. The S129 gate previously
+ * DISCARDED `r.status`/`r.stderr`/`r.signal` (the literal S156 diagnostic gap,
+ * design G9); the recovery taxonomy classifies on the captured result, never on
+ * `exitCode===0` (the Bug-12 backslash-path success stays a success).
+ */
+export interface DownloadResult {
+  ok: boolean;
+  exitCode?: number | null;
+  signal?: string | null;
+  stderr?: string;
+}
+
 export interface CompletenessDeps {
   /** COMPLETED artifacts (status_id===3) of an NLM type, newest-first. null on CLI/parse error. */
   listArtifacts: (notebookId: string, nlmType: string) => NlmArtifactRef[] | null;
-  /** Download a specific artifact BY ID to outPath. Resolves true only on a non-empty file. */
+  /**
+   * Download a specific artifact BY ID to outPath. `ok` is true only on a
+   * non-empty file; on failure the captured exitCode/signal/stderr drive the
+   * transient-vs-terminal taxonomy (design §8). `timeoutMs` lets the decoupled
+   * sweep pass a SHORTER spawnSync timeout (~90s) than the in-gate path's 300s,
+   * so a per-tick budget bounds added claim latency (Codex MAJOR-2).
+   */
   downloadArtifact: (
     notebookId: string,
     artifactId: string,
     nlmType: string,
     outPath: string,
-  ) => Promise<boolean>;
-  /** Filenames (not dirs) in the deliverables dir; [] if the dir is absent. */
-  listDir: (dir: string) => Promise<string[]>;
+    timeoutMs?: number,
+  ) => Promise<DownloadResult>;
+  /**
+   * Regular files (not dirs) in the deliverables dir as {name, size} pairs; []
+   * if the dir is absent. S161 R2-3: the gate is SIZE-AWARE — a 0-byte file is a
+   * truncated/empty non-deliverable and must NOT satisfy the gate, so the size
+   * travels with the name through this single inventory pass (no separate stat).
+   */
+  listDir: (dir: string) => Promise<Array<{ name: string; size: number }>>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   log: (msg: string) => void;
@@ -104,6 +133,55 @@ export interface CompletenessResult {
   recovered: string[];
   stillMissing: string[];
   notes: string[];
+  /**
+   * S158 taxonomy split (design §4 branch (b)): still-missing products whose
+   * failure was a TRANSIENT download of a CONFIRMED status_id-3 artifact — the
+   * recoverable-pending set. ALWAYS a subset of stillMissing; it NEVER makes
+   * `ok` true (ok stays `stillMissing.length === 0`). Empty when every
+   * still-missing product is genuinely not-ready or terminally failed.
+   */
+  recoverablePending: StudioRecoveryProduct[];
+  /** The notebook id recovery would use (echoed for the executor's payload). */
+  notebookId?: string;
+  /** Last captured NLM download stderr across recoverable products (design G9). */
+  recoveryStderr?: string;
+}
+
+// ── S158 download-failure classifier (design §8) ─────────────────────
+// TRANSIENT (everything except truly-local-disk): on a CONFIRMED status_id-3
+// winner a 404/401/403/5xx/429/network/timeout/SIGTERM is an NLM consistency-
+// lag or auth-refresh transient, not genuine loss. Biased toward recoverable —
+// the sweep's fresh re-list is the real terminality decider. The ONLY way to
+// regress is to mis-bucket a LOCAL-disk error as transient (which merely burns
+// bounded attempts, never a hard-fail), so the terminal set is kept tight.
+const TERMINAL_DOWNLOAD_PATTERNS: RegExp[] = [
+  /enospc/i,
+  /no space left/i,
+  /disk (is )?full/i,
+  /\bdisk quota exceeded\b/i,
+  /erofs/i,
+  /read-only file system/i,
+];
+
+/**
+ * Classify a CAPTURED download failure. Only TRULY-LOCAL, recovery-can't-fix
+ * conditions (disk-full / read-only FS / disk-quota) are 'terminal'; everything
+ * else — including 404/auth/5xx/network/timeout/SIGTERM/null-exit — is
+ * 'transient' (Codex MAJOR-7). NEVER keys on exitCode===0: classify only ever
+ * runs on an ok:false result, and the Bug-12 backslash-path success stays a
+ * success. exitCode/signal are accepted for forward-use + logging; the decision
+ * is the local-disk stderr signature.
+ */
+export function classifyDownloadFailure(
+  exitCode: number | null,
+  stderr: string,
+  signal: string | null,
+): "transient" | "terminal" {
+  void exitCode;
+  void signal;
+  const text = stderr ?? "";
+  if (TERMINAL_DOWNLOAD_PATTERNS.some((re) => re.test(text))) return "terminal";
+  return "transient";
 }
 
 /**
@@ -112,8 +190,10 @@ export interface CompletenessResult {
  * the whole point of a worker backstop is to not trust the drift-prone pipeline
  * (Codex MERGE MAJOR-3): a pipeline that drops/flips a product in state must not
  * be able to make the gate pass open. Defensive: tolerate a partial/loose object.
+ * Exported (S158) so the shared finalizeRecoveredRun() re-asserts the SAME
+ * obligation set before the sweep can flip a job to completed (Codex MAJOR-4).
  */
-function obligedProducts(selected: SelectedProducts | null | undefined): string[] {
+export function obligedProducts(selected: SelectedProducts | null | undefined): string[] {
   const sel = (selected ?? {}) as unknown as Record<string, unknown>;
   return STUDIO_ORDER.filter((p) => sel[p] === true);
 }
@@ -235,8 +315,17 @@ export async function enforceStudioCompleteness(
 ): Promise<CompletenessResult> {
   // Obligations come from the DURABLE DB selection, NOT pipeline-written state.
   const selected = obligedProducts(obliged);
-  const names = await deps.listDir(projectsDir).catch(() => [] as string[]);
-  const winners = pickWinners(names.map((name) => ({ name })));
+  const entries = await deps
+    .listDir(projectsDir)
+    .catch(() => [] as Array<{ name: string; size: number }>);
+  // S161 R2-3 (PRIMARY-path zero-byte fail-open): filter 0-byte files out BEFORE
+  // pickWinners. A present-but-empty convention file (truncated/empty download)
+  // is NOT a deliverable — counting it as a winner let the gate pass open and the
+  // executor upload an empty buffer + completeJob. Filtering it makes the obliged
+  // product MISSING → recovery re-download / fail-closed, identical to the
+  // finalize keystone's `size > 0` inventory guard (consistency across both paths).
+  const nonEmpty = entries.filter((e) => e.size > 0);
+  const winners = pickWinners(nonEmpty.map((e) => ({ name: e.name })));
   const presentBefore = selected.filter((p) => winners[p]);
   const missing = selected.filter((p) => !winners[p]);
 
@@ -247,6 +336,7 @@ export async function enforceStudioCompleteness(
     recovered: [],
     stillMissing: [],
     notes: [],
+    recoverablePending: [],
   };
 
   if (missing.length === 0) {
@@ -269,8 +359,13 @@ export async function enforceStudioCompleteness(
     result.notes.push(
       "state.notebook_id is null — cannot recover any missing product from NotebookLM",
     );
+    // No notebook id ⇒ nothing is recoverable-pending (branch (a) — genuine
+    // hard-fail). recoverablePending stays [] so the executor treats it as a
+    // plain terminal failure, never the recoverable branch.
     return result;
   }
+  // S158: echo the notebook id so the executor can build the recovery payload.
+  result.notebookId = notebookId;
 
   // Real run-start: {compact} names recovered files; {ms} is the strict anti-stale
   // floor. NO negative skew (Codex CRITICAL-1: a 5-min tolerance re-admitted a
@@ -311,6 +406,13 @@ export async function enforceStudioCompleteness(
     const deadline = deps.now() + budgetMs;
     let attempts = 0;
     let recovered = false;
+    // S158 taxonomy split: remember whether a status_id-3 winner was EVER
+    // confirmed for this product, and the LAST captured download failure, so
+    // the post-loop classifier can distinguish branch (b) (confirmed + transient
+    // download failure = recoverable-pending) from branch (a) (never confirmed,
+    // or a terminal local-disk failure = unchanged hard-fail).
+    let lastWinner: NlmArtifactRef | null = null;
+    let lastDownload: DownloadResult | null = null;
     for (;;) {
       // Don't START a new list once the budget is spent — but ALWAYS do the
       // first attempt (the dominant "poll lied, asset already done" case recovers
@@ -333,8 +435,8 @@ export async function enforceStudioCompleteness(
       if (winner) {
         const filename = studioFilename(winner.title, namingTs, product);
         const outPath = path.join(projectsDir, filename);
-        const downloaded = await deps.downloadArtifact(notebookId, winner.id, nlmType, outPath);
-        if (downloaded) {
+        const dl = await deps.downloadArtifact(notebookId, winner.id, nlmType, outPath);
+        if (dl.ok) {
           result.recovered.push(product);
           result.notes.push(
             `${product}: recovered ${filename} from completed artifact ${winner.id} (attempt ${attempts})`,
@@ -345,8 +447,13 @@ export async function enforceStudioCompleteness(
           recovered = true;
           break;
         }
+        // Confirmed status_id-3 artifact, download failed — remember it so the
+        // taxonomy split can classify transient-vs-terminal after the budget.
+        lastWinner = winner;
+        lastDownload = dl;
         result.notes.push(
-          `${product}: completed artifact ${winner.id} found but download failed — retrying`,
+          `${product}: completed artifact ${winner.id} found but download failed ` +
+            `(exit=${dl.exitCode ?? "?"} signal=${dl.signal ?? "-"}) — retrying`,
         );
       } else if (arts.length > 0) {
         result.notes.push(
@@ -365,17 +472,55 @@ export async function enforceStudioCompleteness(
 
     if (!recovered) {
       result.stillMissing.push(product);
-      result.notes.push(
-        `${product}: no recoverable completed artifact within ` +
-          `${Math.round(budgetMs / 60000)}min budget (${attempts} attempt(s))`,
-      );
-      deps.log(
-        `[studio-completeness] STILL MISSING ${product} after ${attempts} attempt(s) / ` +
-          `${Math.round(budgetMs / 60000)}min budget`,
-      );
+      // S158 taxonomy split (design §4): a status_id-3 winner WAS confirmed AND
+      // the last download failure classifies TRANSIENT ⇒ branch (b),
+      // recoverable-pending (the decoupled sweep can re-download it off the
+      // critical path). A never-confirmed product (still-rendering) or a
+      // TERMINAL local-disk failure stays branch (a) — unchanged hard-fail,
+      // NOT recoverable. ok stays `stillMissing.length === 0` regardless.
+      const cls = lastWinner
+        ? classifyDownloadFailure(
+            lastDownload?.exitCode ?? null,
+            lastDownload?.stderr ?? "",
+            lastDownload?.signal ?? null,
+          )
+        : null;
+      if (lastWinner && cls === "transient") {
+        result.recoverablePending.push({
+          product,
+          artifactId: lastWinner.id,
+          nlmType,
+          filename: studioFilename(lastWinner.title, namingTs, product),
+        });
+        if (lastDownload?.stderr && !result.recoveryStderr) {
+          result.recoveryStderr = lastDownload.stderr.slice(0, 500);
+        }
+        result.notes.push(
+          `${product}: confirmed artifact ${lastWinner.id} download TRANSIENTLY failed ` +
+            `within ${Math.round(budgetMs / 60000)}min budget (${attempts} attempt(s)) — recoverable-pending`,
+        );
+        deps.log(
+          `[studio-completeness] RECOVERABLE-PENDING ${product} (artifact ${lastWinner.id}) ` +
+            `after ${attempts} attempt(s) — handing to the out-of-band recovery sweep`,
+        );
+      } else {
+        result.notes.push(
+          `${product}: ${
+            lastWinner ? "download TERMINALLY failed (local-disk)" : "no recoverable completed artifact"
+          } within ${Math.round(budgetMs / 60000)}min budget (${attempts} attempt(s))`,
+        );
+        deps.log(
+          `[studio-completeness] STILL MISSING ${product} after ${attempts} attempt(s) / ` +
+            `${Math.round(budgetMs / 60000)}min budget`,
+        );
+      }
     }
   }
 
+  // INVARIANT (design §9): ok is EXACTLY "every selected product is on disk".
+  // recoverablePending is a subset of stillMissing counted as not-delivered, so
+  // it can NEVER make ok true — a recoverable job still takes the executor's
+  // !ok branch and is failed (then swept), never completed-while-missing.
   result.ok = result.stillMissing.length === 0;
   return result;
 }
@@ -387,18 +532,27 @@ export function realListArtifacts(
   notebookId: string,
   nlmType: string,
 ): NlmArtifactRef[] | null {
-  const r = spawnSync(
-    NLM_BIN,
-    ["artifact", "list", "-n", notebookId, "--type", nlmType, "--json"],
-    {
-      encoding: "utf-8",
-      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-      maxBuffer: 16 * 1024 * 1024,
-      timeout: 60_000,
-    },
-  );
-  if (r.status !== 0) return null;
+  // S162 (Codex grounded BLOCK): the ENTIRE body is throw-guarded. spawnSync THROWS
+  // SYNCHRONOUSLY on an invalid arg — notably an empty NLM_BIN (a blank
+  // NOTEBOOKLM_BIN survives the `??` default at line ~68) or a NUL byte in an arg —
+  // UNLIKE a missing binary / timeout / maxBuffer, which return error-shaped
+  // (status:null). This fn documents a throw-safe "returns null on failure"
+  // contract; an unguarded spawnSync throw broke it and escaped the recovery sweep,
+  // stranding a row before its attempt-bump/caps ran. Guarding the whole body (which
+  // also subsumes the prior JSON.parse try/catch) makes a list failure ALWAYS a
+  // transient null (the sweep's C1 retry path), never a thrown error.
   try {
+    const r = spawnSync(
+      NLM_BIN,
+      ["artifact", "list", "-n", notebookId, "--type", nlmType, "--json"],
+      {
+        encoding: "utf-8",
+        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 60_000,
+      },
+    );
+    if (r.status !== 0) return null;
     const parsed = JSON.parse(r.stdout ?? "") as {
       artifacts?: Array<{ id: string; title: string; created_at: string; status_id?: number }>;
     };
@@ -415,44 +569,150 @@ export function realListArtifacts(
   }
 }
 
-/** Download a specific artifact BY ID; resolve true only on a non-empty file. */
+/**
+ * Default spawnSync timeout for the in-gate recovery download. The decoupled
+ * sweep passes a SHORTER timeout (~90s) so a per-tick budget can bound added
+ * new-job-claim latency (Codex MAJOR-2) — spawnSync is uninterruptible once
+ * started, so a shorter atomic timeout is the only lever.
+ */
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 300_000;
+
+/**
+ * The NLM-download spawn seam. Injectable so the atomic-write + cleanup logic in
+ * realDownloadArtifact is unit-testable without the real NotebookLM CLI (S160
+ * Codex MAJOR — the prior partial-cleanup root fix shipped untested).
+ */
+export type DownloadSpawn = (
+  args: string[],
+  opts: { timeoutMs: number },
+) => { status: number | null; signal: NodeJS.Signals | null; stdout?: string; stderr?: string };
+
+const defaultDownloadSpawn: DownloadSpawn = (args, opts) => {
+  const r = spawnSync(NLM_BIN, args, {
+    encoding: "utf-8",
+    env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: opts.timeoutMs,
+  });
+  return { status: r.status, signal: r.signal ?? null, stdout: r.stdout, stderr: r.stderr };
+};
+
+const mangleWinPath = (p: string): string =>
+  p.replace(/^([A-Za-z]):\//, "\\$1\\").replace(/\//g, "\\");
+
+/**
+ * Download a specific artifact BY ID; `ok` is true only on a non-empty file.
+ * S158: captures exitCode/signal/stderr (the gate previously discarded them —
+ * the literal S156 diagnostic gap, G9) so the taxonomy can classify the failure.
+ *
+ * S160 CRITICAL (Codex): the download writes to a same-directory TEMP path and is
+ * ATOMICALLY promoted to the final convention path ONLY after exit 0 + a non-empty
+ * stat. The final convention path is therefore written EXCLUSIVELY by a successful
+ * rename — so a crash mid-download (the worker killed before this fn returns, when
+ * an in-process cleanup could never run) leaves only a `.part` temp file, never the
+ * convention-named final. That is what makes the sweep's on-disk-first skip (M5) and
+ * the finalize keystone safe: a convention file on disk always means a COMPLETE
+ * download. A FAILED download never touches the final, so a prior good file survives.
+ * (Bug-12: NLM may write a backslash-mangled path — the temp candidates absorb it.)
+ *
+ * S161 R2-2 (Codex QA): the promotion is RENAME-ONLY — there is NO `fs.rm(outPath)`
+ * before the rename and NO `fs.copyFile` fallback after it. fs.rename replaces an
+ * existing destination atomically (libuv MOVEFILE_REPLACE_EXISTING on Windows), so
+ * a failed promotion can never (a) delete a prior good final (no pre-delete) nor
+ * (b) leave a truncated convention-named final (no mid-copy crash window) — it
+ * returns {ok:false} with the prior final intact and the temp dropped. The
+ * `renameImpl` seam makes the rename-failure path unit-testable.
+ *
+ * S161 R2-1: any leftover `.part` (e.g. a kill mid-spawn before cleanup runs, or
+ * the sweep's artifact-gone branch) is on the upload skip-list (conventions.json
+ * skip_files.extensions), so an orphan temp can never reach the gallery via
+ * selectUploadSet or the finalize upload set.
+ */
 export async function realDownloadArtifact(
   notebookId: string,
   artifactId: string,
   nlmType: string,
   outPath: string,
-): Promise<boolean> {
-  const r = spawnSync(
-    NLM_BIN,
-    ["download", nlmType, "-n", notebookId, "-a", artifactId, outPath, "--force"],
-    {
-      encoding: "utf-8",
-      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-      maxBuffer: 16 * 1024 * 1024,
-      timeout: 300_000,
-    },
-  );
-  if (r.status !== 0) return false;
+  timeoutMs?: number,
+  spawnImpl: DownloadSpawn = defaultDownloadSpawn,
+  renameImpl: (src: string, dest: string) => Promise<void> = fs.rename,
+): Promise<DownloadResult> {
+  const tmpPath = `${outPath}.part`;
+  const tmpCandidates = [tmpPath, mangleWinPath(tmpPath)];
+  const cleanupTmp = async () => {
+    for (const c of tmpCandidates) await fs.rm(c, { force: true }).catch(() => {});
+  };
 
-  // Bug 12: NLM occasionally writes to a backslash-mangled path instead.
-  const candidates = [
-    outPath,
-    outPath.replace(/^([A-Za-z]):\//, "\\$1\\").replace(/\//g, "\\"),
-  ];
-  for (const candidate of candidates) {
-    try {
-      const st = await fs.stat(candidate);
-      if (st.isFile() && st.size > 0) {
-        if (candidate !== outPath) {
-          await fs.copyFile(candidate, outPath).catch(() => {});
-        }
-        return true;
-      }
-    } catch {
-      // try next candidate
-    }
+  // Clear any leftover temp from a prior crash so a stale .part can't masquerade.
+  await cleanupTmp();
+
+  // S162 (Codex grounded BLOCK): guard the spawn seam. defaultDownloadSpawn's
+  // spawnSync THROWS SYNCHRONOUSLY on an invalid arg (an empty NLM_BIN from a blank
+  // NOTEBOOKLM_BIN, or a NUL byte) — distinct from the error-shaped {status:null}
+  // returns for a missing binary / timeout. An injected spawnImpl could also throw.
+  // Map ANY throw to a fail-closed {ok:false} (this fn's documented "never throws"
+  // contract) so it never escapes the recovery sweep and strands a row; the temp is
+  // dropped and the prior final is left untouched.
+  let r: ReturnType<DownloadSpawn>;
+  try {
+    r = spawnImpl(
+      ["download", nlmType, "-n", notebookId, "-a", artifactId, tmpPath, "--force"],
+      { timeoutMs: timeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS },
+    );
+  } catch (err) {
+    await cleanupTmp();
+    return {
+      ok: false,
+      exitCode: null,
+      signal: null,
+      stderr: `spawn threw: ${(err as Error).message}`.slice(0, 2000),
+    };
   }
-  return false;
+  const exitCode = r.status;
+  const signal = r.signal ?? null;
+  // Scan BOTH streams (design §7) — the NLM CLI splits errors across them.
+  const stderr = [r.stderr, r.stdout].filter(Boolean).join("\n").slice(0, 2000) || undefined;
+
+  if (r.status !== 0) {
+    await cleanupTmp();
+    return { ok: false, exitCode, signal, stderr };
+  }
+
+  // Find the non-empty TEMP file and ATOMICALLY promote it to the final path via
+  // RENAME-ONLY (S161 R2-2). fs.rename replaces an existing destination atomically
+  // (libuv MOVEFILE_REPLACE_EXISTING on Windows) — so there is NO delete-then-write
+  // window and NO copyFile fallback:
+  //   • a rename failure leaves the prior good final UNTOUCHED (no pre-delete), and
+  //   • a crash can never strand a truncated convention-named final (no mid-copy).
+  // On promotion failure we drop the temp and return ok:false (fail-closed); the
+  // final is written EXCLUSIVELY by a successful rename of a confirmed-non-empty temp.
+  for (const cand of tmpCandidates) {
+    let st: Awaited<ReturnType<typeof fs.stat>>;
+    try {
+      st = await fs.stat(cand);
+    } catch {
+      continue; // this candidate wasn't written — try the next
+    }
+    if (!st.isFile() || st.size === 0) continue;
+    try {
+      await renameImpl(cand, outPath);
+    } catch (err) {
+      // Promotion failed: prior final intact, temp dropped, fail-closed. NEVER
+      // copyFile (a mid-copy crash truncates the final) and NEVER delete the final.
+      await cleanupTmp();
+      return {
+        ok: false,
+        exitCode,
+        signal,
+        stderr: (stderr ?? `promotion rename failed: ${(err as Error).message}`).slice(0, 2000),
+      };
+    }
+    await cleanupTmp();
+    return { ok: true, exitCode, signal };
+  }
+  // Exit 0 but no non-empty temp → transient failure; NEVER touch the final.
+  await cleanupTmp();
+  return { ok: false, exitCode, signal, stderr };
 }
 
 /** Default real deps for the worker. */
@@ -461,8 +721,19 @@ export function defaultDeps(log: (msg: string) => void): CompletenessDeps {
     listArtifacts: realListArtifacts,
     downloadArtifact: realDownloadArtifact,
     listDir: async (dir: string) => {
+      // S161 R2-3: stat each regular file so the gate can reject 0-byte winners.
       const dirents = await fs.readdir(dir, { withFileTypes: true });
-      return dirents.filter((d) => d.isFile()).map((d) => d.name);
+      const out: Array<{ name: string; size: number }> = [];
+      for (const d of dirents) {
+        if (!d.isFile()) continue;
+        try {
+          const st = await fs.stat(path.join(dir, d.name));
+          out.push({ name: d.name, size: st.size });
+        } catch {
+          // unreadable entry — skip (treated as absent)
+        }
+      }
+      return out;
     },
     now: () => Date.now(),
     sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),

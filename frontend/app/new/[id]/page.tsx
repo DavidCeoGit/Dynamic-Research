@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import type { ResearchJob, SelectedProducts } from "@/lib/types/queue";
 import { useToast } from "@/components/ToastProvider";
+import { isRecoveringStatus, studioStatusCardLabel } from "@/lib/run-status";
 
 // ── Phase timeline definition ──────────────────────────────────────
 
@@ -126,7 +127,12 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
   );
 
   const isComplete = job?.status === "completed";
-  const isFailed = job?.status === "failed";
+  // S158: a status='failed' row mid studio-recovery is NOT terminal — the
+  // artifacts are confirmed in NLM and the worker is re-downloading them
+  // out-of-band. Treat it as in-progress ("Finalizing media"), keep polling +
+  // timing, and suppress the Retry/Edit terminal affordances.
+  const isRecovering = isRecoveringStatus(job?.status, job?.studio_recovery_status);
+  const isFailed = job?.status === "failed" && !isRecovering;
   const isTerminal = isComplete || isFailed;
   const pct = job?.progress_pct ?? 0;
   const elapsed = useElapsed(job?.claimed_at ?? null, isTerminal);
@@ -265,7 +271,13 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
             <Loader2 className="h-7 w-7 animate-spin text-[#c8a951]" />
           )}
           <h1 className="text-2xl font-semibold tracking-tight text-zinc-100">
-            {isComplete ? "Research Complete" : isFailed ? "Research Failed" : "Research In Progress"}
+            {isComplete
+              ? "Research Complete"
+              : isFailed
+                ? "Research Failed"
+                : isRecovering
+                  ? "Finalizing Media"
+                  : "Research In Progress"}
           </h1>
         </div>
         <p className="mt-2 text-sm text-zinc-500 max-w-2xl">{job.topic}</p>
@@ -477,6 +489,24 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
             </div>
           )}
 
+          {/* S158 — recovering panel (status=failed + studio_recovery=pending).
+              NOT the terminal error panel: no Retry/Edit, the page keeps polling. */}
+          {isRecovering && (
+            <div className="rounded-lg border border-amber-800 bg-amber-500/5 p-6 animate-in fade-in duration-500">
+              <div className="flex items-start gap-4">
+                <Loader2 className="h-6 w-6 text-amber-400 shrink-0 mt-0.5 animate-spin" />
+                <div>
+                  <h3 className="text-lg font-medium text-amber-400">Finalizing your media</h3>
+                  <p className="mt-2 text-sm text-zinc-300">
+                    Your research is done and the media outputs are confirmed generated. A brief
+                    delivery hiccup delayed the download, so the system is automatically retrying.
+                    No action is needed — this page will update as soon as everything lands.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Error panel */}
           {isFailed && (
             <div className="rounded-lg border border-red-800 bg-red-500/5 p-6 animate-in fade-in duration-500">
@@ -521,7 +551,7 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
               <span className={`font-medium ${
                 isComplete ? "text-emerald-400" : isFailed ? "text-red-400" : "text-[#c8a951]"
               }`}>
-                {job.status}
+                {studioStatusCardLabel(job.status, job.studio_recovery_status)}
               </span>
             </div>
             <div className="flex justify-between">

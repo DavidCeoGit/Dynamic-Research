@@ -66,7 +66,8 @@
 
 import * as fs from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { createClient } from "@supabase/supabase-js";
+import { pathToFileURL } from "node:url";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { BUCKET, STUDIO_PRODUCTS, studioFilename, getContentType } from "../lib/conventions.js";
 import { PHASE_CHECKS } from "../lib/workflow-conventions.js";
 import { scopedStoragePath, uploadWithAudit } from "../lib/storage-paths.js";
@@ -81,12 +82,6 @@ import { resolveBySubmitId, hasUsableSubmitId } from "../lib/studio-snapshot-dif
 // ── Args ────────────────────────────────────────────────────────────
 
 const [workDirArg, manifestPathArg] = process.argv.slice(2);
-if (!workDirArg || !manifestPathArg) {
-  console.error(
-    "usage: regenerate-studio-products.ts <workDir> <manifestPath>",
-  );
-  process.exit(2);
-}
 
 // Node's fs handles C:/ paths; NLM download is happier with Windows-native
 // paths too (skill Bug 12). Normalise any /c/ MSYS form up front.
@@ -95,8 +90,11 @@ function toWinPath(p: string): string {
   if (m) return `${m[1].toUpperCase()}:/${m[2]}`;
   return p.replace(/\\/g, "/");
 }
-const workDir = toWinPath(workDirArg);
-const manifestPath = toWinPath(manifestPathArg);
+// Tolerate absent argv on import: the arg-validation + main() run ONLY under the
+// import.meta.main guard at the bottom (S160 C-A testability), so importing this
+// module for a unit test never process.exit(2)s or auto-runs the studio-only job.
+const workDir = toWinPath(workDirArg ?? "");
+const manifestPath = toWinPath(manifestPathArg ?? "");
 
 // ── Env ─────────────────────────────────────────────────────────────
 
@@ -666,10 +664,21 @@ async function main(): Promise<void> {
 
 async function downloadAndUpload(
   task: { product: string; cliType: string },
+  // Bare SupabaseClient (the exact type uploadWithAudit accepts) rather than
+  // ReturnType<typeof createClient>: the latter resolves to the schema-less
+  // `never` default under some program compositions, which then rejects the
+  // `<…,"public",…>` client createClient() actually returns (S160 — exposed when
+  // the new test imports this module into the tsc program).
   artifact: NlmArtifactRef,
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseClient,
   timestamp: string,
+  deps: { downloadArtifact?: typeof realDownloadArtifact } = {},
 ): Promise<{ ok: boolean; remoteName?: string; reason?: string }> {
+  // S158 widened realDownloadArtifact from Promise<boolean> to
+  // Promise<DownloadResult>; consume .ok (S160 C-A — the prior `if (!ok)` on the
+  // object was always false, a DEAD failure guard that let truncated/failed
+  // downloads upload as success). Injectable for the unit test.
+  const downloadArtifact = deps.downloadArtifact ?? realDownloadArtifact;
   const ext = STUDIO_PRODUCTS[task.product]?.ext;
   if (!ext) return { ok: false, reason: `unknown product (no ext in conventions): ${task.product}` };
 
@@ -680,9 +689,14 @@ async function downloadAndUpload(
   const remoteName = studioFilename(title, timestamp, task.product);
   const namedLocal = `${workDir}/${remoteName}`;
 
-  const ok = await realDownloadArtifact(notebookId, artifact.id, task.cliType, namedLocal);
-  if (!ok) {
-    return { ok: false, reason: `download of artifact ${artifact.id} failed or produced an empty file` };
+  const dl = await downloadArtifact(notebookId, artifact.id, task.cliType, namedLocal);
+  if (!dl.ok) {
+    return {
+      ok: false,
+      reason:
+        `download of artifact ${artifact.id} failed or produced an empty file` +
+        (dl.stderr ? `: ${dl.stderr.slice(0, 300)}` : ""),
+    };
   }
 
   const buf = await fs.readFile(namedLocal);
@@ -715,8 +729,20 @@ async function downloadAndUpload(
   return { ok: true, remoteName };
 }
 
-main().catch(async (err) => {
-  await fail(`unhandled error: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-});
+// ── CLI entry (runs ONLY when executed directly — never on import) ──────────
+// Mirrors finalize-recovered-run.ts: the arg-validation + main() are gated so a
+// unit test can import downloadAndUpload without process.exit(2) or auto-running
+// the studio-only job (S160 C-A testability).
+const isMain =
+  !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  if (!workDirArg || !manifestPathArg) {
+    console.error("usage: regenerate-studio-products.ts <workDir> <manifestPath>");
+    process.exit(2);
+  }
+  main().catch(async (err) => {
+    await fail(`unhandled error: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+  });
+}
 
-export {};
+export { downloadAndUpload };

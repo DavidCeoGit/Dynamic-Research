@@ -163,6 +163,27 @@ export type PlanReviewStatus =
   | "blocked"
   | "system_blocked";
 
+/**
+ * S158 transient-tolerant studio gate — parallel dimension to JobStatus.
+ * Mirrors agent/types.ts:StudioRecoveryStatus + the CHECK constraint in
+ * supabase/migrations/20260623_studio_recovery_dimension.sql §1. The UI derives
+ * the "Finalizing media" treatment from (status='failed' AND
+ * studio_recovery_status='pending').
+ */
+export type StudioRecoveryStatus = "none" | "pending" | "recovered" | "exhausted";
+
+export interface StudioRecoveryProduct {
+  product: string;
+  artifactId: string;
+  nlmType: string;
+  filename: string;
+}
+
+export interface StudioRecoveryPayload {
+  notebookId: string;
+  products: StudioRecoveryProduct[];
+}
+
 export interface ResearchJob {
   id: string;
   created_at: string;
@@ -197,6 +218,19 @@ export interface ResearchJob {
   plan_review_attempts?: number;
   plan_review_next_attempt_at?: string | null;
   plan_review_error?: string | null;
+  /**
+   * S158 transient-tolerant studio gate (migration
+   * 20260623_studio_recovery_dimension.sql). Optional so rows from before the
+   * migration deserialize cleanly. The detail page polls these via GET
+   * /api/queue/[id] (select *); the dashboard list select includes
+   * studio_recovery_status so it can derive the "Finalizing media" chip.
+   */
+  studio_recovery_status?: StudioRecoveryStatus;
+  studio_recovery_attempts?: number;
+  studio_recovery_first_failed_at?: string | null;
+  studio_recovery_next_attempt_at?: string | null;
+  studio_recovery_payload?: StudioRecoveryPayload | null;
+  studio_recovery_error?: string | null;
   /**
    * S102 file-upload (migration 20260610_research_queue_attachments.sql).
    * Optional so rows from before the migration deserialize cleanly. Plain
