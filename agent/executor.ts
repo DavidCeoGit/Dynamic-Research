@@ -32,6 +32,7 @@ import {
   type AttachmentDownloadResult,
 } from "./lib/attachments.js";
 import { archiveStaleStateFiles, findStateFile } from "./lib/find-state-file.js";
+import { readPipelineState } from "./lib/read-state-file.js";
 import { selectUploadSet } from "./lib/upload-set.js";
 import {
   sendCompletionEmail,
@@ -708,7 +709,7 @@ export async function executeJob(job: ResearchJob): Promise<string> {
       // so a runaway/cost-killed job can never be laundered into a success.
       const recoveryState =
         killReason === "DURATION" && !classified
-          ? await readStateForRecovery(workDir)
+          ? await readStateForRecovery(job, workDir)
           : null;
       if (shouldRecoverAfterDurationKill(killReason, !!classified, !!recoveryState?.notebook_id)) {
         log(
@@ -1801,40 +1802,114 @@ interface StateWatcher {
   stop: () => void;
 }
 
+/** Discriminated outcome of summarizing an OK-parsed state into a progress
+ * update. "malformed" = the parsed JSON object's phase/phase_status are not
+ * usable primitives (see summarizeStateProgress). */
+export type ProgressSummary =
+  | { kind: "malformed"; detail: string }
+  | { kind: "unchanged" }
+  | { kind: "update"; phase: string; phaseName: string; pct: number; phaseStatus: string };
+
+/**
+ * Pure + total: map an OK-parsed state to a progress-update decision. NEVER
+ * throws — returns "malformed" when phase/phase_status are not primitives.
+ *
+ * readPipelineState guarantees the parsed value is a JSON OBJECT, but NOT that
+ * its FIELDS are primitives. A JSON-representable object like
+ * `{"phase":{"toString":null}}` throws "Cannot convert object to primitive
+ * value" on PHASE_MAP key coercion (and a non-primitive phase_status throws on
+ * string interpolation). In watchStateFile's async setInterval such a throw
+ * would escape as an UNHANDLED REJECTION rather than the intended corrupt-state
+ * log — the old whole-tick try/catch silently swallowed it; this guard restores
+ * that safety while still surfacing it as a (deduped) signal. (Codex MERGE
+ * CRITICAL, S166.) Exported for unit testing.
+ */
+export function summarizeStateProgress(
+  state: PipelineState,
+  lastPhase: string,
+  lastPct: number,
+): ProgressSummary {
+  const phase: unknown = state.phase;
+  const phaseStatus: unknown = state.phase_status;
+  if (
+    (typeof phase === "object" && phase !== null) ||
+    (typeof phaseStatus === "object" && phaseStatus !== null)
+  ) {
+    return { kind: "malformed", detail: "phase/phase_status is not a primitive" };
+  }
+  const phaseKey = phase as string;
+  const mapped = PHASE_MAP[phaseKey];
+  const pct = mapped?.pct ?? lastPct;
+  const phaseName = mapped?.name ?? phaseKey;
+  if (phaseKey === lastPhase && pct === lastPct) {
+    return { kind: "unchanged" };
+  }
+  return {
+    kind: "update",
+    phase: phaseKey,
+    phaseName,
+    pct,
+    phaseStatus: phaseStatus as string,
+  };
+}
+
 function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
   let lastPhase = "";
   let lastPct = 0;
   let stopped = false;
+  // Dedupe: a present-but-unusable state file (unparseable OR a JSON object with
+  // non-primitive phase/phase_status) is logged ONCE per bad episode — the 5s
+  // poll would otherwise spam every tick. Re-armed after the next usable parse.
+  let loggedCorrupt = false;
+
+  const noteCorrupt = (detail: string) => {
+    if (!loggedCorrupt) {
+      loggedCorrupt = true;
+      log(job.id, `state.json present but unusable — progress sync paused: ${detail}`);
+    }
+  };
 
   const interval = setInterval(async () => {
     if (stopped) return;
-    try {
-      const stateFile = await findStateFile(workDir);
-      if (!stateFile) return;
 
-      const content = await fs.readFile(stateFile, "utf-8");
-      const state: PipelineState = JSON.parse(content);
+    const result = await readPipelineState(workDir);
 
-      const mapped = PHASE_MAP[state.phase];
-      const pct = mapped?.pct ?? lastPct;
-      const phaseName = mapped?.name ?? state.phase;
+    // ABSENT (not written yet) and transient IO (file vanished/locked between
+    // find and read, or workdir not yet enumerable) are EXPECTED during a live
+    // run — ignore and retry on the next tick.
+    if (result.kind === "absent" || result.kind === "io-error") return;
 
-      if (state.phase !== lastPhase || pct !== lastPct) {
-        lastPhase = state.phase;
-        lastPct = pct;
+    if (result.kind === "corrupt") {
+      noteCorrupt(
+        result.error instanceof Error ? result.error.message : String(result.error),
+      );
+      return;
+    }
 
-        log(job.id, `Phase: ${phaseName} (${pct}%) — ${state.phase_status}`);
+    // kind === "ok": the helper guarantees a JSON object but NOT primitive
+    // fields; summarizeStateProgress is total and flags a non-primitive
+    // phase/phase_status as "malformed" instead of throwing inside this async
+    // interval (Codex MERGE CRITICAL, S166).
+    const summary = summarizeStateProgress(result.state, lastPhase, lastPct);
+    if (summary.kind === "malformed") {
+      noteCorrupt(summary.detail);
+      return;
+    }
 
-        await updateJob(job.id, {
-          current_phase: phaseName,
-          phase_status: state.phase_status,
-          progress_pct: pct,
-        }).catch((err) => {
-          log(job.id, `Failed to update progress: ${err}`);
-        });
-      }
-    } catch {
-      // State file doesn't exist yet or is being written — ignore
+    loggedCorrupt = false; // re-arm: a usable state parsed cleanly this tick
+    if (summary.kind === "update") {
+      lastPhase = summary.phase;
+      lastPct = summary.pct;
+
+      log(job.id, `Phase: ${summary.phaseName} (${summary.pct}%) — ${summary.phaseStatus}`);
+
+      await updateJob(job.id, {
+        current_phase: summary.phaseName,
+        phase_status: summary.phaseStatus,
+        progress_pct: summary.pct,
+      }).catch((err) => {
+        log(job.id, `Failed to update progress: ${err}`);
+      });
     }
   }, 5_000);
 
@@ -1858,16 +1933,41 @@ function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
 /**
  * S136 Layer 2: read the parsed state.json for a cap-killed run so the recovery
  * branch can synthesize a success verdict + drive enforceStudioCompleteness.
- * Returns null on any IO/parse failure or absent state (→ not recovery-eligible,
- * since shouldRecoverAfterDurationKill requires a notebook_id).
+ *
+ * Returns null for ALL non-OK outcomes (→ not recovery-eligible, since
+ * shouldRecoverAfterDurationKill requires a notebook_id), but now distinguishes
+ * them via readPipelineState so a recoverable run is not silently dropped:
+ *   - absent   → no state file written; nothing to recover (silent, expected).
+ *   - io-error → transient read failure; fail CLOSED, logged.
+ *   - corrupt  → present but unparseable; the child is already dead so this is
+ *                genuine corruption (not a write race) — fail CLOSED, logged
+ *                loudly so a run lost to a malformed state file is visible.
  */
-async function readStateForRecovery(workDir: string): Promise<PipelineState | null> {
-  try {
-    const stateFile = await findStateFile(workDir);
-    if (!stateFile) return null;
-    return JSON.parse(await fs.readFile(stateFile, "utf-8")) as PipelineState;
-  } catch {
-    return null;
+async function readStateForRecovery(
+  job: ResearchJob,
+  workDir: string,
+): Promise<PipelineState | null> {
+  const result = await readPipelineState(workDir);
+  switch (result.kind) {
+    case "ok":
+      return result.state;
+    case "absent":
+      return null;
+    case "io-error": {
+      const msg =
+        result.error instanceof Error ? result.error.message : String(result.error);
+      log(job.id, `readStateForRecovery: state read failed — recovery skipped: ${msg}`);
+      return null;
+    }
+    case "corrupt": {
+      const msg =
+        result.error instanceof Error ? result.error.message : String(result.error);
+      log(
+        job.id,
+        `readStateForRecovery: state.json present but corrupt — recovery skipped: ${msg}`,
+      );
+      return null;
+    }
   }
 }
 
