@@ -11,6 +11,15 @@
  * (`{ valid, errors, plan? }`) so swapping in Zod later is mechanical.
  */
 
+// conventions.json is the canonical source of the studio-product key set (see
+// STUDIO_PRODUCTS below). Value import (not type-only): plan-types is agent-side
+// only — every importer (api-client/executor/plan-transports/plan-synthesizer/
+// plan-reviewer + tests) runs under Node, and conventions.ts already sits in the
+// worker module graph, so its module-load fs.readFileSync is not a new hazard
+// here. No frontend/edge module imports plan-types (frontend only mentions it in
+// comments), so this does not pull conventions into an edge bundle.
+import { STUDIO_PRODUCTS as STUDIO_PRODUCT_DEFS } from "./conventions.js";
+
 // ── Constants ───────────────────────────────────────────────────────
 
 export const PLAN_SCHEMA_VERSION = 1 as const;
@@ -101,14 +110,92 @@ export const SOURCE_PRIORITIES = [
 ] as const;
 export type SourcePriority = (typeof SOURCE_PRIORITIES)[number];
 
-export const STUDIO_PRODUCTS = [
+/**
+ * Studio product keys — SINGLE-SOURCED with the canonical conventions Record
+ * (agent/lib/conventions.json → filename_patterns.studio.products). Closes
+ * audit 2026-06-24 HIGH #1 (two same-NAMED STUDIO_PRODUCTS exports of
+ * incompatible shape that could silently drift AND collide on auto-import).
+ *
+ * Two fixes:
+ *   (a) The plan-types export is RENAMED `STUDIO_PRODUCTS` → `STUDIO_PRODUCT_LIST`
+ *       so it no longer collides with the conventions `STUDIO_PRODUCTS` Record
+ *       (`Record<string, ProductDef>`). One name → one shape, system-wide; an
+ *       auto-import can no longer grab the wrong shape.
+ *   (b) Its VALUES are derived from the conventions Record (below), so the key
+ *       set has a single runtime source of truth, not two independent literals.
+ *
+ * Two representations remain, and the split is irreducible: a PRECISE
+ * `StudioProduct` union must be a static literal — TypeScript cannot project a
+ * literal union from `Object.keys()` of a JSON-loaded Record (it widens to
+ * `string`, regressing every `StudioProduct[]` / `Record<StudioProduct, …>`
+ * type position). So:
+ *   - `STUDIO_PRODUCT_KEYS` (this tuple) is the compile-time TYPE anchor only.
+ *   - `STUDIO_PRODUCT_LIST` (the runtime list) is DERIVED from the conventions
+ *     Record below, so the RUNTIME key set has ONE source of truth
+ *     (conventions.json), per CLAUDE.md §7.
+ *   - `assertStudioProductsInSync()` runs at module load AND in
+ *     agent/test/studio-products-sync.test.ts; it throws if the JSON keys and
+ *     this tuple ever diverge, so the two are single-sourced-by-construction
+ *     and the `as StudioProduct[]` derivation can never silently lie.
+ *
+ * (A third literal — STUDIO_ORDER in studio-completeness.ts:54 — encodes NLM
+ * ordering and is out of scope for this bounded fix; tracked as a follow-up.)
+ */
+const STUDIO_PRODUCT_KEYS = [
   "audio",
   "video",
   "slides",
   "report",
   "infographic",
 ] as const;
-export type StudioProduct = (typeof STUDIO_PRODUCTS)[number];
+export type StudioProduct = (typeof STUDIO_PRODUCT_KEYS)[number];
+
+/**
+ * Runtime studio-product list, derived from the canonical conventions Record.
+ * Renamed from `STUDIO_PRODUCTS` (S165, audit HIGH #1) to avoid colliding with
+ * the conventions `STUDIO_PRODUCTS` Record. Order follows conventions.json
+ * key-insertion order (audio, video, slides, report, infographic) — identical
+ * to STUDIO_PRODUCT_KEYS, so error-message text produced via `.join("|")` is
+ * unchanged from the pre-S165 tuple. Frozen so the `readonly` type is also true
+ * at runtime (Object.keys returns a fresh mutable array).
+ */
+export const STUDIO_PRODUCT_LIST: readonly StudioProduct[] = Object.freeze(
+  Object.keys(STUDIO_PRODUCT_DEFS) as StudioProduct[],
+);
+
+/**
+ * Throw loudly if conventions.json's studio product keys diverge from the
+ * StudioProduct union (STUDIO_PRODUCT_KEYS). Runs at module load (so the worker
+ * fails fast at startup on drift — conventions.json changes already require a
+ * daemon restart per CLAUDE.md §7) and is re-asserted in the sync test (so
+ * drift fails `pnpm test` before it can reach the worker). Exported so the test
+ * pins exactly the invariant the runtime enforces.
+ *
+ * Comparison is set-based (sort + element-wise), so key ORDER between the two
+ * sources is intentionally NOT enforced here (order is pinned separately in the
+ * sync test). The two parameters default to the real sources; they exist ONLY
+ * so the sync test can feed deliberately-drifted inputs and prove the guard is
+ * not vacuous (it actually throws on a mismatch).
+ */
+export function assertStudioProductsInSync(
+  jsonKeys: readonly string[] = Object.keys(STUDIO_PRODUCT_DEFS),
+  unionKeys: readonly string[] = STUDIO_PRODUCT_KEYS,
+): void {
+  const fromJson = jsonKeys.slice().sort();
+  const fromUnion = unionKeys.slice().sort();
+  const mismatch =
+    fromJson.length !== fromUnion.length ||
+    fromJson.some((k, i) => k !== fromUnion[i]);
+  if (mismatch) {
+    throw new Error(
+      `STUDIO_PRODUCTS drift: conventions.json studio keys [${fromJson.join(", ")}] ` +
+        `!= plan-types StudioProduct union [${fromUnion.join(", ")}]. ` +
+        `Update STUDIO_PRODUCT_KEYS in plan-types.ts to match conventions.json ` +
+        `(filename_patterns.studio.products).`,
+    );
+  }
+}
+assertStudioProductsInSync();
 
 // ── Plan schema (design §2) ─────────────────────────────────────────
 
@@ -348,13 +435,13 @@ export function validateResearchPlan(
       !(sp.selected as unknown[]).every(
         (p) =>
           typeof p === "string" &&
-          STUDIO_PRODUCTS.includes(
+          STUDIO_PRODUCT_LIST.includes(
             stripParenthetical(p) as StudioProduct,
           ),
       )
     ) {
       errors.push(
-        `studio_products.selected must be subset of ${STUDIO_PRODUCTS.join("|")}`,
+        `studio_products.selected must be subset of ${STUDIO_PRODUCT_LIST.join("|")}`,
       );
     } else {
       normalizedStudioSelected = (sp.selected as string[]).map(
