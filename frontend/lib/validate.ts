@@ -318,6 +318,40 @@ export const planReviewStatusEnum = z.enum([
 ]);
 
 /**
+ * S158 transient-tolerant studio gate — mirrors agent/types.ts:StudioRecoveryStatus
+ * and the CHECK constraint in
+ * supabase/migrations/20260623_studio_recovery_dimension.sql §1. Only the
+ * EXECUTOR's initial transient write goes through the agent PATCH route
+ * (allowlisted below); the out-of-band sweep advances these via direct
+ * service-role REST, off this allowlist.
+ */
+export const studioRecoveryStatusEnum = z.enum([
+  "none",
+  "pending",
+  "recovered",
+  "exhausted",
+]);
+
+/**
+ * studio_recovery_payload jsonb — self-sufficient recovery descriptor (design
+ * G8). Bounded so a malformed worker write is rejected at the route rather than
+ * persisted. products is capped at the 5 studio products.
+ */
+export const studioRecoveryPayloadSchema = z.object({
+  notebookId: z.string().min(1).max(200),
+  products: z
+    .array(
+      z.object({
+        product: z.string().min(1).max(40),
+        artifactId: z.string().min(1).max(200),
+        nlmType: z.string().min(1).max(40),
+        filename: z.string().min(1).max(400),
+      }),
+    )
+    .max(5),
+});
+
+/**
  * S59 Codex v2 MINOR-2 fix: route-level plan_json schema-version guard.
  *
  * Loose `passthrough` — we enforce the schema_version literal at the route
@@ -355,6 +389,16 @@ export const agentUpdateSchema = z.object({
   // validation here catches schema drift if some new writer omits the format.
   plan_review_next_attempt_at: z.string().datetime().nullable().optional(),
   plan_review_error: z.string().max(500).nullable().optional(),
+  // S158 transient-tolerant studio gate. The executor writes these on the
+  // recoverable branch via api-client:updateJob (the route must explicitly
+  // pass them through — the allowlist drops unrecognized columns silently).
+  // null is meaningful (explicit clear) for the timestamptz/jsonb/text columns.
+  studio_recovery_status: studioRecoveryStatusEnum.optional(),
+  studio_recovery_attempts: z.number().int().min(0).optional(),
+  studio_recovery_first_failed_at: z.string().datetime().nullable().optional(),
+  studio_recovery_next_attempt_at: z.string().datetime().nullable().optional(),
+  studio_recovery_payload: studioRecoveryPayloadSchema.nullable().optional(),
+  studio_recovery_error: z.string().max(500).nullable().optional(),
 });
 
 // ── Form-level schema (extends API payload with transient form fields) ──

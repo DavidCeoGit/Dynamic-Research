@@ -107,6 +107,23 @@ export async function PATCH(
   if (data.plan_review_error !== undefined)
     updates.plan_review_error = data.plan_review_error;
 
+  // S158 transient-tolerant studio gate (allowlist extension — the schema
+  // accepts these, but the handler must explicitly pass them through or they
+  // get silently dropped, like plan_review_*). null is meaningful for the
+  // timestamptz/jsonb/text columns: undefined = leave unchanged, null = clear.
+  if (data.studio_recovery_status !== undefined)
+    updates.studio_recovery_status = data.studio_recovery_status;
+  if (data.studio_recovery_attempts !== undefined)
+    updates.studio_recovery_attempts = data.studio_recovery_attempts;
+  if (data.studio_recovery_first_failed_at !== undefined)
+    updates.studio_recovery_first_failed_at = data.studio_recovery_first_failed_at;
+  if (data.studio_recovery_next_attempt_at !== undefined)
+    updates.studio_recovery_next_attempt_at = data.studio_recovery_next_attempt_at;
+  if (data.studio_recovery_payload !== undefined)
+    updates.studio_recovery_payload = data.studio_recovery_payload;
+  if (data.studio_recovery_error !== undefined)
+    updates.studio_recovery_error = data.studio_recovery_error;
+
   if (Object.keys(updates).length === 0) {
     return Response.json({ error: "No fields to update" }, { status: 400 });
   }

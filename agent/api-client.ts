@@ -5,7 +5,13 @@
  * All mutating endpoints require X-Agent-Key auth header.
  */
 
-import type { ResearchJob, JobStatus, PlanReviewStatus } from "./types.js";
+import type {
+  ResearchJob,
+  JobStatus,
+  PlanReviewStatus,
+  StudioRecoveryStatus,
+  StudioRecoveryPayload,
+} from "./types.js";
 import type { ResearchPlan } from "./lib/plan-types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -82,6 +88,16 @@ export async function updateJob(
     plan_review_attempts?: number;
     plan_review_next_attempt_at?: string | null;
     plan_review_error?: string | null;
+    // S158 transient-tolerant studio gate — the executor writes these on the
+    // recoverable branch (the route allowlists them, like plan_review_*). The
+    // out-of-band sweep advances them via direct service-role REST, not this
+    // helper, so it stays off the agent allowlist.
+    studio_recovery_status?: StudioRecoveryStatus;
+    studio_recovery_attempts?: number;
+    studio_recovery_first_failed_at?: string | null;
+    studio_recovery_next_attempt_at?: string | null;
+    studio_recovery_payload?: StudioRecoveryPayload | null;
+    studio_recovery_error?: string | null;
   },
 ): Promise<ResearchJob> {
   const res = await fetch(`${API_BASE}/api/queue/${id}`, {

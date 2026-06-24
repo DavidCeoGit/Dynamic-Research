@@ -52,6 +52,18 @@ test("selectUploadSet: excludes skip-list scratch (exact / prefix / extension)",
   assert.deepEqual(got, ["i-am-...-report.md"]);
 });
 
+test("selectUploadSet: excludes leftover `.part` download temps (S161 R2-1)", () => {
+  // Sensitivity: without `.part` on skip_files.extensions, isSkipFile() returns
+  // false for the temp and it leaks into the upload set (→ the gallery).
+  const entries = [
+    file("some-title-20260615-190502-video.mp4"), // keep
+    file("some-title-20260615-190502-video.mp4.part"), // orphan temp — skip
+    file("some-title-20260615-190502-audio.mp3.part"), // orphan temp — skip
+  ];
+  const got = selectUploadSet(entries).map((f) => f.remoteName);
+  assert.deepEqual(got, ["some-title-20260615-190502-video.mp4"]);
+});
+
 test("selectUploadSet: excludes non-files / subdirectories (Codex NIT)", () => {
   const entries = [file("i-am-...-report.md"), dir(".claude"), dir("subdir")];
   const got = selectUploadSet(entries).map((f) => f.remoteName);
@@ -154,4 +166,25 @@ test("uploadOutputs: missing Projects dir → selected===0 (no throw)", async ()
   const res = await uploadOutputs(JOB, path.join(os.tmpdir(), "does-not-exist-uploadset"), uploader);
   assert.equal(res.selected, 0);
   assert.equal(res.uploaded, 0);
+});
+
+test("uploadOutputs: a 0-byte deliverable is REFUSED as a failed upload (S161 R2-3 belt)", async () => {
+  // Sensitivity: without the content.length===0 guard the empty buffer is uploaded
+  // (uploaded=2, failed=0) and the job would complete — the exact fail-open R2-3
+  // closes. The guard records it as failed so the executor's failed-upload hard-fail
+  // catches it before completeJob.
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "uploadset-zero-"));
+  try {
+    await fs.writeFile(path.join(base, "report.md"), "real content");
+    await fs.writeFile(path.join(base, "audio.mp3"), ""); // 0 bytes
+    const { uploader, calls } = makeStore();
+    const res = await uploadOutputs(JOB, base, uploader);
+    assert.equal(res.selected, 2, "both files are selected (size is not a select-time filter)");
+    assert.equal(res.uploaded, 1, "only the non-empty deliverable uploads");
+    assert.equal(res.failed.length, 1, "the 0-byte deliverable is recorded as failed");
+    assert.match(res.failed[0].reason, /zero-byte/i);
+    assert.ok(!calls.some((c) => c.filename === "audio.mp3"), "the 0-byte file is never sent to storage");
+  } finally {
+    await fs.rm(base, { recursive: true, force: true });
+  }
 });

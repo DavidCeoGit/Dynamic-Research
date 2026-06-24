@@ -265,12 +265,18 @@ export default function HomePage() {
               </>
             ) : (
               activeJobs.map((job) => {
-                // Only terminal-failure jobs get a hide control. `cancelled` is
-                // currently filtered out of GET /api/queue upstream so it never
-                // reaches here, but the condition keeps the UI forward-safe if
-                // cancelled is ever surfaced (the hide route already accepts it).
+                // S158: a status='failed' row whose studio_recovery_status is
+                // 'pending' is NOT terminal — the artifacts are confirmed in NLM
+                // and the worker is re-downloading them out-of-band. Render it as
+                // an in-progress "Finalizing media" row, not red "Failed".
+                const isRecovering =
+                  job.status === "failed" &&
+                  job.studio_recovery_status === "pending";
+                // Only TERMINAL-failure jobs get a hide control — a recovering
+                // row is excluded (it should not be hideable while self-healing).
                 const isHideable =
-                  job.status === "failed" || job.status === "cancelled";
+                  (job.status === "failed" || job.status === "cancelled") &&
+                  !isRecovering;
                 return (
                   <Link
                     key={job.id}
@@ -284,7 +290,9 @@ export default function HomePage() {
                     {/* Progress bar at top */}
                     <div
                       className={`absolute top-0 left-0 h-1 transition-all duration-1000 ease-out ${
-                        job.status === "failed" ? "bg-red-500" : "bg-[#c8a951]"
+                        job.status === "failed" && !isRecovering
+                          ? "bg-red-500"
+                          : "bg-[#c8a951]"
                       }`}
                       style={{ width: `${job.progress_pct}%` }}
                     />
@@ -293,17 +301,17 @@ export default function HomePage() {
                       <div className="mb-3 flex items-start justify-between gap-4">
                         <span
                           className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${
-                            job.status === "failed"
+                            job.status === "failed" && !isRecovering
                               ? "bg-red-500/10 text-red-400"
                               : "bg-[#c8a951]/10 text-[#c8a951]"
                           }`}
                         >
-                          {job.status === "failed" ? (
+                          {job.status === "failed" && !isRecovering ? (
                             <AlertTriangle className="h-3 w-3" />
                           ) : (
                             <Clock className="h-3 w-3 animate-pulse" />
                           )}
-                          {job.status}
+                          {isRecovering ? "Finalizing media" : job.status}
                         </span>
                         <span className="text-xs font-mono text-zinc-500">
                           {job.progress_pct}%
@@ -326,16 +334,18 @@ export default function HomePage() {
                       <div className="flex items-center gap-2">
                         <span
                           className={`capitalize ${
-                            job.status === "failed"
+                            job.status === "failed" && !isRecovering
                               ? "text-red-400"
                               : "text-zinc-400"
                           }`}
                         >
-                          {job.status === "failed"
-                            ? "Execution Error"
-                            : phaseFromProgress(job.progress_pct) ||
-                              job.current_phase ||
-                              "Pending"}
+                          {isRecovering
+                            ? "Finalizing media — retrying"
+                            : job.status === "failed"
+                              ? "Execution Error"
+                              : phaseFromProgress(job.progress_pct) ||
+                                job.current_phase ||
+                                "Pending"}
                         </span>
                         {/* Hide / Unhide control — only failed/cancelled jobs */}
                         {isHideable && (

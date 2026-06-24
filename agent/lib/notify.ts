@@ -190,6 +190,71 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+// ── S158 transient-tolerant studio gate notifications ───────────────
+
+type DeliveryDelayedArgs = {
+  to: string;
+  slug: string;
+  topic: string;
+};
+
+/**
+ * S158 (design §7/§10) — NON-TERMINAL "delivery delayed, retrying
+ * automatically" email, sent to the requester on the recoverable branch
+ * INSTEAD of notifyTerminal('failed'). A dedicated helper is required because
+ * notifyTerminal/sendCompletionEmail can only render the hardcoded "failed"
+ * body (Codex MAJOR-6) — a softer error string still reads as failure. Distinct
+ * subject/body, NO "failed"/"error" language. Reads RESEND_API_KEY; if missing,
+ * logs + returns (never throws — a notification failure must never break a run).
+ */
+export async function sendDeliveryDelayedEmail(args: DeliveryDelayedArgs): Promise<void> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.warn(
+      `[notify] RESEND_API_KEY not set — skipping delivery-delayed email to ${args.to} for slug ${args.slug}.`,
+    );
+    return;
+  }
+  const from = process.env.RESEND_FROM_EMAIL || "Dynamic Research <onboarding@resend.dev>";
+  const galleryUrl = `${GALLERY_BASE_URL}/${args.slug}/gallery`;
+  const topicSanitized = args.topic.replace(/\s+/g, " ").trim();
+  const topicShort = topicSanitized.length > 100 ? topicSanitized.slice(0, 97) + "..." : topicSanitized;
+  const subject = `Your Dynamic Research run is finalizing: ${topicShort}`;
+  const text =
+    `Good news — your research is done; we're finalizing the media deliverables.\n\n` +
+    `Topic: ${args.topic}\n\n` +
+    `One or more outputs (audio / video / slides / infographic) finished generating but a ` +
+    `brief delivery hiccup delayed the download. The system is automatically retrying — no ` +
+    `action is needed on your part. You'll get a final email with the gallery link as soon as ` +
+    `everything lands.\n\n` +
+    `Gallery (will populate when finalization completes): ${galleryUrl}\n\n` +
+    `— Dynamic Research`;
+  const html =
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:560px;margin:0 auto;color:#111;line-height:1.5">` +
+    `<h2 style="margin:0 0 16px 0;color:#c2410c">Finalizing your media — retrying automatically</h2>` +
+    `<p style="margin:0 0 12px 0"><strong>Topic:</strong> ${escapeHtml(args.topic)}</p>` +
+    `<p style="margin:0 0 12px 0;color:#555">Your research is done; one or more media outputs finished generating but a brief delivery hiccup delayed the download. The system is automatically retrying — <strong>no action is needed</strong>. You'll get a final email with the gallery link as soon as everything lands.</p>` +
+    `<p style="margin:24px 0 0 0;color:#888;font-size:13px">If you don't receive the completion email within ~48 hours, reply to this email.</p>` +
+    `</div>`;
+  const body = { from, to: args.to, subject, text, html };
+  try {
+    const res = await fetch(RESEND_API, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errBody = await res.text();
+      console.warn(`[notify] delivery-delayed POST failed (HTTP ${res.status}) for ${args.to}: ${errBody.slice(0, 300)}`);
+      return;
+    }
+    const data = (await res.json()) as { id?: string };
+    console.log(`[notify] delivery-delayed email sent to ${args.to} (slug=${args.slug}, resend_id=${data.id ?? "?"})`);
+  } catch (err) {
+    console.warn(`[notify] delivery-delayed email threw for ${args.to}: ${(err as Error).message}`);
+  }
+}
+
 // ── S59 plan-review gate notifications ──────────────────────────────
 
 /**
@@ -478,6 +543,61 @@ export async function sendPreflightRecoveryEmail(args: PreflightRecoveryEmailArg
     `<p style="margin:0 0 8px 0"><strong>Last failure kind:</strong> ${escapeHtml(args.lastFailureKind)}</p>` +
     `<p style="margin:0 0 12px 0"><strong>Outage duration:</strong> ~${args.outageDurationMin} min</p>` +
     `<p style="margin:24px 0 0 0;color:#555">Cron-driven worker will resume polling on the next tick.</p>` +
+    `</div>`;
+  await postOperatorAlert(subject, text, html);
+}
+
+// ── S158 studio-recovery exhaustion operator alert ──────────────────
+
+export interface StudioRecoveryExhaustedEmailArgs {
+  jobId: string;
+  slug: string;
+  topic: string;
+  attempts: number;
+  /** Why recovery terminalized: "attempt-cap" | "age-cap" | "artifact-gone". */
+  reason: string;
+  /** Products that never recovered. */
+  products: string[];
+  /** Hours since the first failure (for context in the alert). */
+  ageHours: number;
+}
+
+/**
+ * S158 (design §7/§10) — operator alert via PREFLIGHT_NOTIFY_EMAIL when the
+ * decoupled studio-recovery sweep EXHAUSTS a job (attempt/age cap breached OR
+ * the artifact is no longer status_id 3 in NLM). Fires ONCE — idempotent by the
+ * studio_recovery_status='exhausted' flip that the caller does before sending.
+ * Does NOT feed the S64 preflight circuit breaker: an NLM domain failure is not
+ * a provider auth/quota/infra outage. postOperatorAlert swallows all errors +
+ * skips on an unset recipient (never throws).
+ */
+export async function sendStudioRecoveryExhaustedEmail(
+  args: StudioRecoveryExhaustedEmailArgs,
+): Promise<void> {
+  const subject = `[Dynamic Research] Studio recovery EXHAUSTED (${args.reason}) — ${args.slug}`;
+  const text =
+    `A studio-completeness recovery has exhausted and the job is now a genuine hard-failure.\n\n` +
+    `Job: ${args.jobId}\n` +
+    `Slug: ${args.slug}\n` +
+    `Topic: ${args.topic}\n` +
+    `Unrecovered product(s): ${args.products.join(", ") || "(unknown)"}\n` +
+    `Reason: ${args.reason}\n` +
+    `Recovery passes: ${args.attempts}\n` +
+    `Age since first failure: ~${args.ageHours}h\n\n` +
+    `The artifact(s) were confirmed complete in NotebookLM at the time of the gate but could not ` +
+    `be downloaded within the recovery window. Manual recourse: re-run the download by id, or ` +
+    `scripts/finalize-recovered-run.ts once the artifacts re-download.\n\n` +
+    `— Dynamic Research studio-recovery`;
+  const html =
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;color:#111;line-height:1.5">` +
+    `<h2 style="margin:0 0 16px 0;color:#b91c1c">Studio recovery exhausted (${escapeHtml(args.reason)})</h2>` +
+    `<p style="margin:0 0 8px 0"><strong>Job:</strong> ${escapeHtml(args.jobId)}</p>` +
+    `<p style="margin:0 0 8px 0"><strong>Slug:</strong> ${escapeHtml(args.slug)}</p>` +
+    `<p style="margin:0 0 8px 0"><strong>Topic:</strong> ${escapeHtml(args.topic)}</p>` +
+    `<p style="margin:0 0 8px 0"><strong>Unrecovered product(s):</strong> ${escapeHtml(args.products.join(", ") || "(unknown)")}</p>` +
+    `<p style="margin:0 0 8px 0"><strong>Recovery passes:</strong> ${args.attempts}</p>` +
+    `<p style="margin:0 0 12px 0"><strong>Age since first failure:</strong> ~${args.ageHours}h</p>` +
+    `<p style="margin:16px 0 0 0;color:#555">Manual recourse: re-run the download by id, or scripts/finalize-recovered-run.ts once the artifacts re-download.</p>` +
     `</div>`;
   await postOperatorAlert(subject, text, html);
 }

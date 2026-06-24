@@ -33,7 +33,11 @@ import {
 } from "./lib/attachments.js";
 import { archiveStaleStateFiles, findStateFile } from "./lib/find-state-file.js";
 import { selectUploadSet } from "./lib/upload-set.js";
-import { sendCompletionEmail, sendPlanReviewEmail } from "./lib/notify.js";
+import {
+  sendCompletionEmail,
+  sendPlanReviewEmail,
+  sendDeliveryDelayedEmail,
+} from "./lib/notify.js";
 import {
   uploadWithAudit,
   type UploadWithAuditOpts,
@@ -60,7 +64,8 @@ import {
   enforceStudioCompleteness,
   defaultDeps as studioCompletenessDeps,
 } from "./lib/studio-completeness.js";
-import type { ResearchJob, PipelineState } from "./types.js";
+import { studioRecoveryBackoffMs } from "./lib/studio-recovery-sweep.js";
+import type { ResearchJob, PipelineState, StudioRecoveryPayload } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -467,6 +472,24 @@ export async function executeJob(job: ResearchJob): Promise<string> {
   await fs.mkdir(workDir, { recursive: true });
   await fs.mkdir(projectsDir, { recursive: true });
 
+  // S161 R2-1 (belt-and-suspenders): clear any orphan `*.part` download temps left
+  // in the REUSED projectsDir by a prior killed/crashed run (realDownloadArtifact
+  // writes the binary to `<final>.part` and only renames it into place on success;
+  // a kill mid-spawn or the sweep's artifact-gone branch can strand one). The
+  // `.part` ext is on the upload skip-list so an orphan can never reach the gallery,
+  // but sweeping at job start keeps the dir from accumulating temps across re-queues.
+  // Best-effort — never blocks the run.
+  try {
+    const existing = await fs.readdir(projectsDir, { withFileTypes: true });
+    for (const d of existing) {
+      if (d.isFile() && d.name.endsWith(".part")) {
+        await fs.rm(path.join(projectsDir, d.name), { force: true }).catch(() => {});
+      }
+    }
+  } catch {
+    // projectsDir freshly created / unreadable — nothing to sweep
+  }
+
   // S117 stale-terminal-state fail-open hardening: per-slug workdirs are reused
   // across re-queues. Archive any prior attempt's *-state.json BEFORE this run
   // writes or the poller/gate reads, so findStateFile() can never return a
@@ -822,6 +845,93 @@ export async function executeJob(job: ResearchJob): Promise<string> {
           `unrecoverable from NotebookLM: ${completeness.stillMissing.join(", ")}. ` +
           completeness.notes.join(" | ");
         log(job.id, reason.slice(0, 2000));
+
+        // S158 taxonomy split (design §4/§7): a job is recoverable-pending iff
+        // EVERY still-missing product is branch (b) — a CONFIRMED status_id-3
+        // artifact whose download TRANSIENTLY failed. If so, tag the parallel
+        // studio_recovery_* dimension and hand to the out-of-band sweep instead
+        // of a terminal failure. INVARIANT (design §9): status STILL becomes
+        // 'failed' and we STILL throw — recoverablePending never makes ok true,
+        // so this branch can NEVER fall through to completeJob. The only
+        // differences from today's behavior are the recovery metadata + a
+        // non-terminal "delivery delayed" email (vs the "failed" email).
+        const recoverable = completeness.recoverablePending ?? [];
+        const notebookId = completeness.notebookId;
+        const purelyTransient =
+          recoverable.length > 0 &&
+          !!notebookId &&
+          completeness.stillMissing.every((p) =>
+            recoverable.some((rp) => rp.product === p),
+          );
+
+        if (purelyTransient) {
+          const nowMs = Date.now();
+          const nowIso = new Date(nowMs).toISOString();
+          // attempts=1 marks the in-gate recovery attempt; the sweep increments
+          // from here. first_failed_at is the TRIGGER-IMMUNE age anchor (G6),
+          // written ONCE here and never re-touched by the sweep.
+          const nextIso = new Date(nowMs + studioRecoveryBackoffMs(1)).toISOString();
+          const payload: StudioRecoveryPayload = {
+            notebookId: notebookId as string,
+            products: recoverable.map((rp) => ({
+              product: rp.product,
+              artifactId: rp.artifactId,
+              nlmType: rp.nlmType,
+              filename: rp.filename,
+            })),
+          };
+          let dimensionWritten = false;
+          try {
+            // ONE atomic updateJob — fold the recovery dimension into the SAME
+            // PATCH as status='failed'+error_message so a crash between writes
+            // can't leave a 'failed' row with no recovery dimension (design §7
+            // ordering note); a missing dimension would just yield today's
+            // hard-fail (fail-safe).
+            await updateJob(job.id, {
+              status: "failed",
+              error_message: reason.slice(0, 2000),
+              studio_recovery_status: "pending",
+              studio_recovery_first_failed_at: nowIso,
+              studio_recovery_attempts: 1,
+              studio_recovery_next_attempt_at: nextIso,
+              studio_recovery_payload: payload,
+              studio_recovery_error: completeness.recoveryStderr?.slice(0, 500),
+            });
+            dimensionWritten = true;
+          } catch (e) {
+            // Fail-SAFE: a recovery-dimension WRITE failure degrades to a plain
+            // terminal failure (today's behavior — the S156 floor we accept).
+            log(
+              job.id,
+              `[studio-completeness] recovery-dimension write failed (${(e as Error).message}) — degrading to terminal failed`,
+            );
+          }
+          if (dimensionWritten) {
+            log(
+              job.id,
+              `[studio-completeness] TRANSIENT branch — recoverable-pending ` +
+                `[${recoverable.map((r) => r.product).join(",")}] tagged for out-of-band ` +
+                `recovery (first retry ~${Math.round(studioRecoveryBackoffMs(1) / 60000)}min)`,
+            );
+            // Non-terminal "delivery delayed" email INSTEAD of the "failed" one.
+            if (job.notify_email) {
+              await sendDeliveryDelayedEmail({
+                to: job.notify_email,
+                slug: job.topic_slug,
+                topic: job.topic,
+              }).catch((err) =>
+                log(job.id, `[notify] delivery-delayed email failed (non-fatal): ${(err as Error).message}`),
+              );
+            }
+            // status='failed' + throw (the telemetry finally still runs); the
+            // decoupled sweep self-heals it out-of-band. NEVER reaches completeJob.
+            throw new Error(reason);
+          }
+          // else: write failed → fall through to the terminal hard-fail below.
+        }
+
+        // Branch (a), or a recoverable branch whose dimension write failed —
+        // today's terminal behavior verbatim.
         await failJob(job.id, reason.slice(0, 2000));
         await notifyTerminal(job, "failed", reason.slice(0, 2000));
         throw new Error(reason);
@@ -1886,6 +1996,16 @@ export async function uploadOutputs(
     const localPath = path.join(projectsDir, remoteName);
     try {
       const content = await fs.readFile(localPath);
+
+      // S161 R2-3 (belt-and-suspenders behind the size-aware gate): a 0-byte
+      // deliverable is always a truncated/empty bug. Refuse it as a FAILED upload
+      // so the existing `uploadResult.failed.length > 0` hard-fail catches it before
+      // completeJob — an empty buffer must never be uploaded + reported as success.
+      if (content.length === 0) {
+        log(job.id, `Refusing 0-byte deliverable (not uploaded): ${remoteName}`);
+        failed.push({ remoteName, reason: "refused: zero-byte deliverable" });
+        continue;
+      }
       const contentType = getContentType(remoteName);
 
       const result = await upload({

@@ -20,6 +20,41 @@ export type PlanReviewStatus =
   | "system_blocked";
 
 /**
+ * S158 transient-tolerant studio gate (parallel dimension to JobStatus — the
+ * plan_review_* precedent). Mirrors the CHECK constraint in
+ * supabase/migrations/20260623_studio_recovery_dimension.sql §1.
+ *   none      -- not in the recovery path (default)
+ *   pending   -- artifact confirmed status_id 3 in NLM but download transiently
+ *                failed; the decoupled sweep is retrying off the critical path
+ *   recovered -- sweep re-downloaded + re-asserted obligations + completed
+ *   exhausted -- attempt/age cap breached OR artifact gone (terminal)
+ */
+export type StudioRecoveryStatus = "none" | "pending" | "recovered" | "exhausted";
+
+/**
+ * S158 — one still-pending studio product carried in studio_recovery_payload.
+ * artifactId is the confirmed status_id-3 NLM artifact id so the sweep
+ * downloads BY ID (never default-latest — feedback_nlm_download_default_latest).
+ */
+export interface StudioRecoveryProduct {
+  product: string;
+  artifactId: string;
+  nlmType: string;
+  filename: string;
+}
+
+/**
+ * S158 — self-sufficient recovery descriptor (design G8) persisted in the
+ * studio_recovery_payload jsonb column. Carries the notebook id + the confirmed
+ * artifact ids of every product whose download transiently failed, so the
+ * out-of-band sweep can re-download by id without state.json on disk.
+ */
+export interface StudioRecoveryPayload {
+  notebookId: string;
+  products: StudioRecoveryProduct[];
+}
+
+/**
  * Pipeline mode (CE-3). "full" runs the normal deep-research pipeline via
  * Claude. "studio_only" skips research entirely and regenerates Studio
  * products against the parent run's existing notebook — the worker spawns
@@ -213,6 +248,20 @@ export interface ResearchJob {
   plan_review_attempts?: number;
   plan_review_next_attempt_at?: string | null;
   plan_review_error?: string | null;
+  /**
+   * S158 transient-tolerant studio gate (migration
+   * 20260623_studio_recovery_dimension.sql). Optional/defaulted so rows from
+   * before the migration deserialize cleanly. The executor writes these on the
+   * transient branch via updateJob; the decoupled sweep advances them via
+   * direct service-role REST. See
+   * Documentation/studio-completeness-transient-tolerance-design-gate.md.
+   */
+  studio_recovery_status?: StudioRecoveryStatus;
+  studio_recovery_attempts?: number;
+  studio_recovery_first_failed_at?: string | null;
+  studio_recovery_next_attempt_at?: string | null;
+  studio_recovery_payload?: StudioRecoveryPayload | null;
+  studio_recovery_error?: string | null;
   /**
    * S102 file-upload (migration 20260610_research_queue_attachments.sql).
    * Optional so rows from before the migration deserialize cleanly. The

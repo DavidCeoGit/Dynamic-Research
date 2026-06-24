@@ -84,7 +84,7 @@
     }
   },
   "skip_files": {
-    "_doc": "Files that should NEVER be uploaded to Supabase Storage. Pipeline-internal state, scratch, or sensitive. v2 (S30) added 'nlm-' prefix (was 'nlm_' only — typo: actual NLM helper filenames use hyphen) and extensions skip set with '.py' (helper Python scripts in workdir).",
+    "_doc": "Files that should NEVER be uploaded to Supabase Storage. Pipeline-internal state, scratch, or sensitive. v2 (S30) added 'nlm-' prefix (was 'nlm_' only — typo: actual NLM helper filenames use hyphen) and extensions skip set with '.py' (helper Python scripts in workdir). S161 (R2-1) added '.part' — the realDownloadArtifact temp suffix; a leftover '.part' from a killed/crashed download (or the sweep's artifact-gone branch) must NEVER ship as a deliverable. isSkipFile() matches on endsWith, so any '<final>.part' is excluded from BOTH selectUploadSet and the finalize upload set.",
     "exact": [
       "claude-prompt.md",
       "job-manifest.json",
@@ -100,7 +100,8 @@
       "."
     ],
     "extensions": [
-      ".py"
+      ".py",
+      ".part"
     ]
   },
   "attachments": {

@@ -37,6 +37,7 @@ import {
 } from "./lib/preflight-backoff.js";
 import { sendPreflightBackoffEmail } from "./lib/notify.js";
 import { maybeRunStagingSweep } from "./lib/staging-sweep.js";
+import { maybeRunStudioRecoverySweep } from "./lib/studio-recovery-sweep.js";
 import type { ResearchJob } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -120,6 +121,14 @@ async function probeBackoff(): Promise<void> {
       `(${backoff.consecutiveFailures} consecutive failures, last kind: ${backoff.lastFailureKind}, ` +
       `~${minutesLeft} min remaining). Exiting 0.`,
     );
+    // S158 backoff backstop (design §7 / Codex MAJOR-1): a provider-credit
+    // backoff window exits BEFORE poll() ever runs, so without this a recovery
+    // job would starve through a multi-hour outage and then wall-clock-exhaust.
+    // Studio recovery touches only NLM ($0) + Supabase — independent of the
+    // backed-off Anthropic provider — so run ONE bounded recovery slice before
+    // exiting. Best-effort: never throws (the wrapper guards), and exit 0 is
+    // unchanged (a backoff tick still doesn't escalate LastTaskResult).
+    await maybeRunStudioRecoverySweep({ logFn: (m) => log(m) });
     releasePidFile();
     process.exit(0);
   }
@@ -235,6 +244,17 @@ async function poll(): Promise<void> {
   if (!running) return;
 
   try {
+    // S158 studio-recovery sweep (design §7 / Gemini CRITICAL-1): runs BEFORE
+    // claimJob on EVERY tick (NOT idle-only) so a sustained backlog can't starve
+    // a time-sensitive recovery (a recoverable job has a hard 48h deadline). It
+    // is tightly bounded — a cheap indexed eligibility query returns immediately
+    // when none is due, then at most 1 candidate/tick with a shorter download
+    // timeout — so the added new-job-claim latency is near-zero except on a due
+    // tick. Best-effort: never throws (wrapper-guarded).
+    if (!DRY_RUN) {
+      await maybeRunStudioRecoverySweep({ logFn: (m) => log(m) });
+    }
+
     log("Polling for pending jobs...");
     const job = await claimJob();
 
