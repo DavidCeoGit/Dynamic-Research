@@ -8,13 +8,14 @@
  */
 
 import { getSupabase } from "@/lib/supabase";
+import { isValidAgentKey } from "@/lib/agent-auth";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  // Validate agent key
-  const agentKey = request.headers.get("X-Agent-Key");
-  if (!agentKey || agentKey !== process.env.AGENT_SECRET_KEY) {
+  // Validate agent key — constant-time compare, fails closed if the secret is
+  // unset/empty or the key is missing (S167; was a timing-leaky `!==` compare).
+  if (!isValidAgentKey(request.headers.get("X-Agent-Key"))) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
