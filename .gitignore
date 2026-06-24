@@ -65,3 +65,11 @@ agent/sandbox/
 
 # OS
 .DS_Store
+
+# M&A / Aero-LOI working artifacts (client-identifying; keep out of the repo) — S164
+/6IXTY*
+/Gemini LOI*
+/Earnout Exhibit*
+/Legora-LOI-Review*
+/20260610112456419.pdf
+/aero-financials-ocr.txt

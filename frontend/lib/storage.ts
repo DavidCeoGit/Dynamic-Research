@@ -8,11 +8,11 @@
  *
  * Phase B / S50 — every function takes an `orgId` parameter and constructs
  * tenant-scoped paths via scopedStoragePath() from ./storage-paths. The route
- * callers under frontend/app/api/runs/* either resolve org_id from the slug
- * via resolveOrgForSlug() (slug-bearing routes) or from
- * process.env.SYSTEM_DEFAULT_ORG_ID (the global gallery list). Both are
- * stopgaps until the SSR auth refactor (next Phase B sub-phase) lands and
- * the routes get org_id from the authenticated session cookie.
+ * callers under frontend/app/api/runs/* derive org_id from the authenticated
+ * session via requireOrgOr401() (S146 Phase 4), or from the slug via
+ * resolveOrgForSlug() for slug-bearing routes. The former
+ * SYSTEM_DEFAULT_ORG_ID env fallback + getOrgContextDualPath bridge are
+ * RETIRED (S149) — there is no env fallback; org context is session-derived.
  */
 
 import { getSupabase } from "./supabase";
@@ -151,9 +151,8 @@ export async function resolveOrgForSlug(slug: string): Promise<string | null> {
 /**
  * List all project slugs for an organization (top-level folders under <orgId>/).
  *
- * Phase B / S50 — was listProjects(); the SSR-less stopgap calls this with
- * process.env.SYSTEM_DEFAULT_ORG_ID. The SSR refactor will pass the
- * session-resolved org_id.
+ * Phase B / S50 — callers pass the session-resolved org_id from
+ * requireOrgOr401() (S146 Phase 4); there is no env fallback.
  */
 export async function listProjects(orgId: string): Promise<string[]> {
   const cacheKey = `projects:${orgId}`;

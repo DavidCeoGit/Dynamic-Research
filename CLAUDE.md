@@ -22,7 +22,7 @@
 - **Runtime:** Node ≥ 22.19 (transitive floor from `undici` 8.x `engines.node`; encoded in `agent/package.json` engines field S98 — host runs Node 24.x); `tsx` is the loader for all TypeScript at runtime (`tsx scripts/foo.ts`, `tsx --import worker.ts`, `node --import=tsx worker.ts`).
 - **Frontend:** Next 16, React 19, Tailwind 4, AI SDK 6.0 (`maxOutputTokens` param name).
 - **Backend:** Node.js daemon in `agent/`; Supabase (Postgres + Storage + Auth magic-link).
-- **Tests:** `node --test` (NOT vitest). Root `pnpm test` runs: (1) `bash agent/scripts/test-phase-b-storage-paths.sh` grep guard against legacy flat-layout storage paths, (2) strict `tsc --noEmit` on agent + frontend, (3) **the unit tests** (S163 measured: `pnpm test` reports `tests 501` agent + `tests 102` frontend = 603; the `pnpm test` command is the source of truth — exact counts drift with development) — `pnpm -C agent exec node --import=tsx --test "test/*.test.ts"` (501 agent) + the frontend suites via agent's tsx (102: hidden-runs + attachments + storage-attachments + publish-flag + route-protection + context-extraction + run-status + publish-flag-parity). Unit-test wiring added S96 (2026-06-05); `storage-attachments.test.ts` (8 tests) added S110; `staging-sweep.test.ts` grew through S112/S113 to 47 tests by S145. (Prior counts "446 / 381 agent / 65 frontend / staging-sweep 40" were a frozen S113 snapshot, corrected S145.) NOTE: Node 22 `node --test` only auto-discovers `*.test.js`; passing an explicit glob arg (`"test/*.test.ts"`) is what makes it find the `.ts` tests.
+- **Tests:** `node --test` (NOT vitest). Root `pnpm test` runs: (1) `bash agent/scripts/test-phase-b-storage-paths.sh` grep guard against legacy flat-layout storage paths, (2) strict `tsc --noEmit` on agent + frontend, (3) **the unit tests** (S164 measured: `pnpm test` reports `tests 581` agent + `tests 102` frontend = 683; the `pnpm test` command is the source of truth — exact counts drift with development) — `pnpm -C agent exec node --import=tsx --test "test/*.test.ts"` (581 agent) + the frontend suites via agent's tsx (102: hidden-runs + attachments + storage-attachments + publish-flag + route-protection + context-extraction + run-status + publish-flag-parity). Unit-test wiring added S96 (2026-06-05); `storage-attachments.test.ts` (8 tests) added S110; `staging-sweep.test.ts` grew through S112/S113 to 47 tests by S145; S164 added 4 agent suites from the S163 audit coverage-gap finding (`untrusted-input` 19 + `usage-tracking` 23 + `api-client` 18 + `notify` 20 = +80 → 581 agent). (Prior counts "446 / 381 agent / 65 frontend / staging-sweep 40" were a frozen S113 snapshot, corrected S145.) NOTE: Node 22 `node --test` only auto-discovers `*.test.js`; passing an explicit glob arg (`"test/*.test.ts"`) is what makes it find the `.ts` tests.
 - **TypeScript:** strict mode in every subproject.
 
 ---
@@ -35,7 +35,7 @@ The folder did NOT move — it still physically lives under `Anti Gravity/`, but
 
 GitHub remote: `origin` = `DavidCeoGit/Dynamic-Research` (the WHOLE project — frontend + agent + supabase + Documentation). `git push origin main` deploys (see §4).
 
-**(Historical footgun, RESOLVED S90)** Pre-S90 the git repo was the PARENT `Anti Gravity/` shared across ~34 projects, causing branch-contention + a concurrent force-push that erased DR commits from the shared remote. Gone — DR owns its history now. The `feedback_shared_monorepo_concurrency_stash_hazard` + `feedback_pushclone_divergence_reconcile` patterns no longer apply to DR.
+**(Historical footgun, RESOLVED S90)** Pre-S90 the git repo was the PARENT `Anti Gravity/` shared across ~34 projects, causing branch-contention + a concurrent force-push that erased DR commits from the shared remote. Gone — DR owns its history now. The former shared-monorepo branch-contention/stash and push-clone divergence hazards no longer apply to DR.
 
 **Branch work happens in this folder directly** — the `DR-dev` linked worktree (added S109, retired S114) has been removed. Feature branches are created and worked on in `Dynamic Research/` itself. The load-bearing constraint (the cron task respawning the worker from whatever branch this folder has checked out) is solved by a **dedicated deploy-only clone** at `C:\Users\ceo\Projects\DR-Deploy\` — the `DynamicResearchWorker` scheduled task points to that clone's `worker-start.bat`, so dev branches checked out here never reach the prod Supabase worker. Workflow: create branch → sandbox+promote edits → commit → `gh pr create --base main` → merge → pull DR-Deploy + restart worker (see §4 and §6).
 
@@ -59,7 +59,7 @@ GitHub remote: `origin` = `DavidCeoGit/Dynamic-Research` (the WHOLE project — 
 
 **Worker deploy clone:** `C:\Users\ceo\Projects\DR-Deploy\` is a permanent, main-only mirror — never branch or edit there. Its `agent/.env` must be kept in sync manually whenever env vars change (it is not tracked by git).
 
-**No more push-clone, no sync script, no 3-way diff.** The old `c:/tmp/Dynamic-Research` push-clone is RETIRED. The `feedback_pushclone_divergence_reconcile` footgun no longer applies.
+**No more push-clone, no sync script, no 3-way diff.** The old `c:/tmp/Dynamic-Research` push-clone is RETIRED. The old push-clone divergence footgun no longer applies.
 
 **Sandbox writes are required for `frontend/` edits** — see §5.
 
@@ -77,9 +77,9 @@ Everything else (`agent/`, `frontend/`, `supabase/`, `Documentation/`) requires 
 2. Verify the content
 3. Invoke `/promote` (the user-invocable skill) to copy to live + archive sandbox originals to `sandbox/validated/`
 
-Per `feedback_sandbox_archive_session_suffix.md`: append `-s<N>` suffix when archiving (e.g. `sandbox/validated/foo.ts-s52`).
+When archiving, append a `-s<N>` session suffix (e.g. `sandbox/validated/foo.ts-s52`).
 
-Per `feedback_sandbox_meta_sidecar_root.md`: the `.meta` file is auto-created at sandbox ROOT.
+The `.meta` sidecar file is auto-created at sandbox ROOT.
 
 **Exception:** Inside per-job worker workdirs (e.g. `Projects/<slug>/`), a `.claude/sandbox-allowlist` permits direct writes so the executor can write state.json + deliverables.
 
@@ -93,7 +93,7 @@ Per `feedback_sandbox_meta_sidecar_root.md`: the `.meta` file is auto-created at
 - **Log:** `agent/worker.log` (relative to repo root: `Dynamic Research/agent/worker.log`). Tail this to verify polling.
 - **NEVER kill the daemon without explicit user authorization.** Killing it during a research job mid-execution will leave Supabase rows + storage artifacts orphaned.
 - **S64 preflight + file-backed circuit breaker (preflight-cost-architecture v3):** preflight uses local-only probes — `claude auth status` ($0) + `GET /v1/models` ($0) via `undici.EnvHttpProxyAgent`. A file-backed circuit breaker at `<cwd>/.preflight-backoff` JSON opens for 10/20/40/60-min windows on consecutive preflight failures OR mid-execution terminal-error classification (credit-out / auth-out / billing-error / model-not-found at executor.ts:claude-spawn, executor.ts:plan-synthesis, or plan-reviewer.ts:integration). During Open state, cron-fired workers exit 0 cheaply (no LastTaskResult ≠ 0 escalation). Resend operator-alert fires ONCE on N=3 transition + once on recovery, recipient = `PREFLIGHT_NOTIFY_EMAIL` env var (skip-on-unset). To force-rerun preflight ignoring backoff: `rm <cwd>/.preflight-backoff` (PowerShell or bash). See `Documentation/preflight-cost-architecture-design-gate.md` (v3.1 design) + `Documentation/preflight-cost-architecture-merge-gate-peer-review.md` (S64 MERGE-gate synthesis) + [[feedback_preflight_circuit_breaker]].
-- **S162 studio-recovery sweep (transient-tolerance of the S129 gate) — LIVE in prod (PR #41, main `9779dac`, deployed 2026-06-23/24).** A job whose studio artifacts are CONFIRMED complete in NotebookLM (status_id 3) but whose binary download hit a TRANSIENT blip (S156 incident `f204631d`) is NO LONGER hard-failed. It keeps `status='failed'` but carries a parallel typed `studio_recovery_*` dimension (migration `20260623_studio_recovery_dimension.sql`, APPLIED to prod). `agent/lib/studio-recovery-sweep.ts` `maybeRunStudioRecoverySweep()` runs BEFORE `claimJob` every tick AND before `probeBackoff`'s exit; it re-downloads the artifact by id off the critical path and self-heals `failed→completed` ONLY via `finalizeRecoveredRun()` (re-asserts the full S129 obligation set — the fail-open keystone). Bounded by an attempt cap (8) + an attempts-gated age cap (48h). The sweep NEVER strands a row: the strand-class (an unguarded throw after candidate selection escaping the best-effort wrapper as `{ran:false}` and bypassing the attempt-bump/caps) is closed by 3 layers — per-dep guards (finalize-throw→continued-transient; spawn-seam `spawnSync('')` guards in `studio-completeness.ts`), a structural backstop around the recovery attempt in `runStudioRecoverySweepOnce`, and per-element payload validation + null-safe `productNames`. Tunables ALL optional/defaulted (`STUDIO_RECOVERY_SWEEP_{MAX_ATTEMPTS,MIN_ATTEMPTS_FOR_AGE_EXHAUST,MAX_AGE_MS,DOWNLOAD_TIMEOUT_MS,GRACE_MS}`; DR-Deploy `.env` needs NO change). Frontend shows "Finalizing media" + suppresses terminal controls while recovering. Design: `Documentation/studio-completeness-transient-tolerance-design-gate.md`; the 3-round tri-vendor MERGE gate (Codex grounded BLOCKED twice on real strands, then ENDORSED) is captured in the PR #41 body + `Documentation/studio-completeness-transient-tolerance-merge-gate-peer-review.md` + [[feedback_studio_completeness_worker_gate]] + [[feedback_decoupled_recovery_sweep_not_idle_only]].
+- **S162 studio-recovery sweep (transient-tolerance of the S129 gate) — LIVE in prod (PR #41, main `9779dac`, deployed 2026-06-23/24).** A job whose studio artifacts are CONFIRMED complete in NotebookLM (status_id 3) but whose binary download hit a TRANSIENT blip (S156 incident `f204631d`) is NO LONGER hard-failed. It keeps `status='failed'` but carries a parallel typed `studio_recovery_*` dimension (migration `20260623_studio_recovery_dimension.sql`, APPLIED to prod). `agent/lib/studio-recovery-sweep.ts` `maybeRunStudioRecoverySweep()` runs on every poll tick before `claimJob` (`worker.ts:255`, gated `!DRY_RUN`) AND, when a preflight-backoff window is active, once before `probeBackoff()`'s `process.exit(0)` (`worker.ts:131`) so a recovery job can't starve through a provider-credit outage; it re-downloads the artifact by id off the critical path and self-heals `failed→completed` ONLY via `finalizeRecoveredRun()` (re-asserts the full S129 obligation set — the fail-open keystone). Bounded by an attempt cap (8) + an attempts-gated age cap (48h). The sweep NEVER strands a row: the strand-class (an unguarded throw after candidate selection escaping the best-effort wrapper as `{ran:false}` and bypassing the attempt-bump/caps) is closed by 3 layers — per-dep guards (finalize-throw→continued-transient; spawn-seam `spawnSync('')` guards in `studio-completeness.ts`), a structural backstop around the recovery attempt in `runStudioRecoverySweepOnce`, and per-element payload validation + null-safe `productNames`. Tunables ALL optional/defaulted (`STUDIO_RECOVERY_SWEEP_{MAX_ATTEMPTS,MIN_ATTEMPTS_FOR_AGE_EXHAUST,MAX_AGE_MS,DOWNLOAD_TIMEOUT_MS,GRACE_MS}`; DR-Deploy `.env` needs NO change). Frontend shows "Finalizing media" + suppresses terminal controls while recovering. Design: `Documentation/studio-completeness-transient-tolerance-design-gate.md`; the 3-round tri-vendor MERGE gate (Codex grounded BLOCKED twice on real strands, then ENDORSED) is captured in the PR #41 body + `Documentation/studio-completeness-transient-tolerance-merge-gate-peer-review.md` + [[feedback_studio_completeness_worker_gate]] + [[feedback_decoupled_recovery_sweep_not_idle_only]].
 
 Find current PID via PowerShell:
 
@@ -104,7 +104,7 @@ EOF
 powershell -NoProfile -ExecutionPolicy Bypass -File /tmp/find-worker.ps1
 ```
 
-Avoid `tasklist /FI` from Git Bash — `/FI` gets interpreted as a path and the command fails (see [[feedback_pushclone_divergence_reconcile]] sibling pattern).
+Avoid `tasklist /FI` from Git Bash — `/FI` gets interpreted as a path and the command fails (see [[feedback_git_bash_munges_windows_slash_flag_args]]).
 
 ---
 
@@ -161,10 +161,10 @@ Synthesis artifacts live under `Documentation/` named `<topic>-peer-review.md` o
 
 ## 12. Common runtime quirks (Windows + Git Bash)
 
-- **Pandoc:** in PATH usually, but fallback at `/c/Users/ceo/AppData/Local/Pandoc/pandoc.exe`. Don't use `-H <(...)` process-sub — fails on Git Bash. Inject CSS post-gen via Python (memory `feedback_pandoc_header_flag_windows.md`).
+- **Pandoc:** in PATH usually, but fallback at `/c/Users/ceo/AppData/Local/Pandoc/pandoc.exe`. Don't use `-H <(...)` process-sub — fails on Git Bash. Inject CSS post-gen via Python (see [[reference_md_to_docx_pdf_pipeline_windows]]).
 - **Python stdout:** Git Bash is cp1252 by default; Unicode `print()` crashes. Set `PYTHONIOENCODING=utf-8` or stick to ASCII.
-- **`subprocess.run(["notebooklm", ...])`:** WinError 2. Use the full `.exe` path. See `feedback_nlm_subprocess_requires_full_exe_path.md`.
-- **`Start-Process -FilePath "pnpm"`:** fails because pnpm/npx/tsx/next/vercel are `.cmd` shims. Wrap in `cmd.exe /c`. See `feedback_powershell_start_process_cmd_shims.md`.
+- **`subprocess.run(["notebooklm", ...])`:** WinError 2. Use the full `.exe` path.
+- **`Start-Process -FilePath "pnpm"`:** fails because pnpm/npx/tsx/next/vercel are `.cmd` shims. Wrap in `cmd.exe /c`.
 - **Vercel `env add` stdin trailing newline:** `echo "value" | vercel env add` stores the trailing `\n`. Use `printf "%s"` OR add `.trim()` in the consumer. See `feedback_vercel_env_add_stdin_trailing_newline.md`.
 - **`Bash(run_in_background:true)` SIGTERMs at ~2 min** — don't use for daemons. Use Scheduled Task or `Start-Process -WindowStyle Hidden`.
 
