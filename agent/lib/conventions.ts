@@ -133,14 +133,6 @@ export function studioFilename(title: string, timestamp: string, product: string
   return `${slugify(title)}-${timestamp}-${product}.${def.ext}`;
 }
 
-/** Build a research file filename: {topic-prefix}-{role}.{ext} */
-export function researchFilename(topicPrefix: string, role: string, ext: string): string {
-  if (!RESEARCH_ROLES.has(role) && !RESEARCH_DOCX_ROLES.has(role)) {
-    throw new Error(`unknown research role: ${role}`);
-  }
-  return `${slugify(topicPrefix)}-${role}.${ext}`;
-}
-
 /** True if a filename should be skipped from any uploads/listings. */
 export function isSkipFile(filename: string): boolean {
   if (SKIP_FILES.has(filename)) return true;
