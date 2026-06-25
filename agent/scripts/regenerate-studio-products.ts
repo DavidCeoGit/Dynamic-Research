@@ -77,7 +77,7 @@ import {
   realListArtifacts,
   realDownloadArtifact,
   type NlmArtifactRef,
-} from "../lib/studio-completeness.js";
+} from "../lib/nlm-artifact-cli.js";
 import { resolveBySubmitId, hasUsableSubmitId } from "../lib/studio-snapshot-diff.js";
 
 // ── Args ────────────────────────────────────────────────────────────

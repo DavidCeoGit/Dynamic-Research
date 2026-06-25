@@ -39,7 +39,6 @@
  * backstops).
  */
 
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { studioFilename } from "./conventions.js";
@@ -50,6 +49,18 @@ import type {
   SelectedProducts,
   StudioRecoveryProduct,
 } from "../types.js";
+import {
+  classifyDownloadFailure,
+  realDownloadArtifact,
+  realListArtifacts,
+  type DownloadResult,
+  type NlmArtifactRef,
+} from "./nlm-artifact-cli.js";
+import {
+  artifactCreatedAtMs,
+  deriveRunStart,
+  safeMs,
+} from "./artifact-timestamps.js";
 
 // Canonical product order — single-sourced (S169) from conventions.json via
 // plan-types' STUDIO_PRODUCT_LIST (itself derived from the conventions Record).
@@ -68,32 +79,6 @@ const PRODUCT_TO_NLM_TYPE: Record<string, string> = {
   report: "report",
   infographic: "infographic",
 };
-
-// Windows: spawnSync needs the native venv path (Bug 3 / WinError 2).
-const NLM_BIN =
-  process.env.NOTEBOOKLM_BIN ??
-  (process.platform === "win32"
-    ? "C:/Users/ceo/.notebooklm-venv/Scripts/notebooklm.exe"
-    : "notebooklm");
-
-export interface NlmArtifactRef {
-  id: string;
-  title: string;
-  created_at: string;
-}
-
-/**
- * S158 — the captured outcome of one download attempt. The S129 gate previously
- * DISCARDED `r.status`/`r.stderr`/`r.signal` (the literal S156 diagnostic gap,
- * design G9); the recovery taxonomy classifies on the captured result, never on
- * `exitCode===0` (the Bug-12 backslash-path success stays a success).
- */
-export interface DownloadResult {
-  ok: boolean;
-  exitCode?: number | null;
-  signal?: string | null;
-  stderr?: string;
-}
 
 export interface CompletenessDeps {
   /** COMPLETED artifacts (status_id===3) of an NLM type, newest-first. null on CLI/parse error. */
@@ -152,43 +137,6 @@ export interface CompletenessResult {
   recoveryStderr?: string;
 }
 
-// ── S158 download-failure classifier (design §8) ─────────────────────
-// TRANSIENT (everything except truly-local-disk): on a CONFIRMED status_id-3
-// winner a 404/401/403/5xx/429/network/timeout/SIGTERM is an NLM consistency-
-// lag or auth-refresh transient, not genuine loss. Biased toward recoverable —
-// the sweep's fresh re-list is the real terminality decider. The ONLY way to
-// regress is to mis-bucket a LOCAL-disk error as transient (which merely burns
-// bounded attempts, never a hard-fail), so the terminal set is kept tight.
-const TERMINAL_DOWNLOAD_PATTERNS: RegExp[] = [
-  /enospc/i,
-  /no space left/i,
-  /disk (is )?full/i,
-  /\bdisk quota exceeded\b/i,
-  /erofs/i,
-  /read-only file system/i,
-];
-
-/**
- * Classify a CAPTURED download failure. Only TRULY-LOCAL, recovery-can't-fix
- * conditions (disk-full / read-only FS / disk-quota) are 'terminal'; everything
- * else — including 404/auth/5xx/network/timeout/SIGTERM/null-exit — is
- * 'transient' (Codex MAJOR-7). NEVER keys on exitCode===0: classify only ever
- * runs on an ok:false result, and the Bug-12 backslash-path success stays a
- * success. exitCode/signal are accepted for forward-use + logging; the decision
- * is the local-disk stderr signature.
- */
-export function classifyDownloadFailure(
-  exitCode: number | null,
-  stderr: string,
-  signal: string | null,
-): "transient" | "terminal" {
-  void exitCode;
-  void signal;
-  const text = stderr ?? "";
-  if (TERMINAL_DOWNLOAD_PATTERNS.some((re) => re.test(text))) return "terminal";
-  return "transient";
-}
-
 /**
  * Products the run was OBLIGED to produce. Driven by the DURABLE DB selection
  * (job.selected_products), NOT the pipeline-written state.selectedProducts —
@@ -201,90 +149,6 @@ export function classifyDownloadFailure(
 export function obligedProducts(selected: SelectedProducts | null | undefined): string[] {
   const sel = (selected ?? {}) as unknown as Record<string, unknown>;
   return STUDIO_ORDER.filter((p) => sel[p] === true);
-}
-
-/**
- * Build a compact YYYYMMDD-HHMMSS token from epoch-style components, or null if
- * the components don't form a real calendar date/time (Codex MERGE CRITICAL-2:
- * `new Date(2026, 12, ...)` silently NORMALIZES instead of rejecting). Round-trip
- * validates so an impossible token can't masquerade as a valid run start.
- */
-function buildCompact(
-  y: number,
-  mo: number,
-  d: number,
-  h: number,
-  mi: number,
-  s: number,
-): { compact: string; ms: number } | null {
-  const dt = new Date(y, mo - 1, d, h, mi, s);
-  const ms = dt.getTime();
-  if (!Number.isFinite(ms)) return null;
-  if (
-    dt.getFullYear() !== y ||
-    dt.getMonth() !== mo - 1 ||
-    dt.getDate() !== d ||
-    dt.getHours() !== h ||
-    dt.getMinutes() !== mi ||
-    dt.getSeconds() !== s
-  ) {
-    return null; // normalized → not a real date
-  }
-  const p2 = (n: number) => String(n).padStart(2, "0");
-  return { compact: `${y}${p2(mo)}${p2(d)}-${p2(h)}${p2(mi)}${p2(s)}`, ms };
-}
-
-/**
- * Parse any timestamp form the pipeline emits into {compact, ms}, or null.
- * Accepts compact `YYYYMMDD-HHMMSS`, colon-ISO `YYYY-MM-DDTHH:MM:SS`, AND
- * hyphen-time ISO `YYYY-MM-DDTHH-mm-ss` (Codex MERGE CRITICAL-2 — a shipped
- * worker format the prior code missed and would have synthesized "now" for).
- */
-function parseTimestamp(raw: string | null | undefined): { compact: string; ms: number } | null {
-  if (typeof raw !== "string" || !raw) return null;
-  let m = raw.match(/(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/); // compact
-  if (m) return buildCompact(+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]);
-  m = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})[:-](\d{2})[:-](\d{2})/); // colon- OR hyphen-time ISO
-  if (m) return buildCompact(+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]);
-  return null;
-}
-
-/**
- * Derive the REAL run-start {compact, ms} for naming + the anti-stale floor.
- * Sources, in order of trust: an on-disk winner's embedded timestamp; a token
- * in any artifacts.<p>.file; state.timestamp. Returns null only when NONE is
- * derivable — in which case the floor degrades to best-effort (never a
- * synthesized "now", which Codex CRITICAL-2 showed would wrongly exclude this
- * run's real artifact).
- */
-function deriveRunStart(
-  winners: ReturnType<typeof pickWinners>,
-  state: PipelineState,
-): { compact: string; ms: number } | null {
-  const w = Object.values(winners)[0];
-  const fromWinner = parseTimestamp(w?.timestamp);
-  if (fromWinner) return fromWinner;
-
-  const arts = state.artifacts as Record<string, { file?: unknown }> | undefined;
-  if (arts) {
-    for (const v of Object.values(arts)) {
-      const fromFile = typeof v?.file === "string" ? parseTimestamp(v.file) : null;
-      if (fromFile) return fromFile;
-    }
-  }
-  return parseTimestamp(state.timestamp);
-}
-
-/** Artifact created_at → epoch ms, or null if absent/unparseable. */
-function artifactCreatedAtMs(a: NlmArtifactRef): number | null {
-  if (!a.created_at) return null;
-  const ms = Date.parse(a.created_at);
-  return Number.isFinite(ms) ? ms : null;
-}
-
-/** Finite, non-negative ms or the fallback (Codex MERGE MAJOR-4: NaN env). */
-function safeMs(value: number, fallback: number, floor = 0): number {
-  return Number.isFinite(value) && value >= floor ? value : fallback;
 }
 
 /**
@@ -528,196 +392,6 @@ export async function enforceStudioCompleteness(
   // !ok branch and is failed (then swept), never completed-while-missing.
   result.ok = result.stillMissing.length === 0;
   return result;
-}
-
-// ── Real (non-injected) dependency implementations ───────────────────
-
-/** List COMPLETED (status_id===3) artifacts of a type, newest-first. */
-export function realListArtifacts(
-  notebookId: string,
-  nlmType: string,
-): NlmArtifactRef[] | null {
-  // S162 (Codex grounded BLOCK): the ENTIRE body is throw-guarded. spawnSync THROWS
-  // SYNCHRONOUSLY on an invalid arg — notably an empty NLM_BIN (a blank
-  // NOTEBOOKLM_BIN survives the `??` default at line ~68) or a NUL byte in an arg —
-  // UNLIKE a missing binary / timeout / maxBuffer, which return error-shaped
-  // (status:null). This fn documents a throw-safe "returns null on failure"
-  // contract; an unguarded spawnSync throw broke it and escaped the recovery sweep,
-  // stranding a row before its attempt-bump/caps ran. Guarding the whole body (which
-  // also subsumes the prior JSON.parse try/catch) makes a list failure ALWAYS a
-  // transient null (the sweep's C1 retry path), never a thrown error.
-  try {
-    const r = spawnSync(
-      NLM_BIN,
-      ["artifact", "list", "-n", notebookId, "--type", nlmType, "--json"],
-      {
-        encoding: "utf-8",
-        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: 60_000,
-      },
-    );
-    if (r.status !== 0) return null;
-    const parsed = JSON.parse(r.stdout ?? "") as {
-      artifacts?: Array<{ id: string; title: string; created_at: string; status_id?: number }>;
-    };
-    // status_id 3 == completed; undefined assumed completed for forward-compat
-    // (mirrors verify-gallery-vs-notebook.ts). In_progress (other status_id)
-    // is excluded — that is the whole point vs the unreliable `artifact poll`.
-    const arts = (parsed.artifacts ?? []).filter(
-      (a) => a.status_id === 3 || a.status_id === undefined,
-    );
-    arts.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
-    return arts.map((a) => ({ id: a.id, title: a.title, created_at: a.created_at }));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Default spawnSync timeout for the in-gate recovery download. The decoupled
- * sweep passes a SHORTER timeout (~90s) so a per-tick budget can bound added
- * new-job-claim latency (Codex MAJOR-2) — spawnSync is uninterruptible once
- * started, so a shorter atomic timeout is the only lever.
- */
-const DEFAULT_DOWNLOAD_TIMEOUT_MS = 300_000;
-
-/**
- * The NLM-download spawn seam. Injectable so the atomic-write + cleanup logic in
- * realDownloadArtifact is unit-testable without the real NotebookLM CLI (S160
- * Codex MAJOR — the prior partial-cleanup root fix shipped untested).
- */
-export type DownloadSpawn = (
-  args: string[],
-  opts: { timeoutMs: number },
-) => { status: number | null; signal: NodeJS.Signals | null; stdout?: string; stderr?: string };
-
-const defaultDownloadSpawn: DownloadSpawn = (args, opts) => {
-  const r = spawnSync(NLM_BIN, args, {
-    encoding: "utf-8",
-    env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-    maxBuffer: 16 * 1024 * 1024,
-    timeout: opts.timeoutMs,
-  });
-  return { status: r.status, signal: r.signal ?? null, stdout: r.stdout, stderr: r.stderr };
-};
-
-const mangleWinPath = (p: string): string =>
-  p.replace(/^([A-Za-z]):\//, "\\$1\\").replace(/\//g, "\\");
-
-/**
- * Download a specific artifact BY ID; `ok` is true only on a non-empty file.
- * S158: captures exitCode/signal/stderr (the gate previously discarded them —
- * the literal S156 diagnostic gap, G9) so the taxonomy can classify the failure.
- *
- * S160 CRITICAL (Codex): the download writes to a same-directory TEMP path and is
- * ATOMICALLY promoted to the final convention path ONLY after exit 0 + a non-empty
- * stat. The final convention path is therefore written EXCLUSIVELY by a successful
- * rename — so a crash mid-download (the worker killed before this fn returns, when
- * an in-process cleanup could never run) leaves only a `.part` temp file, never the
- * convention-named final. That is what makes the sweep's on-disk-first skip (M5) and
- * the finalize keystone safe: a convention file on disk always means a COMPLETE
- * download. A FAILED download never touches the final, so a prior good file survives.
- * (Bug-12: NLM may write a backslash-mangled path — the temp candidates absorb it.)
- *
- * S161 R2-2 (Codex QA): the promotion is RENAME-ONLY — there is NO `fs.rm(outPath)`
- * before the rename and NO `fs.copyFile` fallback after it. fs.rename replaces an
- * existing destination atomically (libuv MOVEFILE_REPLACE_EXISTING on Windows), so
- * a failed promotion can never (a) delete a prior good final (no pre-delete) nor
- * (b) leave a truncated convention-named final (no mid-copy crash window) — it
- * returns {ok:false} with the prior final intact and the temp dropped. The
- * `renameImpl` seam makes the rename-failure path unit-testable.
- *
- * S161 R2-1: any leftover `.part` (e.g. a kill mid-spawn before cleanup runs, or
- * the sweep's artifact-gone branch) is on the upload skip-list (conventions.json
- * skip_files.extensions), so an orphan temp can never reach the gallery via
- * selectUploadSet or the finalize upload set.
- */
-export async function realDownloadArtifact(
-  notebookId: string,
-  artifactId: string,
-  nlmType: string,
-  outPath: string,
-  timeoutMs?: number,
-  spawnImpl: DownloadSpawn = defaultDownloadSpawn,
-  renameImpl: (src: string, dest: string) => Promise<void> = fs.rename,
-): Promise<DownloadResult> {
-  const tmpPath = `${outPath}.part`;
-  const tmpCandidates = [tmpPath, mangleWinPath(tmpPath)];
-  const cleanupTmp = async () => {
-    for (const c of tmpCandidates) await fs.rm(c, { force: true }).catch(() => {});
-  };
-
-  // Clear any leftover temp from a prior crash so a stale .part can't masquerade.
-  await cleanupTmp();
-
-  // S162 (Codex grounded BLOCK): guard the spawn seam. defaultDownloadSpawn's
-  // spawnSync THROWS SYNCHRONOUSLY on an invalid arg (an empty NLM_BIN from a blank
-  // NOTEBOOKLM_BIN, or a NUL byte) — distinct from the error-shaped {status:null}
-  // returns for a missing binary / timeout. An injected spawnImpl could also throw.
-  // Map ANY throw to a fail-closed {ok:false} (this fn's documented "never throws"
-  // contract) so it never escapes the recovery sweep and strands a row; the temp is
-  // dropped and the prior final is left untouched.
-  let r: ReturnType<DownloadSpawn>;
-  try {
-    r = spawnImpl(
-      ["download", nlmType, "-n", notebookId, "-a", artifactId, tmpPath, "--force"],
-      { timeoutMs: timeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS },
-    );
-  } catch (err) {
-    await cleanupTmp();
-    return {
-      ok: false,
-      exitCode: null,
-      signal: null,
-      stderr: `spawn threw: ${(err as Error).message}`.slice(0, 2000),
-    };
-  }
-  const exitCode = r.status;
-  const signal = r.signal ?? null;
-  // Scan BOTH streams (design §7) — the NLM CLI splits errors across them.
-  const stderr = [r.stderr, r.stdout].filter(Boolean).join("\n").slice(0, 2000) || undefined;
-
-  if (r.status !== 0) {
-    await cleanupTmp();
-    return { ok: false, exitCode, signal, stderr };
-  }
-
-  // Find the non-empty TEMP file and ATOMICALLY promote it to the final path via
-  // RENAME-ONLY (S161 R2-2). fs.rename replaces an existing destination atomically
-  // (libuv MOVEFILE_REPLACE_EXISTING on Windows) — so there is NO delete-then-write
-  // window and NO copyFile fallback:
-  //   • a rename failure leaves the prior good final UNTOUCHED (no pre-delete), and
-  //   • a crash can never strand a truncated convention-named final (no mid-copy).
-  // On promotion failure we drop the temp and return ok:false (fail-closed); the
-  // final is written EXCLUSIVELY by a successful rename of a confirmed-non-empty temp.
-  for (const cand of tmpCandidates) {
-    let st: Awaited<ReturnType<typeof fs.stat>>;
-    try {
-      st = await fs.stat(cand);
-    } catch {
-      continue; // this candidate wasn't written — try the next
-    }
-    if (!st.isFile() || st.size === 0) continue;
-    try {
-      await renameImpl(cand, outPath);
-    } catch (err) {
-      // Promotion failed: prior final intact, temp dropped, fail-closed. NEVER
-      // copyFile (a mid-copy crash truncates the final) and NEVER delete the final.
-      await cleanupTmp();
-      return {
-        ok: false,
-        exitCode,
-        signal,
-        stderr: (stderr ?? `promotion rename failed: ${(err as Error).message}`).slice(0, 2000),
-      };
-    }
-    await cleanupTmp();
-    return { ok: true, exitCode, signal };
-  }
-  // Exit 0 but no non-empty temp → transient failure; NEVER touch the final.
-  await cleanupTmp();
-  return { ok: false, exitCode, signal, stderr };
 }
 
 /** Default real deps for the worker. */

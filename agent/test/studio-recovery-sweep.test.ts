@@ -24,7 +24,7 @@ import {
   type RecoveryCandidate,
   type RecoverySweepDeps,
 } from "../lib/studio-recovery-sweep.js";
-import type { DownloadResult } from "../lib/studio-completeness.js";
+import type { DownloadResult } from "../lib/nlm-artifact-cli.js";
 import type { FinalizeArgs, FinalizeResult } from "../scripts/finalize-recovered-run.js";
 
 const JOB = "22222222-2222-2222-2222-222222222222";

@@ -39,7 +39,7 @@ import {
   realDownloadArtifact,
   type NlmArtifactRef,
   type DownloadResult,
-} from "./studio-completeness.js";
+} from "./nlm-artifact-cli.js";
 import {
   finalizeRecoveredRun,
   defaultFinalizeDeps,
