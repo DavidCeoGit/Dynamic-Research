@@ -31,7 +31,7 @@
  * closed (never falls back to a guess).
  */
 
-import type { NlmArtifactRef } from "./studio-completeness.js";
+import type { NlmArtifactRef } from "./nlm-artifact-cli.js";
 
 /** Whether a submit task_id is usable for resolution (parseable, real — not the
  * "(unparsed)" sentinel the launcher writes when generate --json had no id). */

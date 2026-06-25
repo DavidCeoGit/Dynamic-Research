@@ -20,13 +20,15 @@ import { join as pathJoin } from "node:path";
 
 import {
   enforceStudioCompleteness,
+  type CompletenessDeps,
+} from "../lib/studio-completeness.js";
+import {
   classifyDownloadFailure,
   realDownloadArtifact,
-  type CompletenessDeps,
   type DownloadResult,
   type DownloadSpawn,
   type NlmArtifactRef,
-} from "../lib/studio-completeness.js";
+} from "../lib/nlm-artifact-cli.js";
 import type { PipelineState, SelectedProducts } from "../types.js";
 
 // Run starts 2026-06-15 19:05:02.

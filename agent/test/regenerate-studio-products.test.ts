@@ -21,7 +21,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
 import { downloadAndUpload } from "../scripts/regenerate-studio-products.js";
-import type { DownloadResult } from "../lib/studio-completeness.js";
+import type { DownloadResult } from "../lib/nlm-artifact-cli.js";
 
 const TASK = { product: "video", cliType: "video" };
 const ARTIFACT = { id: "vid-1", title: "X", created_at: "2026-06-15T19:34:36" };

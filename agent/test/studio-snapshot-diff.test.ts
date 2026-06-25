@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveBySubmitId, hasUsableSubmitId } from "../lib/studio-snapshot-diff.js";
-import type { NlmArtifactRef } from "../lib/studio-completeness.js";
+import type { NlmArtifactRef } from "../lib/nlm-artifact-cli.js";
 
 const AFTER = "2026-06-17T12:05:00Z";
 const BEFORE = "2026-06-17T11:50:00Z";
