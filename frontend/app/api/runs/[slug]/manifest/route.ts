@@ -27,7 +27,8 @@ import {
 import { requireOrgOr401 } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 import { resolveClonePublishRequired } from "@/lib/publish-flag";
-import type { AttachmentMeta } from "@/lib/types/queue";
+import { coerceSelection } from "@/lib/studio-products";
+import type { AttachmentMeta, SelectedProducts } from "@/lib/types/queue";
 
 export const dynamic = "force-dynamic";
 
@@ -58,13 +59,7 @@ interface ManifestResponse {
     maxVendorsEnriched: number;
   };
   ajiDnaEnabled: boolean;
-  selectedProducts: {
-    audio: boolean;
-    video: boolean;
-    slides: boolean;
-    report: boolean;
-    infographic: boolean;
-  };
+  selectedProducts: SelectedProducts; // S172 site G
   customizations: {
     perplexity: { queryFraming: string; emphasis: string[]; outputStructure: string };
     notebookLM: { persona: string; researchMode: "deep" | "standard"; priorities: string[] };
@@ -214,13 +209,7 @@ export async function GET(
       : (((state.aji_dna_enabled as boolean | undefined) ??
           (state.ajiDnaEnabled as boolean | undefined)) ??
         false),
-    selectedProducts: {
-      audio: !!sp.audio,
-      video: !!sp.video,
-      slides: !!sp.slides,
-      report: !!sp.report,
-      infographic: !!sp.infographic,
-    },
+    selectedProducts: coerceSelection(sp), // S172 site G: ≡ the hand {audio:!!sp.audio,…} map
     customizations: {
       perplexity: {
         queryFraming: (px.queryFraming as string) ?? "",

@@ -5,9 +5,12 @@
  */
 
 import type { SelectedProducts } from "./types/queue";
+import { STUDIO_PRODUCT_KEYS, type StudioProductKey } from "./studio-products";
 
-/** Per-component time estimates in minutes. */
-const TIMES = {
+/** Per-component time estimates in minutes. S172 site H: typed as a complete
+ *  Record over the canonical product keys (+ base/vendors) so adding a product to
+ *  STUDIO_PRODUCT_KEYS makes an omitted minute-estimate a compile error. */
+const TIMES: Record<StudioProductKey, number> & { base: number; vendors: number } = {
   base: 12,       // Perplexity + NotebookLM + CI scoring + synthesis
   audio: 8,
   video: 15,      // Cinematic format
@@ -15,7 +18,7 @@ const TIMES = {
   report: 5,
   infographic: 10,
   vendors: 20,    // Vendor discovery + enrichment
-} as const;
+};
 
 /**
  * Calculate estimated completion time in minutes.
@@ -30,11 +33,13 @@ export function estimateMinutes(
 ): number {
   let total = TIMES.base;
 
-  if (products.audio) total += TIMES.audio;
-  if (products.video) total += TIMES.video;
-  if (products.slides) total += TIMES.slides;
-  if (products.report) total += TIMES.report;
-  if (products.infographic) total += TIMES.infographic;
+  // S172 site H (design §5 rule 5): iterate the canonical key set rather than a
+  // hand-unrolled if-chain. Typing TIMES forces the LITERAL complete but does NOT
+  // force the consuming logic to read a new key — this loop does, so a new product
+  // can never be silently dropped from the ETA.
+  for (const k of STUDIO_PRODUCT_KEYS) {
+    if (products[k]) total += TIMES[k];
+  }
   if (vendorsEnabled) total += TIMES.vendors;
 
   return total;

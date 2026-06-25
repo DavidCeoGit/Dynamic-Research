@@ -13,6 +13,12 @@ import {
   ATTACHMENT_STORED_NAME_REGEX,
   isReservedBasename,
 } from "./attachments-constants";
+import {
+  STUDIO_PRODUCT_KEYS,
+  emptySelection,
+  type StudioProductKey,
+  type AssertExact,
+} from "./studio-products";
 
 // ── Slug generation ─────────────────────────────────────────────────
 
@@ -110,6 +116,18 @@ export const selectedProductsSchema = z.object({
   (p) => Object.values(p).some(Boolean),
   { message: "At least one product must be selected" },
 );
+
+// S172 single-source (sites B/C): hard tsc error if these Zod product keys ever
+// drift from the canonical StudioProductKey set. VALUE-ASSIGNMENT form — a bare
+// `type _X = AssertExact<…>` is vacuous (a type alias to `false` does not fail
+// tsc). Zod 4.3.6 preserves the key set through .refine(), so `keyof z.infer<…>`
+// yields the product-key union; a typo'd key is a missing+extra pair, caught too.
+// (Used by tsc at compile time only — the runtime binding is intentionally unread.)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _selectedProductsKeysInSync: AssertExact<
+  keyof z.infer<typeof selectedProductsSchema>,
+  StudioProductKey
+> = true;
 
 export const perplexitySchema = z.object({
   queryFraming: z.string().max(25000).default(""),
@@ -335,7 +353,7 @@ export const studioRecoveryStatusEnum = z.enum([
 /**
  * studio_recovery_payload jsonb — self-sufficient recovery descriptor (design
  * G8). Bounded so a malformed worker write is rejected at the route rather than
- * persisted. products is capped at the 5 studio products.
+ * persisted. products is capped at the canonical studio-product count.
  */
 export const studioRecoveryPayloadSchema = z.object({
   notebookId: z.string().min(1).max(200),
@@ -348,7 +366,9 @@ export const studioRecoveryPayloadSchema = z.object({
         filename: z.string().min(1).max(400),
       }),
     )
-    .max(5),
+    // S172 single-source (site L): cap tied to the canonical product count, not a
+    // hardcoded 5 — a 6th product no longer silently rejects a valid recovery.
+    .max(STUDIO_PRODUCT_KEYS.length),
 });
 
 /**
@@ -412,6 +432,14 @@ export const selectedProductsBaseSchema = z.object({
   infographic: z.boolean().default(false),
 });
 
+// S172 single-source (site C): same key-parity guard as site B, for the
+// refine-free base schema used by react-hook-form field registration.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _selectedProductsBaseKeysInSync: AssertExact<
+  keyof z.infer<typeof selectedProductsBaseSchema>,
+  StudioProductKey
+> = true;
+
 export const formDataSchema = z.object({
   topic: z.string().min(10, "Topic must be at least 10 characters").max(25000),
   // S153 — FORM STATE carries provenance-tagged ContextItem[] (not string[]).
@@ -443,7 +471,7 @@ export const FORM_DEFAULT_VALUES: FormData = {
   userContext: { domainKnowledge: [], constraints: [], additionalUrls: [], claimsToVerify: [], publishRequired: false },
   vendorEvaluation: { enabled: false, vendorType: "", serviceArea: "", serviceAddress: "", jobDescription: "", maxVendorsDiscovered: 10, maxVendorsEnriched: 5 },
   ajiDnaEnabled: false,
-  selectedProducts: { audio: false, video: false, slides: false, report: false, infographic: false },
+  selectedProducts: emptySelection(), // S172 site D: derived all-false default
   customizations: { perplexity: { queryFraming: "", emphasis: [], outputStructure: "" }, notebookLM: { persona: "", researchMode: "deep", priorities: [] }, studio: {} },
   notifyEmail: "",
   generatedQuestions: [],

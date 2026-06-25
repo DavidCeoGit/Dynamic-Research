@@ -6,8 +6,9 @@ import type { ContextSource } from "@/lib/context-items";
 import type { StepReviewProps } from "@/lib/types/queue";
 import { ArrowLeft, Loader2, Send, Music, Video, Presentation, FileText, Image as ImageIcon, Sparkles, RefreshCw, Repeat, X } from "lucide-react";
 import { TimeEstimate } from "./Shared";
+import { isStudioProductKey, type StudioProductKey } from "@/lib/studio-products";
 
-const PRODUCT_META: Record<string, { label: string; icon: typeof Music }> = {
+const PRODUCT_META: Record<StudioProductKey, { label: string; icon: typeof Music }> = {
   audio: { label: "Audio Overview", icon: Music },
   video: { label: "Cinematic Video", icon: Video },
   slides: { label: "Slide Deck", icon: Presentation },
@@ -218,8 +219,11 @@ export function StepReview({ onPrev, isSubmitting, submitError, estMins, cloneSl
         <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-500 mb-2">Products</h3>
         <div className="flex flex-wrap gap-2">
           {selectedProducts.map(([key]) => {
+            // S172 site K: narrow the string key (Object.entries yields string)
+            // before indexing the exact record; a stale/extra key is skipped
+            // (replaces the now-provably-dead `if (!meta) return null`).
+            if (!isStudioProductKey(key)) return null;
             const meta = PRODUCT_META[key];
-            if (!meta) return null;
             const Icon = meta.icon;
             return (
               <span key={key} className="inline-flex items-center gap-1.5 rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-300">

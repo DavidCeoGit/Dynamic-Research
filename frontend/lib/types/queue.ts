@@ -4,6 +4,13 @@
  * Used by API routes, hooks, form components, and the worker daemon.
  */
 
+// S172 single-source: SelectedProducts is the hermetic frontend canonical
+// Record<StudioProductKey, boolean> (lib/studio-products.ts). Imported here for
+// this module's OWN internal use (ResearchJobPayload, ResearchJob) and re-exported
+// below so existing importers ("@/lib/types/queue") keep working unchanged. The
+// "../" is load-bearing: queue.ts lives in lib/types/, the module in lib/.
+import type { SelectedProducts } from "../studio-products";
+
 // ── Form step progression ───────────────────────────────────────────
 
 export type FormStep = "topic" | "questions" | "products" | "customize" | "review";
@@ -50,13 +57,9 @@ export interface VendorEvaluation {
 
 // ── Product selection ───────────────────────────────────────────────
 
-export interface SelectedProducts {
-  audio: boolean;
-  video: boolean;
-  slides: boolean;
-  report: boolean;
-  infographic: boolean;
-}
+// SelectedProducts is imported at the top of this file (hermetic canonical) and
+// re-exported here so "@/lib/types/queue" consumers resolve it unchanged.
+export type { SelectedProducts };
 
 // ── Studio customizations ───────────────────────────────────────────
 
