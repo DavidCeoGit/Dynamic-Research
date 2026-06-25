@@ -108,7 +108,26 @@ const RISK_ACCEPTED_RE =
 /** Queue job ids are UUIDs; anything else must not reach a filesystem path. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const truncate = (s: string): string => (s.length > REASON_SLICE ? `${s.slice(0, REASON_SLICE)}…` : s);
+// Coercion-safe display string for an UNTRUSTED parsed-state value. state.json
+// is JSON.parsed, so a field may be a non-coercible object like {"toString":null}
+// that throws "Cannot convert object to primitive value" on String(). JSON-
+// serialize objects/arrays (parsed JSON is always serializable) and String() the
+// primitives, so this NEVER throws. (S168 Codex MERGE CRITICAL: a poisoned
+// verification_status / verdict / sourceQualityClass / claims_extraction_status
+// reached String() in a reasons line, threw on the sync path, and orphaned the job.)
+const coerceDisplay = (v: unknown): string => {
+  if (typeof v === "string") return v;
+  if (v === null || typeof v !== "object") return String(v);
+  try {
+    return JSON.stringify(v) ?? "[unserializable]";
+  } catch {
+    return "[uncoercible]";
+  }
+};
+const truncate = (v: unknown): string => {
+  const s = coerceDisplay(v);
+  return s.length > REASON_SLICE ? `${s.slice(0, REASON_SLICE)}…` : s;
+};
 
 /**
  * Canonical STRICT publish-flag predicate (S120 coercion harmonization).
@@ -260,7 +279,7 @@ function validateClaim(claim: unknown, idx: number, reasons: string[]): void {
   }
   if (typeof c.sourceQualityClass !== "string" || !SOURCE_QUALITY_CLASSES.has(c.sourceQualityClass.trim())) {
     reasons.push(
-      `${label} sourceQualityClass "${truncate(String(c.sourceQualityClass))}" not in {primary, official, reputable-secondary, weak}`,
+      `${label} sourceQualityClass "${truncate(c.sourceQualityClass)}" not in {primary, official, reputable-secondary, weak}`,
     );
   }
   if (typeof c.upstreamIndependenceBasis !== "string" || c.upstreamIndependenceBasis.trim().length === 0) {
@@ -272,7 +291,7 @@ function validateClaim(claim: unknown, idx: number, reasons: string[]): void {
     reasons.push(`${label} missing counter-evidence notes (record "none found" explicitly)`);
   }
   if (typeof c.verdict !== "string" || !CLAIM_PASS_VERDICTS.has(c.verdict)) {
-    reasons.push(`${label} verdict "${truncate(String(c.verdict))}" is not verified/verified_with_caveat`);
+    reasons.push(`${label} verdict "${truncate(c.verdict)}" is not verified/verified_with_caveat`);
   }
 }
 
@@ -302,7 +321,7 @@ export function evaluatePublishGate(
 
     if (pv.verification_status !== "passed") {
       reasons.push(
-        `verification_status is "${truncate(String(pv.verification_status))}" (must be "passed")`,
+        `verification_status is "${truncate(pv.verification_status)}" (must be "passed")`,
       );
     }
 
@@ -335,7 +354,7 @@ export function evaluatePublishGate(
     const claimsRaw = pv.claims;
     if (ces !== "populated" && ces !== "no_load_bearing_claims") {
       reasons.push(
-        `claims_extraction_status is "${truncate(String(ces))}" (must be "populated" or "no_load_bearing_claims")`,
+        `claims_extraction_status is "${truncate(ces)}" (must be "populated" or "no_load_bearing_claims")`,
       );
     }
     // S108 Gemini G4: "no load-bearing claims" is a tempting LLM escape hatch

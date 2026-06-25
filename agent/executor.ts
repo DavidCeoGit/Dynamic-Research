@@ -711,10 +711,16 @@ export async function executeJob(job: ResearchJob): Promise<string> {
         killReason === "DURATION" && !classified
           ? await readStateForRecovery(job, workDir)
           : null;
-      if (shouldRecoverAfterDurationKill(killReason, !!classified, !!recoveryState?.notebook_id)) {
+      // Validate notebook_id at the SOURCE: a parsed-JSON state.json may carry a
+      // non-string notebook_id. Gate recovery on a non-empty STRING (fail CLOSED
+      // otherwise — never launder a garbage id into a success verdict) and use
+      // the validated value in the log so a non-coercible object can't throw
+      // there. (S168; recoverableNotebookId mirrors the S166 coercion guard.)
+      const recoveryNotebookId = recoverableNotebookId(recoveryState);
+      if (shouldRecoverAfterDurationKill(killReason, !!classified, recoveryNotebookId !== null)) {
         log(
           job.id,
-          `[S136] MAX_JOB_DURATION cap-kill with no terminal error — attempting studio-completeness recovery instead of failing (notebook ${recoveryState!.notebook_id})`,
+          `[S136] MAX_JOB_DURATION cap-kill with no terminal error — attempting studio-completeness recovery instead of failing (notebook ${recoveryNotebookId})`,
         );
         recoveryVerdict = {
           success: true,
@@ -1802,6 +1808,34 @@ interface StateWatcher {
   stop: () => void;
 }
 
+// ── State-field coercion safety (S166/S168) ─────────────────────────
+// state.json is JSON.parsed from an UNTRUSTED child-written file, so a field's
+// runtime value is NOT guaranteed to match its declared PipelineState type. A
+// JSON-representable non-null object (e.g. {"toString":null}, [], {}) passes a
+// structural "is an object" check but throws "Cannot convert object to
+// primitive value" the moment it is coerced — String(x), `${x}`, or MAP[x].
+// These two pure/total helpers are the single source for that defense; every
+// state-field coercion site routes through them. (Codex MERGE CRITICAL, S166.)
+
+/**
+ * True iff `v` is a non-null object (incl. arrays) — i.e. NOT a primitive — so
+ * String(v) / `${v}` / MAP[v] would risk throwing. Pure, never throws.
+ */
+export function isNonPrimitiveStateField(v: unknown): boolean {
+  return typeof v === "object" && v !== null;
+}
+
+/**
+ * The recovery-eligible notebook id, or null. ONLY a non-empty STRING is a
+ * usable recovery target: a non-string notebook_id (object/number/null) must
+ * fail CLOSED — never be laundered into a success verdict (fail-OPEN) — and a
+ * non-coercible object must never reach a log-line template. Pure, never throws.
+ */
+export function recoverableNotebookId(state: PipelineState | null): string | null {
+  const id: unknown = state?.notebook_id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
 /** Discriminated outcome of summarizing an OK-parsed state into a progress
  * update. "malformed" = the parsed JSON object's phase/phase_status are not
  * usable primitives (see summarizeStateProgress). */
@@ -1831,10 +1865,7 @@ export function summarizeStateProgress(
 ): ProgressSummary {
   const phase: unknown = state.phase;
   const phaseStatus: unknown = state.phase_status;
-  if (
-    (typeof phase === "object" && phase !== null) ||
-    (typeof phaseStatus === "object" && phaseStatus !== null)
-  ) {
+  if (isNonPrimitiveStateField(phase) || isNonPrimitiveStateField(phaseStatus)) {
     return { kind: "malformed", detail: "phase/phase_status is not a primitive" };
   }
   const phaseKey = phase as string;
@@ -2010,6 +2041,44 @@ async function verifyPipelineCompletion(workDir: string): Promise<CompletionVerd
     };
   }
 
+  return evaluateCompletion(state);
+}
+
+/**
+ * Pure + total: decide pipeline completion from a parsed state. NEVER throws.
+ *
+ * state.json is parsed from an UNTRUSTED child-written file, so phase /
+ * phase_status are not guaranteed to be the primitives PipelineState declares.
+ * A non-null object (e.g. {"phase":{"toString":null}}) throws "Cannot convert
+ * object to primitive value" on the String()/`${}`/PHASE_MAP[] coercions below,
+ * and a non-string phase_status throws on .slice(). Both are treated as a
+ * malformed (NOT-complete) state and fail CLOSED — never thrown, never a false
+ * success. The parsed value ITSELF may also be a non-object — the literal `null`
+ * (JSON.parse("null") returns null, NOT a throw), a primitive, or an array — so
+ * a top-level guard runs first; otherwise `state.phase` would null-deref and
+ * escape on the sync path (bypassing failJob → orphaned job). Extracted from
+ * verifyPipelineCompletion + exported for unit testing. (S168, mirrors the S166
+ * summarizeStateProgress guard.)
+ */
+export function evaluateCompletion(state: PipelineState): CompletionVerdict {
+  // state.json may JSON.parse to a non-object (the literal `null`, a primitive,
+  // or an array) — declared type PipelineState is a runtime lie. Guard FIRST so
+  // `state.phase` below can't null-deref and a non-object can't slip through.
+  // Fail CLOSED (malformed) — keeps the function total. (Gemini MERGE CRITICAL, S168.)
+  const s: unknown = state;
+  if (s === null || typeof s !== "object" || Array.isArray(s)) {
+    return {
+      success: false,
+      reason: "state.json malformed after Claude exit: parsed value is not a JSON object",
+    };
+  }
+  if (isNonPrimitiveStateField(state.phase) || isNonPrimitiveStateField(state.phase_status)) {
+    return {
+      success: false,
+      reason: "state.json malformed after Claude exit: phase/phase_status is not a primitive value",
+    };
+  }
+
   const phaseRaw = state.phase;
   const phaseStr = String(phaseRaw).trim().toLowerCase();
   const phaseNum = parseFloat(phaseStr);
@@ -2024,7 +2093,7 @@ async function verifyPipelineCompletion(workDir: string): Promise<CompletionVerd
 
   if (!isComplete) {
     const phaseLabel = PHASE_MAP[String(phaseRaw)]?.name ?? String(phaseRaw);
-    const status = (state.phase_status ?? "(empty)").slice(0, 200);
+    const status = String(state.phase_status ?? "(empty)").slice(0, 200);
     return {
       success: false,
       reason: `Pipeline stopped at phase ${phaseRaw} (${phaseLabel}); expected phase_status="complete" OR phase>=7 (Finalization). phase_status: "${status}"`,
