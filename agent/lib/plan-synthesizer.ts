@@ -33,6 +33,7 @@ import { fenceValue } from "./untrusted-input.js";
 import type { ResearchJob } from "../types.js";
 import {
   validateResearchPlan,
+  STUDIO_PRODUCT_LIST,
   type ResearchPlan,
 } from "./plan-types.js";
 
@@ -142,6 +143,21 @@ export class PlanSynthesisError extends Error {
 // ── Prompt assembly ─────────────────────────────────────────────────
 
 /**
+ * Studio-product fragments for the synthesizer prompt, single-sourced (S169) from
+ * conventions.json via STUDIO_PRODUCT_LIST. All three are BYTE-IDENTICAL to the
+ * former hand-typed literals, so the prompt Claude receives is unchanged; a
+ * product added to conventions.json now flows into BOTH the pipeline digest and
+ * the schema hint automatically instead of silently drifting. Pinned byte-for-
+ * byte in agent/test/studio-products-single-source.test.ts.
+ *   SLASH   -> slash-joined prose form (RESEARCH_COMPARE_PIPELINE_DIGEST)
+ *   ENUM    -> quoted comma-space enum (SCHEMA_HINT discipline line)
+ *   EXAMPLE -> quoted "<p>?" JSON-skeleton form (SCHEMA_HINT example)
+ */
+export const STUDIO_PRODUCTS_SLASH = STUDIO_PRODUCT_LIST.join("/");
+export const STUDIO_SELECTED_ENUM = STUDIO_PRODUCT_LIST.map((p) => `"${p}"`).join(", ");
+export const STUDIO_SELECTED_EXAMPLE = STUDIO_PRODUCT_LIST.map((p) => `"${p}?"`).join(",");
+
+/**
  * Embedded slash-command phase digest (Codex cross-coverage gap #13).
  * Kept narrow and stable — describes the WORK SHAPE so the synthesized
  * plan accurately reflects what the worker will execute, not a hallucinated
@@ -158,12 +174,12 @@ The /research-compare worker pipeline runs these phases sequentially:
   3    NotebookLM Research        — deep-research mode
   4    Extraction                 — structured facts + claims
   5    Synthesis                  — narrative + comparison
-  5.5  Studio Products            — audio/video/slides/report/infographic (Veo cinematic for video)
+  5.5  Studio Products            — ${STUDIO_PRODUCTS_SLASH} (Veo cinematic for video)
   6    Vendor Evaluation          — optional; only when enabled in manifest
   7    Finalization               — deliverable upload + state.json terminal marker
 
 Phase 0.5 in worker mode is NONINTERACTIVE — no AskUserQuestion calls.
-Studio product selection is controlled by manifest.selected_products (audio/video/slides/report/infographic).
+Studio product selection is controlled by manifest.selected_products (${STUDIO_PRODUCTS_SLASH}).
 Failure-path: NONINTERACTIVE worker writes phase_status: "ERROR: ..." + exits 1; never silently completes.
 Terminal marker contract: phase_status MUST be EXACTLY "complete" (no clarifier) on success.
 `.trim();
@@ -234,8 +250,12 @@ export function buildSynthesizerPrompt(job: ResearchJob): string {
 /**
  * Inlined schema hint — kept short and skeletal so Claude infers from the
  * TS types rather than memorizing this string. Reduces prompt token cost.
+ *
+ * Exported (S169) so the studio-products single-source test can pin the studio
+ * enum + JSON-example lines byte-for-byte (proves the interpolation is wired and
+ * unchanged from the pre-refactor literal).
  */
-const SCHEMA_HINT = `
+export const SCHEMA_HINT = `
 TOPIC CANONICALIZATION (CRITICAL — S81 #7 system_blocked failure mode):
 - topic_resolved MUST be a single concise question or statement. Target <= 200 chars; hard limit 500 chars.
 - DO NOT echo the user's full topic verbatim. DO NOT preserve every clause, qualifier, or example.
@@ -245,7 +265,7 @@ TOPIC CANONICALIZATION (CRITICAL — S81 #7 system_blocked failure mode):
 
 ENUM DISCIPLINE (CRITICAL — S59 smoke-test learning):
 - source_priorities entries MUST be one of: "peer-reviewed", "industry-analyst", "vendor-docs", "community" — BARE values, NO parenthetical decoration. Reorder them to reflect priority but do not append "(context...)" strings.
-- studio_products.selected entries MUST be exactly one of: "audio", "video", "slides", "report", "infographic" — BARE values.
+- studio_products.selected entries MUST be exactly one of: ${STUDIO_SELECTED_ENUM} — BARE values.
 - depth_target MUST be exactly one of: "executive", "practitioner", "expert".
 - schema_version MUST be the literal integer 1.
 
@@ -264,7 +284,7 @@ ENUM DISCIPLINE (CRITICAL — S59 smoke-test learning):
     "rubric_rationale": "2-3 sentence justification tying dimensions to persona's decision_context"
   },
   "studio_products": {
-    "selected": ["audio?","video?","slides?","report?","infographic?"],
+    "selected": [${STUDIO_SELECTED_EXAMPLE}],
     "per_product_emphasis": { "<product>": "solution-integration emphasis line" }
   },
   "expected_artifacts": ["filenames the worker will produce"],

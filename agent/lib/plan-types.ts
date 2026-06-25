@@ -138,8 +138,12 @@ export type SourcePriority = (typeof SOURCE_PRIORITIES)[number];
  *     this tuple ever diverge, so the two are single-sourced-by-construction
  *     and the `as StudioProduct[]` derivation can never silently lie.
  *
- * (A third literal — STUDIO_ORDER in studio-completeness.ts:54 — encodes NLM
- * ordering and is out of scope for this bounded fix; tracked as a follow-up.)
+ * (S169–S170 follow-up SHIPPED: STUDIO_ORDER in studio-completeness.ts, the
+ * SelectedProducts type in types.ts, the plan-synthesizer prompt literals,
+ * PRODUCT_DEFS in regenerate-studio-products.ts, and NLM_TYPE_TO_PRODUCT in
+ * verify-gallery-vs-notebook.ts are now all single-sourced from
+ * STUDIO_PRODUCT_LIST too. The remaining ~6 frontend mirrors are deferred: they
+ * cannot import this Node-only module and need a hermetic frontend mirror.)
  */
 const STUDIO_PRODUCT_KEYS = [
   "audio",
