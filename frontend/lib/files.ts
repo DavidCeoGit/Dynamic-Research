@@ -9,6 +9,7 @@
  */
 
 import type { StorageFileEntry } from "./storage";
+import { STUDIO_PRODUCT_KEYS, type StudioProductKey } from "./studio-products";
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -21,12 +22,11 @@ export type FileType =
   | "state"
   | "docx";
 
+// S172 site M: the studio portion is spread-derived from the canonical key set
+// (a new studio product is auto-included); the non-studio CLI product names are
+// kept explicit. FileType above stays extension-keyed (render-kind, OUT of scope).
 export type ProductType =
-  | "audio"
-  | "video"
-  | "slides"
-  | "report"
-  | "infographic"
+  | StudioProductKey
   | "brief"
   | "perplexity"
   | "notebooklm"
@@ -95,13 +95,13 @@ export const CONTENT_TYPE_MAP: Record<string, string> = {
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 };
 
-/** Known CLI product names that appear after the timestamp. */
-const KNOWN_PRODUCTS = new Set([
-  "audio",
-  "video",
-  "slides",
-  "report",
-  "infographic",
+/** Known CLI product names that appear after the timestamp. S172 site M: the
+ *  studio portion drives resolveProduct() suffix-stripping, so it is spread from
+ *  the canonical key set; "state" is Set-only (a state.json marker, not a
+ *  ProductType). KNOWN_PRODUCTS ⊇ STUDIO_PRODUCT_KEYS is structurally guaranteed by
+ *  the [...STUDIO_PRODUCT_KEYS] spread in this declaration (a compile-time tautology). */
+const KNOWN_PRODUCTS = new Set<string>([
+  ...STUDIO_PRODUCT_KEYS,
   "brief",
   "perplexity",
   "notebooklm",

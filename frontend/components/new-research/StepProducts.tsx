@@ -5,6 +5,7 @@ import type { FormData } from "@/lib/validate";
 import type { StepProductsProps } from "@/lib/types/queue";
 import { ArrowLeft, ArrowRight, Music, Video, Presentation, FileText, Image as ImageIcon } from "lucide-react";
 import { TimeEstimate } from "./Shared";
+import type { StudioProductKey, AssertExact } from "@/lib/studio-products";
 
 const PRODUCTS = [
   { key: "audio" as const, label: "Audio Overview", desc: "NotebookLM podcast-style audio deep dive", icon: Music, time: "+8 min" },
@@ -13,6 +14,15 @@ const PRODUCTS = [
   { key: "report" as const, label: "Executive Report", desc: "Formatted research report (DOCX)", icon: FileText, time: "+5 min" },
   { key: "infographic" as const, label: "Infographic", desc: "Visual data summary", icon: ImageIcon, time: "+10 min" },
 ] as const;
+
+// S172 site J: compile-time exhaustiveness (same rationale as site I — this array
+// is in a client component the node test harness can't import). The PRODUCTS key
+// set MUST equal the canonical set; a missing/typo'd key fails this `= true`.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _productsKeysCover: AssertExact<
+  (typeof PRODUCTS)[number]["key"],
+  StudioProductKey
+> = true;
 
 export function StepProducts({ onNext, onPrev, estMins }: StepProductsProps) {
   const { register, watch, formState: { errors } } = useFormContext<FormData>();

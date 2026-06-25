@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import type { ResearchJob } from "@/lib/types/queue";
 import { phaseFromProgress } from "@/lib/estimates";
+import { isStudioProductKey, type StudioProductKey } from "@/lib/studio-products";
 import { CardSkeleton } from "@/components/Skeleton";
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -85,7 +86,7 @@ function formatTimestamp(ts: string): string {
   return `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}`;
 }
 
-const PRODUCT_ICONS: Record<string, typeof Music> = {
+const PRODUCT_ICONS: Record<StudioProductKey, typeof Music> = {
   audio: Music,
   video: Video,
   infographic: ImageIcon,
@@ -502,12 +503,17 @@ export default function HomePage() {
                       {/* Product icons */}
                       <div className="mt-2 flex items-center gap-2">
                         {products.map(([key]) => {
+                          // S172 site F: narrow the string key (Object.entries
+                          // yields string) before indexing the exact icon record;
+                          // a stale/extra key is skipped (replaces the Icon? guard,
+                          // now provably-dead under Record<StudioProductKey,…>).
+                          if (!isStudioProductKey(key)) return null;
                           const Icon = PRODUCT_ICONS[key];
-                          return Icon ? (
+                          return (
                             <span key={key} title={key}>
                               <Icon className="h-4 w-4 text-zinc-500" />
                             </span>
-                          ) : null;
+                          );
                         })}
                       </div>
                     </div>

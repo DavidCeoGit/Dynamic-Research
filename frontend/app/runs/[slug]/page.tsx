@@ -19,22 +19,17 @@ import {
   Repeat,
   X,
 } from "lucide-react";
+import {
+  STUDIO_PRODUCT_KEYS,
+  coerceSelection,
+  emptySelection,
+  type StudioProductKey,
+  type SelectedProducts,
+} from "@/lib/studio-products";
 
-// ── Constants ───────────────────────────────────────────────────────
-
-const PRODUCT_KEYS = ["audio", "video", "slides", "report", "infographic"] as const;
-type ProductKey = (typeof PRODUCT_KEYS)[number];
-type ProductMap = Record<ProductKey, boolean>;
-
-function normalizeProducts(raw: Record<string, boolean> | undefined): ProductMap {
-  return {
-    audio: !!raw?.audio,
-    video: !!raw?.video,
-    slides: !!raw?.slides,
-    report: !!raw?.report,
-    infographic: !!raw?.infographic,
-  };
-}
+// S172 site E: PRODUCT_KEYS / ProductKey / ProductMap / normalizeProducts are now
+// the hermetic studio-products module (STUDIO_PRODUCT_KEYS / StudioProductKey /
+// SelectedProducts / coerceSelection).
 
 // ── Component ───────────────────────────────────────────────────────
 
@@ -54,18 +49,12 @@ export default function RunDetailPage({
 
   // S60 — Replay state + modal.
   const [replayModalOpen, setReplayModalOpen] = useState(false);
-  const [replayProducts, setReplayProducts] = useState<ProductMap>({
-    audio: false,
-    video: false,
-    slides: false,
-    report: false,
-    infographic: false,
-  });
+  const [replayProducts, setReplayProducts] = useState<SelectedProducts>(emptySelection());
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState<string | null>(null);
 
   function openReplayModal() {
-    setReplayProducts(normalizeProducts(state?.selectedProducts));
+    setReplayProducts(coerceSelection(state?.selectedProducts));
     setReplayError(null);
     setReplayModalOpen(true);
   }
@@ -75,11 +64,11 @@ export default function RunDetailPage({
     setReplayModalOpen(false);
   }
 
-  function toggleProduct(key: ProductKey) {
+  function toggleProduct(key: StudioProductKey) {
     setReplayProducts((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
-  const anyProductSelected = PRODUCT_KEYS.some((k) => replayProducts[k]);
+  const anyProductSelected = STUDIO_PRODUCT_KEYS.some((k) => replayProducts[k]);
 
   async function submitReplay() {
     if (replayLoading || !anyProductSelected) return;
@@ -403,7 +392,7 @@ export default function RunDetailPage({
             </div>
 
             <div className="mt-5 space-y-2">
-              {PRODUCT_KEYS.map((key) => (
+              {STUDIO_PRODUCT_KEYS.map((key) => (
                 <label
                   key={key}
                   className="flex cursor-pointer items-center gap-3 rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-300 transition hover:border-zinc-700"

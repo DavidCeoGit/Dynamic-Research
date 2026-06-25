@@ -27,7 +27,8 @@ import {
   FileText,
   Image as ImageIcon,
 } from "lucide-react";
-import type { ResearchJob, SelectedProducts } from "@/lib/types/queue";
+import type { ResearchJob } from "@/lib/types/queue";
+import type { StudioProductKey, AssertExact } from "@/lib/studio-products";
 import { useToast } from "@/components/ToastProvider";
 import { isRecoveringStatus, studioStatusCardLabel } from "@/lib/run-status";
 
@@ -72,13 +73,25 @@ function phaseStatus(pct: number, phase: Phase, phases: Phase[]): "done" | "acti
 
 // ── Deliverables ───────────────────────────────────────────────────
 
-const DELIVERABLES: { key: keyof SelectedProducts; label: string; Icon: typeof Music }[] = [
+const DELIVERABLES = [
   { key: "report",      label: "Executive Report", Icon: FileText },
   { key: "infographic", label: "Infographic",      Icon: ImageIcon },
   { key: "slides",      label: "Slide Deck",       Icon: Presentation },
   { key: "audio",       label: "Audio Overview",   Icon: Music },
   { key: "video",       label: "Cinematic Video",  Icon: Video },
-];
+] as const satisfies readonly { key: StudioProductKey; label: string; Icon: typeof Music }[];
+
+// S172 site I: compile-time exhaustiveness — the deliverables key set MUST equal
+// the canonical set (missing key → extracted union ⊊ StudioProductKey; extra/typo
+// → ⊋; either fails `= true`). Compile-time guard (design §4 value-assignment form)
+// rather than the design's test-time check: this array lives in a client page
+// module the node test harness cannot import (@/ aliases + heavy client deps), so
+// the guard runs in `tsc` + the Vercel build, enforcing the identical invariant.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _deliverablesKeysCover: AssertExact<
+  (typeof DELIVERABLES)[number]["key"],
+  StudioProductKey
+> = true;
 
 // ── Fetcher ────────────────────────────────────────────────────────
 
