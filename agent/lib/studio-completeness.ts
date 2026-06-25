@@ -43,6 +43,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { studioFilename } from "./conventions.js";
+import { STUDIO_PRODUCT_LIST } from "./plan-types.js";
 import { pickWinners } from "./studio-winner.js";
 import type {
   PipelineState,
@@ -50,8 +51,12 @@ import type {
   StudioRecoveryProduct,
 } from "../types.js";
 
-// Canonical product order (matches SelectedProducts / conventions STUDIO_PRODUCTS).
-const STUDIO_ORDER = ["audio", "video", "slides", "report", "infographic"] as const;
+// Canonical product order — single-sourced (S169) from conventions.json via
+// plan-types' STUDIO_PRODUCT_LIST (itself derived from the conventions Record).
+// STUDIO_PRODUCT_LIST follows conventions key-insertion order (audio, video,
+// slides, report, infographic) — identical to the former literal — so
+// obligedProducts() output is byte-for-byte unchanged.
+const STUDIO_ORDER = STUDIO_PRODUCT_LIST;
 
 // Conventions product name → NotebookLM CLI type. The CLI uses "slide-deck"
 // for what conventions calls "slides"; both `artifact list --type` and

@@ -69,6 +69,7 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { BUCKET, STUDIO_PRODUCTS, studioFilename, getContentType } from "../lib/conventions.js";
+import { STUDIO_PRODUCT_LIST } from "../lib/plan-types.js";
 import { PHASE_CHECKS } from "../lib/workflow-conventions.js";
 import { scopedStoragePath, uploadWithAudit } from "../lib/storage-paths.js";
 import { isStateFileName, selectNewestStateFile } from "../lib/find-state-file.js";
@@ -127,6 +128,29 @@ const PRODUCT_DEFS: Record<string, ProductDef> = {
   report: { cliType: "report", genFlags: [], maxPollMin: 25 },
   infographic: { cliType: "infographic", genFlags: ["--orientation", "landscape"], maxPollMin: 25 },
 };
+
+// Single-source guard (S169): Object.keys(PRODUCT_DEFS) IS the studio_only product
+// set (see the `products` filter in main()). Assert it matches the canonical
+// STUDIO_PRODUCT_LIST (conventions.json) so a product added to conventions can
+// never SILENTLY drop out of studio_only regen — drift fails LOUD at script
+// startup (this script is spawned fresh per studio_only job) and in
+// agent/test/studio-products-single-source.test.ts. The default params exist so
+// the test can feed drifted inputs and prove the guard is non-vacuous.
+export function assertProductDefsInSync(
+  defKeys: readonly string[] = Object.keys(PRODUCT_DEFS),
+  canonical: readonly string[] = STUDIO_PRODUCT_LIST,
+): void {
+  const a = defKeys.slice().sort();
+  const b = canonical.slice().sort();
+  if (a.length !== b.length || a.some((k, i) => k !== b[i])) {
+    throw new Error(
+      `PRODUCT_DEFS drift: keys [${a.join(", ")}] != conventions STUDIO_PRODUCT_LIST ` +
+        `[${b.join(", ")}]. Add the new product's CLI def to PRODUCT_DEFS ` +
+        `(regenerate-studio-products.ts) or update conventions.json.`,
+    );
+  }
+}
+assertProductDefsInSync();
 
 // ── State file (worker progress relay) ──────────────────────────────
 //

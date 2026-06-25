@@ -47,8 +47,10 @@
 
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { slugify, VERSION, LAST_UPDATED } from "../lib/conventions.js";
 import { GalleryWinner, pickWinners } from "../lib/studio-winner.js";
+import { STUDIO_PRODUCT_LIST } from "../lib/plan-types.js";
 
 // ── Args ─────────────────────────────────────────────────────────────
 
@@ -63,28 +65,12 @@ function argFor(flag: string): string | undefined {
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-if (!notebookId) {
-  console.error(
-    "usage: verify-gallery-vs-notebook.ts --notebook <id> (--local-dir <path> | --slug <supabase-slug>) [--strict]",
-  );
-  process.exit(2);
-}
-
-// Exactly one source mode.
-if ((slug && localDir) || (!slug && !localDir)) {
-  console.error(
-    "error: provide exactly one of --local-dir <path> or --slug <supabase-slug>",
-  );
-  process.exit(2);
-}
-
-// Supabase creds are only needed for the legacy --slug storage mode.
+// Supabase creds are only needed for the legacy --slug storage mode. Module-level
+// so listGallery() can read them; the presence CHECK runs in the CLI-entry block
+// at the bottom (S170 — gated behind import.meta.main so a unit test can import
+// this module's pure helpers without process.exit()).
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (slug && (!supabaseUrl || !supabaseKey)) {
-  console.error("missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY (required for --slug mode)");
-  process.exit(2);
-}
 
 // ── NLM CLI type → conventions product mapping ──────────────────────
 
@@ -97,6 +83,37 @@ const NLM_TYPE_TO_PRODUCT: Record<string, string> = {
   report: "report",
   infographic: "infographic",
 };
+
+// Single-source guard (S170): Object.values(NLM_TYPE_TO_PRODUCT) IS the verifier
+// coverage set — main()'s `Object.entries(NLM_TYPE_TO_PRODUCT)` loop checks exactly
+// these product types. Assert that product VALUE set equals the canonical
+// STUDIO_PRODUCT_LIST (conventions.json) so a product added to conventions can
+// never SILENTLY drop out of the gallery-vs-notebook check (this script gates
+// /research-compare Phase 6.5 in --strict mode). Drift fails LOUD at module load
+// (the script is spawned fresh per check) AND in
+// agent/test/studio-products-single-source.test.ts. The CLI-type KEYS (e.g.
+// "slide-deck") are intentionally NOT derived — they are the NotebookLM CLI's own
+// argument names with no canonical source; only the product values are
+// single-sourced (mirrors regenerate-studio-products.ts assertProductDefsInSync,
+// which keeps the per-product CLI defs literal and asserts the key SET). The
+// default params exist ONLY so the sync test can feed drifted inputs and prove the
+// guard is non-vacuous.
+export function assertNlmTypeMapInSync(
+  productValues: readonly string[] = Object.values(NLM_TYPE_TO_PRODUCT),
+  canonical: readonly string[] = STUDIO_PRODUCT_LIST,
+): void {
+  const a = productValues.slice().sort();
+  const b = canonical.slice().sort();
+  if (a.length !== b.length || a.some((p, i) => p !== b[i])) {
+    throw new Error(
+      `NLM_TYPE_TO_PRODUCT drift: product values [${a.join(", ")}] != conventions ` +
+        `STUDIO_PRODUCT_LIST [${b.join(", ")}]. Add the new product's NotebookLM ` +
+        `CLI-type mapping to NLM_TYPE_TO_PRODUCT (verify-gallery-vs-notebook.ts) or ` +
+        `update conventions.json.`,
+    );
+  }
+}
+assertNlmTypeMapInSync();
 
 // Windows node spawnSync needs a native path — MSYS /c/... won't resolve.
 const NLM_BIN =
@@ -120,11 +137,6 @@ interface RowReport {
   status: "PASS" | "MISMATCH" | "MISSING-IN-GALLERY" | "STALE-IN-GALLERY" | "EMPTY";
   detail: string;
 }
-
-main().catch((err) => {
-  console.error("fatal:", err);
-  process.exit(2);
-});
 
 async function main() {
   const source = localDir ? `local ${localDir}` : `storage <${slug}/>`;
@@ -334,4 +346,39 @@ function reportTable(rows: RowReport[]): void {
     }
   }
   console.log("─".repeat(100));
+}
+
+// ── CLI entry (runs ONLY when executed directly — never on import) ──────────
+// Mirrors regenerate-studio-products.ts: the arg-validation + main() are gated
+// behind import.meta.main so a unit test can import assertNlmTypeMapInSync (and
+// the pure helpers) without process.exit() or auto-running the verification
+// (S170 testability). The module-load assertNlmTypeMapInSync() above still runs
+// on import — that is the drift guard, and it is pure (throws only on drift).
+const isMain =
+  !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  if (!notebookId) {
+    console.error(
+      "usage: verify-gallery-vs-notebook.ts --notebook <id> (--local-dir <path> | --slug <supabase-slug>) [--strict]",
+    );
+    process.exit(2);
+  }
+  // Exactly one source mode.
+  if ((slug && localDir) || (!slug && !localDir)) {
+    console.error(
+      "error: provide exactly one of --local-dir <path> or --slug <supabase-slug>",
+    );
+    process.exit(2);
+  }
+  // Supabase creds are only needed for the legacy --slug storage mode.
+  if (slug && (!supabaseUrl || !supabaseKey)) {
+    console.error(
+      "missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY (required for --slug mode)",
+    );
+    process.exit(2);
+  }
+  main().catch((err) => {
+    console.error("fatal:", err);
+    process.exit(2);
+  });
 }

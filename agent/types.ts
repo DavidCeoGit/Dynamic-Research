@@ -5,6 +5,11 @@
  * agent/ package doesn't depend on the Next.js frontend.
  */
 
+// Type-only import: erased at runtime, so types.ts stays runtime-standalone (no
+// conventions.json fs.readFileSync is pulled in just because a module imports a
+// type from here). StudioProduct is the canonical union (plan-types.ts).
+import type { StudioProduct } from "./lib/plan-types.js";
+
 export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 /**
@@ -145,13 +150,16 @@ export interface VendorEvaluation {
   maxVendorsEnriched: number;
 }
 
-export interface SelectedProducts {
-  audio: boolean;
-  video: boolean;
-  slides: boolean;
-  report: boolean;
-  infographic: boolean;
-}
+/**
+ * Studio-product selection booleans, single-sourced (S169) over the canonical
+ * StudioProduct union (plan-types.ts -> conventions.json). `Record<StudioProduct,
+ * boolean>` is structurally identical to the former 5-field interface today, so
+ * every `sel.audio` / `sel[p]` read and `{...} as SelectedProducts` cast is
+ * unchanged; adding a product to conventions.json now makes every object literal
+ * that omits the new key a compile error here — the single-source enforcement.
+ * (The frontend's lib/types/queue.ts twin is a separate, deferred follow-up.)
+ */
+export type SelectedProducts = Record<StudioProduct, boolean>;
 
 export interface PerplexityCustomization {
   queryFraming: string;
