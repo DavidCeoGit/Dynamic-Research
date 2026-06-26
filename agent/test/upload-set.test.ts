@@ -16,7 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { selectUploadSet, type UploadCandidate } from "../lib/upload-set.js";
-import { uploadOutputs, type Uploader } from "../executor.js";
+import { uploadOutputs, type Uploader } from "../lib/upload-outputs.js";
 import type { ResearchJob } from "../types.js";
 
 const file = (name: string): UploadCandidate => ({ name, isFile: true });
