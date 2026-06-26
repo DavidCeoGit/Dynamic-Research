@@ -28,7 +28,7 @@ import {
   type StorageDownloaderLike,
 } from "../lib/attachments.js";
 import { ATTACHMENTS } from "../lib/conventions.js";
-import { buildManifest, buildPrompt } from "../executor.js";
+import { buildManifest, buildPrompt } from "../lib/job-manifest.js";
 import type { AttachmentMeta, ResearchJob } from "../types.js";
 
 const ORG = "0a1b2c3d-0a1b-4c3d-8e9f-0a1b2c3d4e5f";

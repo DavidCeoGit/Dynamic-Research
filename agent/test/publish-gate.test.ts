@@ -26,7 +26,7 @@ import {
   logPublishFlagDiagnostics,
   readUrgentBypass,
 } from "../lib/publish-gate.js";
-import { buildManifest } from "../executor.js";
+import { buildManifest } from "../lib/job-manifest.js";
 import type {
   PipelineState,
   PublishVerification,

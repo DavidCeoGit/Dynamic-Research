@@ -13,7 +13,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildPrompt } from "../executor.js";
+import { buildPrompt } from "../lib/job-manifest.js";
 import type { ResearchJob } from "../types.js";
 
 function baseJob(): ResearchJob {
