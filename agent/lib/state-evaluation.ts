@@ -1,0 +1,330 @@
+import * as fs from "node:fs/promises";
+import { updateJob } from "../api-client.js";
+import { readPipelineState } from "./read-state-file.js";
+import { findStateFile } from "./find-state-file.js";
+import type { PipelineState, ResearchJob } from "../types.js";
+
+// Phase number → { name, progressPct } mapping from /research-compare
+const PHASE_MAP: Record<string, { name: string; pct: number }> = {
+  "0":   { name: "Preflight",           pct: 5 },
+  "0.5": { name: "Research Brief",      pct: 8 },
+  "1":   { name: "Perplexity Research", pct: 15 },
+  "1.5": { name: "CI Tier 1 Scoring",   pct: 25 },
+  "2":   { name: "NotebookLM Import",   pct: 30 },
+  "3":   { name: "NotebookLM Research", pct: 40 },
+  "4":   { name: "Extraction",          pct: 50 },
+  "5":   { name: "Synthesis",           pct: 60 },
+  "5.5": { name: "Studio Products",     pct: 70 },
+  "6":   { name: "Vendor Evaluation",   pct: 85 },
+  "7":   { name: "Finalization",        pct: 95 },
+};
+
+function log(context: string, msg: string): void {
+  const ts = new Date().toISOString().slice(11, 23);
+  console.log(`[${ts}] [${context.slice(0, 8)}] ${msg}`);
+}
+
+// ── State file watcher ──────────────────────────────────────────────
+
+export interface StateWatcher {
+  stop: () => void;
+}
+
+// ── State-field coercion safety (S166/S168) ─────────────────────────
+// state.json is JSON.parsed from an UNTRUSTED child-written file, so a field's
+// runtime value is NOT guaranteed to match its declared PipelineState type. A
+// JSON-representable non-null object (e.g. {"toString":null}, [], {}) passes a
+// structural "is an object" check but throws "Cannot convert object to
+// primitive value" the moment it is coerced — String(x), `${x}`, or MAP[x].
+// These two pure/total helpers are the single source for that defense; every
+// state-field coercion site routes through them. (Codex MERGE CRITICAL, S166.)
+
+/**
+ * True iff `v` is a non-null object (incl. arrays) — i.e. NOT a primitive — so
+ * String(v) / `${v}` / MAP[v] would risk throwing. Pure, never throws.
+ */
+export function isNonPrimitiveStateField(v: unknown): boolean {
+  return typeof v === "object" && v !== null;
+}
+
+/**
+ * The recovery-eligible notebook id, or null. ONLY a non-empty STRING is a
+ * usable recovery target: a non-string notebook_id (object/number/null) must
+ * fail CLOSED — never be laundered into a success verdict (fail-OPEN) — and a
+ * non-coercible object must never reach a log-line template. Pure, never throws.
+ */
+export function recoverableNotebookId(state: PipelineState | null): string | null {
+  const id: unknown = state?.notebook_id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+/** Discriminated outcome of summarizing an OK-parsed state into a progress
+ * update. "malformed" = the parsed JSON object's phase/phase_status are not
+ * usable primitives (see summarizeStateProgress). */
+export type ProgressSummary =
+  | { kind: "malformed"; detail: string }
+  | { kind: "unchanged" }
+  | { kind: "update"; phase: string; phaseName: string; pct: number; phaseStatus: string };
+
+/**
+ * Pure + total: map an OK-parsed state to a progress-update decision. NEVER
+ * throws — returns "malformed" when phase/phase_status are not primitives.
+ *
+ * readPipelineState guarantees the parsed value is a JSON OBJECT, but NOT that
+ * its FIELDS are primitives. A JSON-representable object like
+ * `{"phase":{"toString":null}}` throws "Cannot convert object to primitive
+ * value" on PHASE_MAP key coercion (and a non-primitive phase_status throws on
+ * string interpolation). In watchStateFile's async setInterval such a throw
+ * would escape as an UNHANDLED REJECTION rather than the intended corrupt-state
+ * log — the old whole-tick try/catch silently swallowed it; this guard restores
+ * that safety while still surfacing it as a (deduped) signal. (Codex MERGE
+ * CRITICAL, S166.) Exported for unit testing.
+ */
+export function summarizeStateProgress(
+  state: PipelineState,
+  lastPhase: string,
+  lastPct: number,
+): ProgressSummary {
+  const phase: unknown = state.phase;
+  const phaseStatus: unknown = state.phase_status;
+  if (isNonPrimitiveStateField(phase) || isNonPrimitiveStateField(phaseStatus)) {
+    return { kind: "malformed", detail: "phase/phase_status is not a primitive" };
+  }
+  const phaseKey = phase as string;
+  const mapped = PHASE_MAP[phaseKey];
+  const pct = mapped?.pct ?? lastPct;
+  const phaseName = mapped?.name ?? phaseKey;
+  if (phaseKey === lastPhase && pct === lastPct) {
+    return { kind: "unchanged" };
+  }
+  return {
+    kind: "update",
+    phase: phaseKey,
+    phaseName,
+    pct,
+    phaseStatus: phaseStatus as string,
+  };
+}
+
+export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
+  let lastPhase = "";
+  let lastPct = 0;
+  let stopped = false;
+  // Dedupe: a present-but-unusable state file (unparseable OR a JSON object with
+  // non-primitive phase/phase_status) is logged ONCE per bad episode — the 5s
+  // poll would otherwise spam every tick. Re-armed after the next usable parse.
+  let loggedCorrupt = false;
+
+  const noteCorrupt = (detail: string) => {
+    if (!loggedCorrupt) {
+      loggedCorrupt = true;
+      log(job.id, `state.json present but unusable — progress sync paused: ${detail}`);
+    }
+  };
+
+  const interval = setInterval(async () => {
+    if (stopped) return;
+
+    const result = await readPipelineState(workDir);
+
+    // ABSENT (not written yet) and transient IO (file vanished/locked between
+    // find and read, or workdir not yet enumerable) are EXPECTED during a live
+    // run — ignore and retry on the next tick.
+    if (result.kind === "absent" || result.kind === "io-error") return;
+
+    if (result.kind === "corrupt") {
+      noteCorrupt(
+        result.error instanceof Error ? result.error.message : String(result.error),
+      );
+      return;
+    }
+
+    // kind === "ok": the helper guarantees a JSON object but NOT primitive
+    // fields; summarizeStateProgress is total and flags a non-primitive
+    // phase/phase_status as "malformed" instead of throwing inside this async
+    // interval (Codex MERGE CRITICAL, S166).
+    const summary = summarizeStateProgress(result.state, lastPhase, lastPct);
+    if (summary.kind === "malformed") {
+      noteCorrupt(summary.detail);
+      return;
+    }
+
+    loggedCorrupt = false; // re-arm: a usable state parsed cleanly this tick
+    if (summary.kind === "update") {
+      lastPhase = summary.phase;
+      lastPct = summary.pct;
+
+      log(job.id, `Phase: ${summary.phaseName} (${summary.pct}%) — ${summary.phaseStatus}`);
+
+      await updateJob(job.id, {
+        current_phase: summary.phaseName,
+        phase_status: summary.phaseStatus,
+        progress_pct: summary.pct,
+      }).catch((err) => {
+        log(job.id, `Failed to update progress: ${err}`);
+      });
+    }
+  }, 5_000);
+
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(interval);
+    },
+  };
+}
+
+// findStateFile() moved to ./lib/find-state-file.ts (imported above) as a
+// shared, tested primitive. It now selects the NEWEST state file by the run
+// timestamp embedded in the filename (fs mtime only as a fallback for plain
+// names) — the prior "prefer exact state.json, else the FIRST '<x>-state.json'"
+// logic returned the OLDEST timestamp in a REUSED workdir and false-failed
+// e18e1931 (a completed phase-6 run shadowed by a stale phase-0 state.json). S87.
+
+// ── Pipeline completion verifier (Bug 35) ──────────────────────────
+
+/**
+ * S136 Layer 2: read the parsed state.json for a cap-killed run so the recovery
+ * branch can synthesize a success verdict + drive enforceStudioCompleteness.
+ *
+ * Returns null for ALL non-OK outcomes (→ not recovery-eligible, since
+ * shouldRecoverAfterDurationKill requires a notebook_id), but now distinguishes
+ * them via readPipelineState so a recoverable run is not silently dropped:
+ *   - absent   → no state file written; nothing to recover (silent, expected).
+ *   - io-error → transient read failure; fail CLOSED, logged.
+ *   - corrupt  → present but unparseable; the child is already dead so this is
+ *                genuine corruption (not a write race) — fail CLOSED, logged
+ *                loudly so a run lost to a malformed state file is visible.
+ */
+export async function readStateForRecovery(
+  job: ResearchJob,
+  workDir: string,
+): Promise<PipelineState | null> {
+  const result = await readPipelineState(workDir);
+  switch (result.kind) {
+    case "ok":
+      return result.state;
+    case "absent":
+      return null;
+    case "io-error": {
+      const msg =
+        result.error instanceof Error ? result.error.message : String(result.error);
+      log(job.id, `readStateForRecovery: state read failed — recovery skipped: ${msg}`);
+      return null;
+    }
+    case "corrupt": {
+      const msg =
+        result.error instanceof Error ? result.error.message : String(result.error);
+      log(
+        job.id,
+        `readStateForRecovery: state.json present but corrupt — recovery skipped: ${msg}`,
+      );
+      return null;
+    }
+  }
+}
+
+export interface CompletionVerdict {
+  success: boolean;
+  reason: string;
+  /** Parsed state.json on success — consumed by the PUBLISH gate so the
+   * caller doesn't re-read/re-parse the file it was just verified from. */
+  state?: PipelineState;
+}
+
+export async function verifyPipelineCompletion(workDir: string): Promise<CompletionVerdict> {
+  let stateFile: string | null;
+  try {
+    stateFile = await findStateFile(workDir);
+  } catch (err) {
+    const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    return {
+      success: false,
+      reason: `Cannot enumerate workDir to locate state.json (IO error after Claude exit): ${msg}`,
+    };
+  }
+
+  if (!stateFile) {
+    return {
+      success: false,
+      reason: "Claude exited 0 but no state.json was written — cannot verify completion",
+    };
+  }
+
+  let state: PipelineState;
+  try {
+    const content = await fs.readFile(stateFile, "utf-8");
+    state = JSON.parse(content) as PipelineState;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      reason: `state.json unreadable after Claude exit: ${msg}`,
+    };
+  }
+
+  return evaluateCompletion(state);
+}
+
+/**
+ * Pure + total: decide pipeline completion from a parsed state. NEVER throws.
+ *
+ * state.json is parsed from an UNTRUSTED child-written file, so phase /
+ * phase_status are not guaranteed to be the primitives PipelineState declares.
+ * A non-null object (e.g. {"phase":{"toString":null}}) throws "Cannot convert
+ * object to primitive value" on the String()/`${}`/PHASE_MAP[] coercions below,
+ * and a non-string phase_status throws on .slice(). Both are treated as a
+ * malformed (NOT-complete) state and fail CLOSED — never thrown, never a false
+ * success. The parsed value ITSELF may also be a non-object — the literal `null`
+ * (JSON.parse("null") returns null, NOT a throw), a primitive, or an array — so
+ * a top-level guard runs first; otherwise `state.phase` would null-deref and
+ * escape on the sync path (bypassing failJob → orphaned job). Extracted from
+ * verifyPipelineCompletion + exported for unit testing. (S168, mirrors the S166
+ * summarizeStateProgress guard.)
+ */
+export function evaluateCompletion(state: PipelineState): CompletionVerdict {
+  // state.json may JSON.parse to a non-object (the literal `null`, a primitive,
+  // or an array) — declared type PipelineState is a runtime lie. Guard FIRST so
+  // `state.phase` below can't null-deref and a non-object can't slip through.
+  // Fail CLOSED (malformed) — keeps the function total. (Gemini MERGE CRITICAL, S168.)
+  const s: unknown = state;
+  if (s === null || typeof s !== "object" || Array.isArray(s)) {
+    return {
+      success: false,
+      reason: "state.json malformed after Claude exit: parsed value is not a JSON object",
+    };
+  }
+  if (isNonPrimitiveStateField(state.phase) || isNonPrimitiveStateField(state.phase_status)) {
+    return {
+      success: false,
+      reason: "state.json malformed after Claude exit: phase/phase_status is not a primitive value",
+    };
+  }
+
+  const phaseRaw = state.phase;
+  const phaseStr = String(phaseRaw).trim().toLowerCase();
+  const phaseNum = parseFloat(phaseStr);
+  const phaseStatusStr = String(state.phase_status ?? "").trim().toLowerCase();
+  const ALLOWED = new Set(["7", "complete", "finalized", "finalised", "done"]);
+  const COMPLETE_AUGMENTED = /^complete[\s\-:(]/;
+  const isComplete =
+    ALLOWED.has(phaseStr) ||
+    (Number.isFinite(phaseNum) && phaseNum >= 7) ||
+    phaseStatusStr === "complete" ||
+    COMPLETE_AUGMENTED.test(phaseStatusStr);
+
+  if (!isComplete) {
+    const phaseLabel = PHASE_MAP[String(phaseRaw)]?.name ?? String(phaseRaw);
+    const status = String(state.phase_status ?? "(empty)").slice(0, 200);
+    return {
+      success: false,
+      reason: `Pipeline stopped at phase ${phaseRaw} (${phaseLabel}); expected phase_status="complete" OR phase>=7 (Finalization). phase_status: "${status}"`,
+    };
+  }
+
+  return {
+    success: true,
+    reason: `Pipeline reached terminal state (phase ${phaseRaw}, phase_status: "${phaseStatusStr}")`,
+    state,
+  };
+}

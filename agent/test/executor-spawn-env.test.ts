@@ -28,7 +28,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert";
-import { buildClaudeSpawnEnv } from "../executor.js";
+import { buildClaudeSpawnEnv } from "../lib/claude-spawn.js";
 
 test("buildClaudeSpawnEnv strips ANTHROPIC_API_KEY (S82 root-cause fix)", () => {
   const out = buildClaudeSpawnEnv({

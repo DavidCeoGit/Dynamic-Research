@@ -15,7 +15,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-import { summarizeStateProgress } from "../executor.js";
+import { summarizeStateProgress } from "../lib/state-evaluation.js";
 import type { PipelineState } from "../types.js";
 
 /** Build a minimal state — summarizeStateProgress only reads phase/phase_status. */
