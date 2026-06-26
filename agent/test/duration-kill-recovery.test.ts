@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldRecoverAfterDurationKill } from "../executor.js";
+import { shouldRecoverAfterDurationKill } from "../lib/claude-spawn.js";
 
 test("DURATION kill, no terminal error, notebook present → recover", () => {
   assert.equal(shouldRecoverAfterDurationKill("DURATION", false, true), true);

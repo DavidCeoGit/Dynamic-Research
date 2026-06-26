@@ -22,8 +22,8 @@ import {
   isNonPrimitiveStateField,
   recoverableNotebookId,
   evaluateCompletion,
-  shouldRecoverAfterDurationKill,
-} from "../executor.js";
+} from "../lib/state-evaluation.js";
+import { shouldRecoverAfterDurationKill } from "../lib/claude-spawn.js";
 import type { PipelineState } from "../types.js";
 
 /** Build a minimal state with only the fields under test. */
