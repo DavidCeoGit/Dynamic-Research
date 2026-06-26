@@ -73,3 +73,6 @@ agent/sandbox/
 /Legora-LOI-Review*
 /20260610112456419.pdf
 /aero-financials-ocr.txt
+
+# Accidentally-bundled local research notes (S172/S175 — keep on disk, never track)
+/Documentation/leverage Perplexity Pro and NotebookLM*
