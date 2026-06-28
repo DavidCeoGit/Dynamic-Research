@@ -8,6 +8,12 @@
  * 10 req/s × ~2k tokens. Token cap closes most of the burn; this limiter
  * closes the request-volume vector.
  *
+ * S181: also used by the OTP verify Server Action (login/actions.ts:
+ * verifyEmailOtp) as brute-force defense-in-depth. Server Actions have no
+ * Request object, so clientIp() was split into clientIpFromHeaders() (takes any
+ * { get(name) } header bag — a Headers OR next/headers ReadonlyHeaders) with
+ * clientIp(request) delegating to it. Single source for the IP-extraction rule.
+ *
  * SCOPE + LIMITATIONS (intentional, documented for the audit trail):
  *
  *   1. In-memory storage. State lives in the Vercel serverless function
@@ -16,7 +22,9 @@
  *      For Dynamic Research's current soft-launch traffic this is fine
  *      (a sustained-flood attacker hits the cap on the worst-case
  *      multiplied-by-instance-count, which is still much smaller than
- *      the unbounded baseline).
+ *      the unbounded baseline). For OTP-verify brute force this is a
+ *      SECONDARY speed-bump; the PRIMARY control is Supabase-side and
+ *      per-TOKEN (single-use codes + short expiry), not this limiter.
  *
  *   2. The intended replacement is @upstash/ratelimit + Upstash Redis
  *      (S52 follow-on if usage scales). The interface here is
@@ -24,10 +32,16 @@
  *      call that returns { allowed, retryAfterSec, remaining }.
  *      Drop-in swap when traffic justifies the Redis dependency.
  *
- *   3. IP is read from x-forwarded-for (Vercel sets this), falling
- *      back to x-real-ip and finally "anon" — a missing IP yields a
- *      single shared bucket which is the safest fail-mode (does not
- *      let a malformed-header attacker dodge the limiter).
+ *   3. IP source. On Vercel, `x-forwarded-for` is OVERWRITTEN by the platform
+ *      with the true client IP and client-supplied values are NOT forwarded
+ *      (Vercel does this specifically to prevent IP spoofing — see
+ *      vercel.com/docs/headers/request-headers), so the leftmost entry is the
+ *      trusted client IP and CANNOT be spoofed or rotated by a client. `x-real-ip`
+ *      is the documented fallback (Vercel sets it identical to x-forwarded-for);
+ *      it is only reached here when x-forwarded-for is absent (e.g. local /
+ *      non-Vercel dev, where spoofing is not the threat model). A fully missing
+ *      IP yields the single shared "anon" bucket (safest fail-mode — does not let
+ *      a malformed-header attacker dodge the limiter).
  *
  *   4. Bucket size + refill rate are conservative: 20 tokens, refill 1
  *      token per 180 seconds (= 20 req/hour sustained, with burst
@@ -52,21 +66,36 @@ export interface RateLimitResult {
 }
 
 /**
- * Extract a stable client IP from the request headers. Vercel terminates
- * TLS and sets x-forwarded-for; fallback to x-real-ip; final fallback
- * "anon" is a single shared bucket (safe fail).
+ * Extract a stable client IP from a header bag. On Vercel the leftmost
+ * x-forwarded-for entry is the platform-set, spoof-proof client IP (Vercel
+ * overwrites the header). x-real-ip is the Vercel-provided fallback (identical to
+ * x-forwarded-for) and is only reached off-Vercel/local; final fallback "anon" is
+ * a single shared bucket (safe fail). Accepts anything with a
+ * `get(name): string | null` method, so it works with both a WHATWG `Headers`
+ * (route handlers, via clientIp) and a next/headers `ReadonlyHeaders` (Server
+ * Actions / Server Components).
  */
-export function clientIp(request: Request): string {
-  const xff = request.headers.get("x-forwarded-for");
+export function clientIpFromHeaders(h: {
+  get(name: string): string | null;
+}): string {
+  const xff = h.get("x-forwarded-for");
   if (xff) {
     // x-forwarded-for can be comma-separated (client, proxy1, proxy2...).
-    // The leftmost entry is the original client.
+    // On Vercel the leftmost entry is the platform-overwritten client IP.
     const first = xff.split(",")[0]?.trim();
     if (first) return first;
   }
-  const xri = request.headers.get("x-real-ip");
+  const xri = h.get("x-real-ip");
   if (xri) return xri.trim();
   return "anon";
+}
+
+/**
+ * Extract a stable client IP from a Request. Vercel terminates TLS and sets
+ * x-forwarded-for. Delegates to clientIpFromHeaders so the rule is single-source.
+ */
+export function clientIp(request: Request): string {
+  return clientIpFromHeaders(request.headers);
 }
 
 /**

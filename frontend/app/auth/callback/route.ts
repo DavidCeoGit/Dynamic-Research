@@ -2,23 +2,26 @@
  * OAuth callback — exchange magic-link code for a session.
  *
  * Phase 1 of the SSR auth refactor — see Documentation/ssr-auth-refactor-design.md.
+ * S181: the post-exchange routing (getUser → organization_members lookup →
+ * redirect taxonomy) was extracted to lib/post-auth.ts:resolvePostAuthDestination
+ * so this magic-link path and the new 6-digit OTP verify Server Action route
+ * IDENTICALLY and cannot drift. The link path is KEPT as an additive fallback to
+ * the OTP code (the email carries both; Gmail-prefetch can consume the link but
+ * not the typed code).
  *
  * Flow: user clicks magic-link email → /auth/callback?code=...&redirect=...
  *   1. Re-validate the redirect param server-side (defense-in-depth on top of
  *      the Server Action's pre-validation) — C-M3 open-redirect close-out.
  *   2. Exchange the code for a Supabase session (writes auth cookies).
- *   3. Look up the user's organization_members row.
- *      - DB/RLS error (memberError) → /login?error=<msg> (NOT /no-org —
- *        Codex round-2 MINOR finding C-m1: a transport-layer error must not
- *        be collapsed with a legitimate-zero-row response).
- *      - missing (data=null, no error) → /no-org
- *      - present → safeRedirect (defaults to /)
- *   4. Code-exchange failures redirect to /login?error=<reason>.
+ *   3. resolvePostAuthDestination() decides the landing path (see that file for
+ *      the full no-user / membership-error / no-org / member taxonomy).
+ *   4. Code-exchange failures (incl. a missing code) redirect to /login?error=.
  */
 
 import { NextResponse } from "next/server";
 import { createServerSupabase } from "@/lib/supabase-server";
 import { isSafeRedirect } from "@/lib/auth";
+import { resolvePostAuthDestination } from "@/lib/post-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -41,36 +44,7 @@ export async function GET(request: Request) {
     );
   }
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.redirect(
-      new URL("/login?error=no_user_after_exchange", url),
-    );
-  }
-
-  const { data: member, error: memberError } = await supabase
-    .from("organization_members")
-    .select("organization_id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (memberError) {
-    // Distinguish transport/RLS errors from legitimate zero-membership users.
-    // Collapsing both into /no-org would mask DB/policy failures (Codex C-m1).
-    return NextResponse.redirect(
-      new URL(
-        `/login?error=${encodeURIComponent("Membership lookup failed: " + memberError.message)}`,
-        url,
-      ),
-    );
-  }
-  if (!member) {
-    return NextResponse.redirect(new URL("/no-org", url));
-  }
-
-  // isSafeRedirect already enforced same-origin relative; new URL(safe, url)
-  // with a path starting with "/" resolves to the request's origin and cannot
-  // escape.
-  return NextResponse.redirect(new URL(safeRedirect, url));
+  // Shared with the OTP verify path so the two cannot drift (lib/post-auth.ts).
+  const destination = await resolvePostAuthDestination(supabase, safeRedirect);
+  return NextResponse.redirect(new URL(destination, url));
 }
