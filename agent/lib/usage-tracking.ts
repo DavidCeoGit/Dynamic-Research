@@ -383,3 +383,66 @@ export async function recordUsage(
     return { ok: false, parsed, reason: msg };
   }
 }
+
+// ── Billing-ledger reconcile for recovered runs (S186 D-9/G9) ───────────────
+
+export interface MarkUsageCompletedResult {
+  ok: boolean;
+  /** Number of research_usage rows flipped to 'complete' (0 = none existed yet). */
+  updated: number;
+  reason?: string;
+}
+
+/**
+ * Reconcile the usage ledger when a run that was recorded `failed` at park time
+ * is later COMPLETED by the studio-recovery sweep / finalize keystone.
+ *
+ * Idempotent UPDATE (never an INSERT) of the existing research_usage row(s) for
+ * `researchQueueId`, setting `job_status` → 'complete'. recordUsage already
+ * INSERTed the row in the executor `finally` (job_status='failed', because the
+ * run parked failed); the recovery completion never re-runs that path, so
+ * without this the ledger diverges from the delivered run (the S162 mis-billing
+ * this retro-fixes).
+ *
+ *  - UPDATE, not INSERT: the sweep lacks the token/cost/stdout inputs recordUsage
+ *    needs, and research_usage has NO unique key on research_queue_id — a second
+ *    INSERT would double-bill (Codex C-1, design §7.3/G9).
+ *  - No row yet (edge): updated:0, ok:true, logged. Nothing to reconcile.
+ *  - Idempotent across sweep retries: re-running re-sets the same value.
+ *  - Best-effort: a reconcile failure is logged, NEVER thrown — a completed run
+ *    that already PATCHed must not be un-completed by a ledger hiccup (mirrors
+ *    recordUsage / uploadWithAudit).
+ *
+ * Only `job_status` is touched; the token/cost columns are left as recorded, so
+ * a prior 'no-summary' row keeps its null-cost detail in those columns.
+ */
+export async function markUsageCompleted(opts: {
+  sb: SupabaseClient;
+  researchQueueId: string;
+}): Promise<MarkUsageCompletedResult> {
+  try {
+    const { data, error } = await opts.sb
+      .from("research_usage")
+      .update({ job_status: "complete" })
+      .eq("research_queue_id", opts.researchQueueId)
+      .select("research_queue_id");
+
+    if (error) {
+      console.warn(
+        `[usage-tracking] markUsageCompleted UPDATE failed (non-blocking): ${error.message}`,
+      );
+      return { ok: false, updated: 0, reason: error.message };
+    }
+    const updated = Array.isArray(data) ? data.length : 0;
+    if (updated === 0) {
+      console.warn(
+        `[usage-tracking] markUsageCompleted: no research_usage row for ${opts.researchQueueId} — nothing to reconcile`,
+      );
+    }
+    return { ok: true, updated };
+  } catch (updateEx) {
+    const msg = (updateEx as Error).message;
+    console.warn(`[usage-tracking] markUsageCompleted threw (non-blocking): ${msg}`);
+    return { ok: false, updated: 0, reason: msg };
+  }
+}

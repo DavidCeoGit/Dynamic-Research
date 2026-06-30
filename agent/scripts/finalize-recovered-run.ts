@@ -49,6 +49,7 @@ import { isSkipFile, getContentType } from "../lib/conventions.js";
 import { uploadWithAudit } from "../lib/storage-paths.js";
 import { obligedProducts } from "../lib/studio-completeness.js";
 import { pickWinners } from "../lib/studio-winner.js";
+import { markUsageCompleted } from "../lib/usage-tracking.js";
 import type { SelectedProducts } from "../types.js";
 
 export type FinalizeStatus = "failed" | "completed" | "cancelled";
@@ -86,6 +87,12 @@ export interface FinalizeDeps {
     jobId: string,
     body: Record<string, unknown>,
   ) => Promise<{ ok: boolean; httpStatus: number; row?: Record<string, unknown> | null; text?: string }>;
+  /**
+   * Reconcile the usage ledger to 'complete' for a run finalized as 'completed'
+   * (S186 D-9). Best-effort; never throws. Called ONLY after a successful
+   * completed PATCH. Injected so the parity test pins the completed-edge call.
+   */
+  markUsageCompleted: (researchQueueId: string) => Promise<void>;
   log: (msg: string) => void;
 }
 
@@ -326,6 +333,20 @@ export async function finalizeRecoveredRun(
     };
   }
 
+  // ── Billing-ledger reconcile (S186 D-9/G9): the run completes HERE, but its
+  // research_usage row was INSERTed 'failed' at park time (recordUsage in the
+  // executor finally). Flip it to 'complete' so the ledger matches the delivered
+  // run. Best-effort — a ledger hiccup must NEVER un-complete a run that already
+  // PATCHed (this PATCH is the single completion edge). Only the completed edge;
+  // failed/cancelled keep their honest non-success ledger row.
+  if (status === "completed") {
+    try {
+      await deps.markUsageCompleted(jobId);
+    } catch (billErr) {
+      log(`[finalize] markUsageCompleted threw (non-blocking): ${(billErr as Error).message}`);
+    }
+  }
+
   return { ok: true, uploaded, skipped, failed, httpStatus: patch.httpStatus };
 }
 
@@ -412,6 +433,9 @@ export function defaultFinalizeDeps(
         rowOut = null;
       }
       return { ok: res.ok, httpStatus: res.status, row: rowOut, text };
+    },
+    markUsageCompleted: async (researchQueueId) => {
+      await markUsageCompleted({ sb, researchQueueId });
     },
     log,
   };
