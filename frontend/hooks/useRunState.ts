@@ -1,6 +1,7 @@
 "use client";
 
 import useSWR from "swr";
+import type { StudioRecoveryStatus } from "@/lib/types/queue";
 
 // ── State shape (mirrors CLI state.json) ────────────────────────────
 
@@ -64,6 +65,16 @@ export interface RunState {
   };
   artifacts: Record<string, ArtifactState>;
   files_written: string[];
+  /**
+   * S187 P0-2 (Branch (c)) — studio-recovery dimension merged in by /api/state
+   * from the research_queue row (these are DB columns, NOT part of state.json).
+   * studio_recovery_video_deferred marks a best-effort completion whose Studio
+   * video never landed within the render window; the results page reads it to
+   * show an honest non-blocking "video unavailable for this run" banner.
+   * Optional — absent for legacy runs and any run with no matching queue row.
+   */
+  studio_recovery_video_deferred?: boolean;
+  studio_recovery_status?: StudioRecoveryStatus;
 }
 
 // ── Fetcher ─────────────────────────────────────────────────────────

@@ -23,6 +23,7 @@ import type { ResearchJob } from "@/lib/types/queue";
 import { phaseFromProgress } from "@/lib/estimates";
 import { isStudioProductKey, type StudioProductKey } from "@/lib/studio-products";
 import { CardSkeleton } from "@/components/Skeleton";
+import { isRecoveringStatus, studioRecoveryKind } from "@/lib/run-status";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -266,13 +267,20 @@ export default function HomePage() {
               </>
             ) : (
               activeJobs.map((job) => {
-                // S158: a status='failed' row whose studio_recovery_status is
-                // 'pending' is NOT terminal — the artifacts are confirmed in NLM
-                // and the worker is re-downloading them out-of-band. Render it as
-                // an in-progress "Finalizing media" row, not red "Failed".
-                const isRecovering =
-                  job.status === "failed" &&
-                  job.studio_recovery_status === "pending";
+                // S158/S187: a failed row that isRecoveringStatus() flags is NOT
+                // terminal — the artifacts are confirmed in NLM and the worker is
+                // finishing them out-of-band (re-downloading a blipped product, or
+                // waiting on a still-rendering video). Render it as an in-progress
+                // row (kind-aware copy below), not red "Failed".
+                const isRecovering = isRecoveringStatus(
+                  job.status,
+                  job.studio_recovery_status,
+                );
+                // S187 P0-2 — render-wait vs download-blip, so the chip + status
+                // line show honest "video still rendering" copy for a render park.
+                const recoveryKind = isRecovering
+                  ? studioRecoveryKind(job.studio_recovery_payload)
+                  : "download";
                 // Only TERMINAL-failure jobs get a hide control — a recovering
                 // row is excluded (it should not be hideable while self-healing).
                 const isHideable =
@@ -312,7 +320,11 @@ export default function HomePage() {
                           ) : (
                             <Clock className="h-3 w-3 animate-pulse" />
                           )}
-                          {isRecovering ? "Finalizing media" : job.status}
+                          {isRecovering
+                            ? recoveryKind === "render"
+                              ? "Rendering video"
+                              : "Finalizing media"
+                            : job.status}
                         </span>
                         <span className="text-xs font-mono text-zinc-500">
                           {job.progress_pct}%
@@ -341,7 +353,9 @@ export default function HomePage() {
                           }`}
                         >
                           {isRecovering
-                            ? "Finalizing media — retrying"
+                            ? recoveryKind === "render"
+                              ? "Video still rendering"
+                              : "Finalizing media — retrying"
                             : job.status === "failed"
                               ? "Execution Error"
                               : phaseFromProgress(job.progress_pct) ||

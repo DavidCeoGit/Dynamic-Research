@@ -243,7 +243,7 @@ export async function GET(request: Request) {
 
   const { data, error } = await supabase
     .from("research_queue")
-    .select("id, topic, topic_slug, status, current_phase, phase_status, progress_pct, estimated_minutes, created_at, result_slug, studio_recovery_status")
+    .select("id, topic, topic_slug, status, current_phase, phase_status, progress_pct, estimated_minutes, created_at, result_slug, studio_recovery_status, studio_recovery_payload")
     .eq("organization_id", orgId)
     .in("status", ["pending", "running", "failed"])
     .order("created_at", { ascending: false });

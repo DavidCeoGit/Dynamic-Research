@@ -30,3 +30,27 @@ export function studioStatusCardLabel(
   if (isRecoveringStatus(status, studioRecoveryStatus)) return "Finalizing media";
   return status ?? "";
 }
+
+/**
+ * S187 P0-2 (Branch (c)) — which kind of recovery a parked run is doing, derived
+ * from studio_recovery_payload. 'render' (the Studio video was still rendering at
+ * the worker checkpoint) takes precedence over 'download' (the S158 download-blip
+ * retry): whenever ANY pending product is a render wait, the UI shows the honest
+ * "video still rendering" copy rather than "download hiccup". A per-product
+ * recovery_kind that is absent ⇒ 'download' (backward-compat, mirrors the agent's
+ * StudioRecoveryProduct default), so a legacy pending row reads as 'download'.
+ *
+ * A structural param type (not the imported StudioRecoveryPayload) keeps this
+ * module hermetic + unit-testable under node --test without pulling in the
+ * types/queue import chain.
+ */
+export function studioRecoveryKind(
+  payload:
+    | { products?: Array<{ recovery_kind?: "download" | "render" }> | null }
+    | null
+    | undefined,
+): "download" | "render" {
+  const products = payload?.products;
+  if (!Array.isArray(products)) return "download";
+  return products.some((p) => p?.recovery_kind === "render") ? "render" : "download";
+}
