@@ -38,6 +38,7 @@ interface Mock {
   patches: Record<string, unknown>[];
   uploads: string[];
   logs: string[];
+  billingCalls: string[];
 }
 
 function mockDeps(over: {
@@ -52,10 +53,13 @@ function mockDeps(over: {
   emptyRead?: string[];
   /** statPath THROWS for these (vanished/unreadable between inventory and upload — Repro 2). */
   statThrows?: string[];
+  /** markUsageCompleted dep throws (proves the billing reconcile is best-effort). */
+  billingThrows?: boolean;
 } = {}): Mock {
   const patches: Record<string, unknown>[] = [];
   const uploads: string[] = [];
   const logs: string[] = [];
+  const billingCalls: string[] = [];
   const isEmptyRead = (p: string) =>
     (over.zeroByte ?? []).some((z) => p.endsWith(z)) ||
     (over.emptyRead ?? []).some((z) => p.endsWith(z));
@@ -86,8 +90,12 @@ function mockDeps(over: {
       return { ok: true, httpStatus: 200, row: body };
     },
     log: (m) => logs.push(m),
+    markUsageCompleted: async (id) => {
+      if (over.billingThrows) throw new Error("usage update boom (test)");
+      billingCalls.push(id);
+    },
   };
-  return { deps, patches, uploads, logs };
+  return { deps, patches, uploads, logs, billingCalls };
 }
 
 function completedArgs(over: Partial<FinalizeArgs> = {}): FinalizeArgs {
@@ -319,5 +327,54 @@ describe("finalizeRecoveredRun — auto/manual PARITY", () => {
     assert.deepEqual(autoR.missingObliged, manualR.missingObliged);
     assert.equal(auto.patches.length, 0);
     assert.equal(manual.patches.length, 0);
+  });
+});
+
+describe("finalizeRecoveredRun — billing-ledger reconcile (S186 D-9/G9)", () => {
+  test("completed + obligations present → markUsageCompleted called once with the jobId", async () => {
+    const m = mockDeps({ selected: sel({ audio: true }), onDisk: [deliverable("audio", "mp3")] });
+    const r = await finalizeRecoveredRun(completedArgs(), m.deps);
+    assert.equal(r.ok, true);
+    assert.equal(m.patches.length, 1); // completed PATCH landed
+    assert.deepEqual(m.billingCalls, [JOB]); // ledger reconciled exactly once
+  });
+
+  test("status=failed → markUsageCompleted NOT called (honest non-success ledger row kept)", async () => {
+    const m = mockDeps({ selected: sel({ audio: true }), onDisk: [deliverable("audio", "mp3")] });
+    const r = await finalizeRecoveredRun(completedArgs({ status: "failed" }), m.deps);
+    assert.equal(r.ok, true);
+    assert.equal(m.billingCalls.length, 0);
+  });
+
+  test("REFUSED on an obligation gap → no PATCH, no ledger flip", async () => {
+    const m = mockDeps({ selected: sel({ video: true }), onDisk: [] }); // video obliged, absent
+    const r = await finalizeRecoveredRun(completedArgs(), m.deps);
+    assert.equal(r.refused, true);
+    assert.equal(m.patches.length, 0);
+    assert.equal(m.billingCalls.length, 0);
+  });
+
+  test("upload-failed (C2 refuses to complete) → no PATCH, no ledger flip", async () => {
+    const m = mockDeps({
+      selected: sel({ audio: true }),
+      onDisk: [deliverable("audio", "mp3")],
+      uploadFails: true,
+    });
+    const r = await finalizeRecoveredRun(completedArgs(), m.deps);
+    assert.equal(r.ok, false);
+    assert.equal(m.patches.length, 0);
+    assert.equal(m.billingCalls.length, 0);
+  });
+
+  test("best-effort: a throwing markUsageCompleted does NOT un-complete a run that already PATCHed", async () => {
+    const m = mockDeps({
+      selected: sel({ audio: true }),
+      onDisk: [deliverable("audio", "mp3")],
+      billingThrows: true,
+    });
+    const r = await finalizeRecoveredRun(completedArgs(), m.deps);
+    assert.equal(r.ok, true); // completion stands despite the ledger throw
+    assert.equal(m.patches.length, 1); // the completed PATCH already landed
+    assert.ok(m.logs.some((l) => l.includes("markUsageCompleted threw")));
   });
 });

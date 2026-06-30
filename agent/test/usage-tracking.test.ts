@@ -15,7 +15,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseUsageSummary, recordUsage } from "../lib/usage-tracking.js";
+import { parseUsageSummary, recordUsage, markUsageCompleted } from "../lib/usage-tracking.js";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -413,4 +413,113 @@ test("recordUsage: insert that throws is caught — recordUsage returns ok false
   assert.equal(res.reason, "connection reset by peer");
   assert.ok(res.parsed);
   assert.equal(res.parsed?.job_status, "complete");
+});
+
+// ── markUsageCompleted: idempotent billing-ledger UPDATE (S186 D-9/G9) ───────
+
+/** Captures the UPDATE chain markUsageCompleted issues, and flags any INSERT. */
+interface UpdateCaptured {
+  table: string | null;
+  patch: Record<string, unknown> | null;
+  eqCol: string | null;
+  eqVal: string | null;
+  insertCalled: boolean;
+}
+
+function makeUpdateClient(
+  cap: UpdateCaptured,
+  outcome: { rows?: unknown[]; error?: { message: string }; throwMsg?: string },
+): SupabaseClient {
+  return {
+    from(table: string) {
+      cap.table = table;
+      return {
+        // markUsageCompleted must NEVER INSERT (no unique key → would double-bill).
+        insert() {
+          cap.insertCalled = true;
+          return { error: null };
+        },
+        update(patch: Record<string, unknown>) {
+          cap.patch = patch;
+          return {
+            eq(col: string, val: string) {
+              cap.eqCol = col;
+              cap.eqVal = val;
+              return {
+                async select(_cols: string) {
+                  if (outcome.throwMsg) throw new Error(outcome.throwMsg);
+                  if (outcome.error) return { data: null, error: outcome.error };
+                  return { data: outcome.rows ?? [], error: null };
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  } as unknown as SupabaseClient;
+}
+
+function freshCap(): UpdateCaptured {
+  return { table: null, patch: null, eqCol: null, eqVal: null, insertCalled: false };
+}
+
+test("markUsageCompleted: UPDATEs research_usage.job_status→complete keyed by research_queue_id (never INSERTs)", async () => {
+  const cap = freshCap();
+  const sb = makeUpdateClient(cap, { rows: [{ research_queue_id: "queue-123" }] });
+
+  const res = await markUsageCompleted({ sb, researchQueueId: "queue-123" });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.updated, 1);
+  assert.equal(cap.table, "research_usage");
+  assert.deepEqual(cap.patch, { job_status: "complete" });
+  assert.equal(cap.eqCol, "research_queue_id");
+  assert.equal(cap.eqVal, "queue-123");
+  assert.equal(cap.insertCalled, false);
+});
+
+test("markUsageCompleted: no existing usage row → updated 0, ok true, no INSERT, no throw", async () => {
+  const cap = freshCap();
+  const sb = makeUpdateClient(cap, { rows: [] });
+
+  const res = await markUsageCompleted({ sb, researchQueueId: "queue-none" });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.updated, 0);
+  assert.equal(cap.insertCalled, false);
+});
+
+test("markUsageCompleted: idempotent across repeated ticks — every call UPDATEs, never INSERTs", async () => {
+  const cap = freshCap();
+  const sb = makeUpdateClient(cap, { rows: [{ research_queue_id: "q" }] });
+
+  const r1 = await markUsageCompleted({ sb, researchQueueId: "q" });
+  const r2 = await markUsageCompleted({ sb, researchQueueId: "q" });
+
+  assert.equal(r1.ok, true);
+  assert.equal(r2.ok, true);
+  assert.deepEqual(cap.patch, { job_status: "complete" });
+  assert.equal(cap.insertCalled, false);
+});
+
+test("markUsageCompleted: UPDATE error returns ok false with reason, never throws", async () => {
+  const cap = freshCap();
+  const sb = makeUpdateClient(cap, { error: { message: "permission denied for table research_usage" } });
+
+  const res = await markUsageCompleted({ sb, researchQueueId: "q" });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.updated, 0);
+  assert.equal(res.reason, "permission denied for table research_usage");
+});
+
+test("markUsageCompleted: UPDATE that throws is caught — ok false, does not throw", async () => {
+  const cap = freshCap();
+  const sb = makeUpdateClient(cap, { throwMsg: "connection reset by peer" });
+
+  const res = await markUsageCompleted({ sb, researchQueueId: "q" });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "connection reset by peer");
 });
