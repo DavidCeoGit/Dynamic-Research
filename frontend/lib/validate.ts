@@ -428,6 +428,12 @@ export const agentUpdateSchema = z.object({
   studio_recovery_next_attempt_at: z.string().datetime().nullable().optional(),
   studio_recovery_payload: studioRecoveryPayloadSchema.nullable().optional(),
   studio_recovery_error: z.string().max(500).nullable().optional(),
+  // S187 P0-2 — best-effort video-deferred marker. The worker writes this via a
+  // direct Supabase REST PATCH (finalize-recovered-run:patchRow), NOT this agent
+  // route, so it is allowlisted here only for cross-tier parity with
+  // agent/types.ts + frontend/lib/types/queue.ts (mirror completeness, not a
+  // runtime dependency of the agent route).
+  studio_recovery_video_deferred: z.boolean().optional(),
 });
 
 // ── Form-level schema (extends API payload with transient form fields) ──

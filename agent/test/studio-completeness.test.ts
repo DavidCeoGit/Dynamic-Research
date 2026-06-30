@@ -639,3 +639,144 @@ describe("realDownloadArtifact — atomic temp-then-rename (S160 Codex CRITICAL/
     await fsp.rm(dir, { recursive: true, force: true });
   });
 });
+
+// ── S187 P0-2 (Branch (c)) — still-rendering-video classification + anti-stale ──
+// Exercised through enforceStudioCompleteness with the flag threaded ON via opts
+// (the production const STUDIO_VIDEO_RENDER_ENABLED is load-time + default OFF, so a
+// unit test can only reach the render path via opts.videoRenderEnabled). These prove
+// the cross-run-contamination guards (exact videoTaskId / strict runFloorMs floor)
+// and the dark-launch flag's inertness when OFF.
+const RENDER_OPTS = { recoveryBudgetMs: 600_000, pollIntervalMs: 60_000, videoRenderEnabled: true };
+
+describe("enforceStudioCompleteness — Branch (c) render classification (videoRenderEnabled)", () => {
+  // video selected + missing; report present so the only gap is the video.
+  const baseDir = [deliverable("report", "md")];
+  const baseSel = sel({ video: true, report: true });
+  // No COMPLETED video artifact (the download arm finds nothing) → lastWinner null
+  // → the render classification runs.
+  const noCompletedVideo = (() => []) as CompletenessDeps["listArtifacts"];
+
+  test("exact videoTaskId match (status_id 1, in_progress) → recoverable-pending(render)", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video" ? [{ id: "vid-task-1", title: "V", created_at: AFTER, status_id: 1 }] : [],
+    });
+    const r = await enforceStudioCompleteness(
+      baseSel,
+      stateWith({ artifacts: { video: { task_id: "vid-task-1" } } }),
+      "/p",
+      RENDER_OPTS,
+      h.deps,
+    );
+    assert.equal(r.ok, false, "ok stays false — a selected product is still missing");
+    assert.equal(r.videoStillRendering, true);
+    assert.equal(r.recoverablePending.length, 1);
+    assert.equal(r.recoverablePending[0].product, "video");
+    assert.equal(r.recoverablePending[0].recovery_kind, "render");
+    assert.equal(r.recoverablePending[0].videoTaskId, "vid-task-1");
+  });
+
+  test("exact videoTaskId match even at status_id 3 (sub-second render→complete race) → render", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video" ? [{ id: "vid-task-1", title: "V", created_at: AFTER, status_id: 3 }] : [],
+    });
+    const r = await enforceStudioCompleteness(
+      baseSel,
+      stateWith({ artifacts: { video: { task_id: "vid-task-1" } } }),
+      "/p",
+      RENDER_OPTS,
+      h.deps,
+    );
+    assert.equal(r.recoverablePending.length, 1);
+    assert.equal(r.recoverablePending[0].recovery_kind, "render");
+  });
+
+  test("no exact id + fresh in_progress artifact (created_at >= runFloorMs) → render by floor", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video" ? [{ id: "fresh-art", title: "V", created_at: AFTER, status_id: 1 }] : [],
+    });
+    const r = await enforceStudioCompleteness(baseSel, stateWith(), "/p", RENDER_OPTS, h.deps);
+    assert.equal(r.recoverablePending.length, 1);
+    assert.equal(r.recoverablePending[0].recovery_kind, "render");
+    // no persisted task_id ⇒ the matched artifact's own id becomes the anti-stale identity.
+    assert.equal(r.recoverablePending[0].videoTaskId, "fresh-art");
+  });
+
+  test("FOREIGN in_progress artifact well BEFORE the floor → TERMINAL (cross-run contamination guard)", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video" ? [{ id: "prior-run", title: "V", created_at: BEFORE, status_id: 1 }] : [],
+    });
+    const r = await enforceStudioCompleteness(baseSel, stateWith(), "/p", RENDER_OPTS, h.deps);
+    assert.equal(r.ok, false);
+    assert.equal(r.recoverablePending.length, 0, "a prior-run video must NOT be adopted");
+    assert.ok(r.stillMissing.includes("video"));
+  });
+
+  test("in_progress artifact 92s BEFORE the floor → TERMINAL (strict floor, no negative skew)", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video" ? [{ id: "near-prior", title: "V", created_at: NEAR_BEFORE, status_id: 1 }] : [],
+    });
+    const r = await enforceStudioCompleteness(baseSel, stateWith(), "/p", RENDER_OPTS, h.deps);
+    assert.equal(r.recoverablePending.length, 0);
+  });
+
+  test("never-launched (empty status-aware list) → TERMINAL", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: () => [],
+    });
+    const r = await enforceStudioCompleteness(baseSel, stateWith(), "/p", RENDER_OPTS, h.deps);
+    assert.equal(r.ok, false);
+    assert.equal(r.recoverablePending.length, 0);
+  });
+
+  test("status-aware list CLI blip (null) → TERMINAL (conservative one-shot classify)", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: () => null,
+    });
+    const r = await enforceStudioCompleteness(
+      baseSel,
+      stateWith({ artifacts: { video: { task_id: "vid-task-1" } } }),
+      "/p",
+      RENDER_OPTS,
+      h.deps,
+    );
+    assert.equal(r.recoverablePending.length, 0);
+  });
+
+  test("flag OFF (default opts) → render path INERT → unchanged hard-fail even with an exact match", async () => {
+    const h = harness({
+      dir: baseDir,
+      listArtifacts: noCompletedVideo,
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video" ? [{ id: "vid-task-1", title: "V", created_at: AFTER, status_id: 1 }] : [],
+    });
+    const r = await enforceStudioCompleteness(
+      baseSel,
+      stateWith({ artifacts: { video: { task_id: "vid-task-1" } } }),
+      "/p",
+      OPTS, // no videoRenderEnabled ⇒ falls back to the OFF production const
+      h.deps,
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.recoverablePending.length, 0, "flag OFF ⇒ no render classification (inert)");
+    assert.notEqual(r.videoStillRendering, true);
+  });
+});

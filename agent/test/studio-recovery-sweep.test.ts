@@ -25,7 +25,7 @@ import {
   type RecoverySweepDeps,
 } from "../lib/studio-recovery-sweep.js";
 import type { DownloadResult } from "../lib/nlm-artifact-cli.js";
-import type { FinalizeArgs, FinalizeResult } from "../scripts/finalize-recovered-run.js";
+import type { FinalizeArgs, FinalizeBestEffortArgs, FinalizeResult } from "../scripts/finalize-recovered-run.js";
 
 const JOB = "22222222-2222-2222-2222-222222222222";
 const NB = "ca4561a0-a1df-40d6-a9da-f0efaad432af";
@@ -54,8 +54,12 @@ interface Harness {
   patches: Record<string, unknown>[];
   patchedIds: string[];
   finalizeCalls: FinalizeArgs[];
+  /** S187 P0-2 — args the sweep passed to finalizeBestEffort (best-effort edge). */
+  bestEffortCalls: FinalizeBestEffortArgs[];
+  /** S187 P0-2 — videoDeferred flag captured from each sendCompleted call. */
+  completedArgs: Array<{ videoDeferred?: boolean }>;
   downloads: Array<{ id: string; timeoutMs?: number }>;
-  emails: { completed: number; failed: number; exhausted: number };
+  emails: { completed: number; failed: number; exhausted: number; bestEffortAlert: number };
   /** S161 R2-1: dirs the sweep asked removeOrphanParts to clean. */
   removeOrphanDirs: string[];
 }
@@ -64,9 +68,14 @@ function harness(over: {
   candidate?: RecoveryCandidate | null;
   malformedPending?: RecoveryCandidate[];
   listArtifacts?: RecoverySweepDeps["listArtifacts"];
+  /** S187 P0-2 — status-aware list (the render arm's NLM source). */
+  listArtifactsWithStatus?: RecoverySweepDeps["listArtifactsWithStatus"];
   isFilePresent?: RecoverySweepDeps["isFilePresent"];
   downloadResult?: DownloadResult;
   finalizeResult?: FinalizeResult;
+  /** S187 P0-2 — best-effort completion result + a throw injector (strand-guard). */
+  finalizeBestEffortResult?: FinalizeResult;
+  finalizeBestEffortThrows?: boolean | Error;
   /** S162: make the finalize dep THROW (simulate a Supabase/storage transport
    *  reject inside finalizeRecoveredRun's un-try/caught fetch/upload deps). */
   finalizeThrows?: boolean | Error;
@@ -79,8 +88,10 @@ function harness(over: {
   const patches: Record<string, unknown>[] = [];
   const patchedIds: string[] = [];
   const finalizeCalls: FinalizeArgs[] = [];
+  const bestEffortCalls: FinalizeBestEffortArgs[] = [];
+  const completedArgs: Array<{ videoDeferred?: boolean }> = [];
   const downloads: Array<{ id: string; timeoutMs?: number }> = [];
-  const emails = { completed: 0, failed: 0, exhausted: 0 };
+  const emails = { completed: 0, failed: 0, exhausted: 0, bestEffortAlert: 0 };
   const removeOrphanDirs: string[] = [];
   const cand = over.candidate === undefined ? candidate() : over.candidate;
   const deps: RecoverySweepDeps = {
@@ -94,10 +105,18 @@ function harness(over: {
       over.listArtifacts ??
       ((_nb, type) => (type === "video" ? [{ id: "vid-1", title: "X", created_at: "2026-06-15T19:34:36" }] : [])),
     // S187 P0-2 — render-arm deps (defaults: empty status-aware list ⇒ no rendering
-    // match; best-effort returns ok; alert no-op). Existing tests don't exercise the
-    // render path; the S187 render tests build their own scenarios.
-    listArtifactsWithStatus: () => [],
-    finalizeBestEffort: async () => ({ ok: true, uploaded: 4, skipped: 0, failed: 0 }),
+    // match; best-effort returns ok + is tracked; alert counted). The S187 render
+    // tests override listArtifactsWithStatus / finalizeBestEffortResult per scenario.
+    listArtifactsWithStatus: over.listArtifactsWithStatus ?? (() => []),
+    finalizeBestEffort: async (args) => {
+      bestEffortCalls.push(args);
+      if (over.finalizeBestEffortThrows) {
+        throw over.finalizeBestEffortThrows instanceof Error
+          ? over.finalizeBestEffortThrows
+          : new Error("finalizeBestEffort threw (simulated)");
+      }
+      return over.finalizeBestEffortResult ?? { ok: true, uploaded: 4, skipped: 0, failed: 0 };
+    },
     downloadArtifact: async (_nb, id, _type, _out, timeoutMs) => {
       downloads.push({ id, timeoutMs });
       if (over.downloadThrows) {
@@ -121,8 +140,9 @@ function harness(over: {
       patches.push(body);
       return over.patchOk ?? true;
     },
-    sendCompleted: async () => {
+    sendCompleted: async (a) => {
       emails.completed++;
+      completedArgs.push({ videoDeferred: a.videoDeferred });
     },
     sendFailed: async () => {
       emails.failed++;
@@ -130,12 +150,14 @@ function harness(over: {
     sendExhaustedAlert: async () => {
       emails.exhausted++;
     },
-    sendBestEffortAlert: async () => {},
+    sendBestEffortAlert: async () => {
+      emails.bestEffortAlert++;
+    },
     projectsDir: "/projects",
     now: () => over.now ?? NOW,
     log: () => {},
   };
-  return { deps, patches, patchedIds, finalizeCalls, downloads, emails, removeOrphanDirs };
+  return { deps, patches, patchedIds, finalizeCalls, bestEffortCalls, completedArgs, downloads, emails, removeOrphanDirs };
 }
 
 describe("runStudioRecoverySweepOnce", () => {
@@ -514,6 +536,165 @@ describe("runStudioRecoverySweepOnce", () => {
     await runStudioRecoverySweepOnce(h.deps);
     assert.equal(h.patches.length, 1, "quarantine PATCH attempted");
     assert.equal(h.emails.exhausted, 0, "no alert when the quarantine PATCH failed");
+  });
+});
+
+// ── S187 P0-2 (Branch (c)) — render-arm dispatch + best-effort completion ──
+describe("runStudioRecoverySweepOnce — Branch (c) render arm + best-effort", () => {
+  const RENDER_AFTER = "2026-06-15T19:34:36";
+  // A 'render' video payload: anti-stale identity (videoTaskId) + floor persisted.
+  const renderPayload = {
+    notebookId: NB,
+    products: [
+      {
+        product: "video",
+        artifactId: "vid-1",
+        nlmType: "video",
+        filename: "x-20260615-190502-video.mp4",
+        recovery_kind: "render" as const,
+        videoTaskId: "vid-task-1",
+        runFloorMs: NOW - 2 * HOUR,
+      },
+    ],
+  };
+
+  test("render reached status_id 3 → download by canonical id → finalize all → RECOVERED", async () => {
+    const h = harness({
+      candidate: candidate({ studio_recovery_payload: renderPayload }),
+      // status-aware list shows THIS run's video, render complete (status_id 3).
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video"
+          ? [{ id: "vid-task-1", title: "X", created_at: RENDER_AFTER, status_id: 3 }]
+          : [],
+    });
+    const r = await runStudioRecoverySweepOnce(h.deps);
+    assert.equal(r.outcome, "recovered");
+    // Downloaded by the LIST-CANONICAL id (S138 Layer-1), not blindly by payload.artifactId.
+    assert.equal(h.downloads.length, 1);
+    assert.equal(h.downloads[0].id, "vid-task-1");
+    // All present after the render download → the NORMAL finalize path (all 5), NOT best-effort.
+    assert.equal(h.finalizeCalls.length, 1);
+    assert.equal(h.bestEffortCalls.length, 0, "video landed → must NOT defer/best-effort");
+    assert.equal(h.emails.bestEffortAlert, 0);
+  });
+
+  test("render still in_progress (status_id 1) within the window → RETRY (keep waiting, no download)", async () => {
+    const h = harness({
+      candidate: candidate({ studio_recovery_payload: renderPayload }), // first_failed_at = 1h ago (< 120m)
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video"
+          ? [{ id: "vid-task-1", title: "X", created_at: RENDER_AFTER, status_id: 1 }]
+          : [],
+    });
+    const r = await runStudioRecoverySweepOnce(h.deps);
+    assert.equal(r.outcome, "retry");
+    assert.equal(h.downloads.length, 0, "still rendering → never downloads");
+    assert.equal(h.finalizeCalls.length, 0);
+    assert.equal(h.bestEffortCalls.length, 0, "within the render window → no best-effort");
+    assert.equal(h.patches[0].studio_recovery_attempts, 2, "bumped 1 → 2 (retry)");
+  });
+
+  test("render window EXHAUSTED + render-only-remaining → BEST-EFFORT completed (video deferred) + operator alert", async () => {
+    const h = harness({
+      candidate: candidate({
+        studio_recovery_payload: renderPayload,
+        studio_recovery_first_failed_at: new Date(NOW - 3 * HOUR).toISOString(), // 180m > 120m window
+        studio_recovery_attempts: 3, // newAttempts ≥ MIN_ATTEMPTS_FOR_AGE_EXHAUST
+      }),
+      // still rendering even at 3h → genuine render outage.
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video"
+          ? [{ id: "vid-task-1", title: "X", created_at: RENDER_AFTER, status_id: 1 }]
+          : [],
+    });
+    const r = await runStudioRecoverySweepOnce(h.deps);
+    assert.equal(r.outcome, "recovered", "best-effort completion is a 'recovered' outcome");
+    assert.equal(h.bestEffortCalls.length, 1, "best-effort finalize fired");
+    assert.equal(h.bestEffortCalls[0].deferred, "video");
+    assert.equal(h.bestEffortCalls[0].videoTaskId, "vid-task-1", "launch-proof threaded from the payload");
+    assert.equal(h.finalizeCalls.length, 0, "the all-5 finalize must NOT run when the video is deferred");
+    assert.equal(h.emails.bestEffortAlert, 1, "the '+ ALERT' half of best-effort + alert");
+    assert.equal(h.emails.completed, 1, "requester still gets a completion email");
+    assert.equal(h.completedArgs[0].videoDeferred, true, "completion email uses the honest best-effort copy");
+    assert.equal(h.downloads.length, 0);
+  });
+
+  test("MIXED: a download product still missing + render exhausted → NO best-effort (never defer a download product)", async () => {
+    const mixedPayload = {
+      notebookId: NB,
+      products: [
+        { ...AUD }, // download arm (no recovery_kind ⇒ 'download')
+        renderPayload.products[0], // render arm
+      ],
+    };
+    const h = harness({
+      candidate: candidate({
+        studio_recovery_payload: mixedPayload,
+        studio_recovery_first_failed_at: new Date(NOW - 3 * HOUR).toISOString(), // window exhausted
+        studio_recovery_attempts: 3,
+      }),
+      // audio is a CONFIRMED status_id-3 artifact (not artifact-gone) whose download keeps failing.
+      listArtifacts: (_nb, type) =>
+        type === "audio" ? [{ id: "aud-1", title: "A", created_at: RENDER_AFTER }] : [],
+      downloadResult: { ok: false, exitCode: 1, stderr: "HTTP 503", signal: null }, // audio transient-fails
+      // video still rendering.
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video"
+          ? [{ id: "vid-task-1", title: "X", created_at: RENDER_AFTER, status_id: 1 }]
+          : [],
+    });
+    const r = await runStudioRecoverySweepOnce(h.deps);
+    assert.equal(r.outcome, "retry");
+    assert.equal(h.bestEffortCalls.length, 0, "a still-missing DOWNLOAD product blocks best-effort");
+    assert.equal(h.finalizeCalls.length, 0);
+  });
+
+  test("best-effort finalize REFUSES (obligation gap) → continued-transient RETRY, never completed", async () => {
+    const h = harness({
+      candidate: candidate({
+        studio_recovery_payload: renderPayload,
+        studio_recovery_first_failed_at: new Date(NOW - 3 * HOUR).toISOString(),
+        studio_recovery_attempts: 3,
+      }),
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video"
+          ? [{ id: "vid-task-1", title: "X", created_at: RENDER_AFTER, status_id: 1 }]
+          : [],
+      // the keystone refuses (e.g. a non-video obligation absent on disk).
+      finalizeBestEffortResult: {
+        ok: false,
+        refused: true,
+        reason: "obliged studio product(s) missing on disk: audio",
+        uploaded: 0,
+        skipped: 0,
+        failed: 0,
+      },
+    });
+    const r = await runStudioRecoverySweepOnce(h.deps);
+    assert.equal(r.outcome, "retry", "a refusal must NOT complete the run");
+    assert.equal(h.bestEffortCalls.length, 1, "best-effort was attempted");
+    assert.equal(h.emails.completed, 0, "no completion email on a refusal");
+    assert.equal(h.emails.bestEffortAlert, 0, "no outage alert on a refusal");
+  });
+
+  test("finalizeBestEffort THROWS → strand-guard: continued-transient (caps backstop), never strands", async () => {
+    const h = harness({
+      candidate: candidate({
+        studio_recovery_payload: renderPayload,
+        studio_recovery_first_failed_at: new Date(NOW - 3 * HOUR).toISOString(),
+        studio_recovery_attempts: 3,
+      }),
+      listArtifactsWithStatus: (_nb, type) =>
+        type === "video"
+          ? [{ id: "vid-task-1", title: "X", created_at: RENDER_AFTER, status_id: 1 }]
+          : [],
+      finalizeBestEffortThrows: true,
+    });
+    const r = await runStudioRecoverySweepOnce(h.deps);
+    // The structural backstop converts the throw to a continued-transient (null) →
+    // the caller bumps attempts + schedules the next attempt; the row never strands.
+    assert.equal(r.outcome, "retry");
+    assert.equal(h.emails.completed, 0);
   });
 });
 

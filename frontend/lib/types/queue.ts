@@ -180,6 +180,17 @@ export interface StudioRecoveryProduct {
   artifactId: string;
   nlmType: string;
   filename: string;
+  /**
+   * S187 P0-2 (Branch (c)) — how the sweep recovers this product. ABSENT ⇒
+   * 'download' (backward-compat). 'render' = the Studio video was still rendering
+   * at the checkpoint. Mirrors agent/types.ts:StudioRecoveryProduct +
+   * frontend/lib/validate.ts:studioRecoveryPayloadSchema (cross-tier parity).
+   */
+  recovery_kind?: "download" | "render";
+  /** S187 P0-2 ('render' only): exact in-progress NLM artifact id (anti-stale identity). */
+  videoTaskId?: string;
+  /** S187 P0-2 ('render' only): run-start floor (ms) — an older in-progress artifact is foreign. */
+  runFloorMs?: number;
 }
 
 export interface StudioRecoveryPayload {
@@ -234,6 +245,13 @@ export interface ResearchJob {
   studio_recovery_next_attempt_at?: string | null;
   studio_recovery_payload?: StudioRecoveryPayload | null;
   studio_recovery_error?: string | null;
+  /**
+   * S187 P0-2 — true when a run completed BEST-EFFORT with its Studio video
+   * deferred (the render exceeded the window). Mirrors agent/types.ts:ResearchJob
+   * + migration 20260629_studio_recovery_video_deferred.sql; the results page
+   * selects it to surface an honest "video unavailable for this run" banner.
+   */
+  studio_recovery_video_deferred?: boolean;
   /**
    * S102 file-upload (migration 20260610_research_queue_attachments.sql).
    * Optional so rows from before the migration deserialize cleanly. Plain

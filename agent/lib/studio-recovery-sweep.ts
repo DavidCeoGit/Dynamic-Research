@@ -80,10 +80,19 @@ const GRACE_MS = envMs("STUDIO_RECOVERY_SWEEP_GRACE_MS", 120_000); // 2 min
 // reached status_id 3 within this age (from first_failed_at, attempts-gated like
 // MAX_AGE_MS) is completed BEST-EFFORT (4/5 + video deferred). Much tighter than the
 // 48h download age cap so a genuine render outage never strands the run for 2 days.
+// NOTE (S188 MERGE gate, Codex MINOR): this is the AGE THRESHOLD, not the wall-clock
+// at which best-effort fires. Because the render arm reuses the shared download
+// BACKOFF_SCHEDULE_MS below (5m,15m,45m,2h…), poll ticks land ~5,20,65,185 min, so the
+// FIRST tick with age ≥ 120m (and attempts ≥ MIN_ATTEMPTS_FOR_AGE_EXHAUST) is ~185m —
+// that is when best-effort actually completes, and a video finishing at ~25m is not
+// downloaded until the ~65m tick. Correct + bounded, just less responsive than 120m
+// implies. Design §9's FASTER render backoff (2m,5m,10m,15m…) is a deferred
+// post-shadow tuning (a dedicated render-backoff schedule), not shipped in this dark-
+// launched v1.
 const STUDIO_VIDEO_RENDER_MAX_AGE_MS = envMs(
   "STUDIO_VIDEO_RENDER_MAX_AGE_MS",
   7_200_000,
-); // 120 min
+); // 120 min age threshold (effective first best-effort ~185m under the shared backoff)
 const PROJECTS_DIR =
   process.env.PROJECTS_DIR ??
   "/c/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/Projects";

@@ -148,7 +148,8 @@ interface FinalizeCoreOpts {
    * re-assertion AND additionally require the 5 research-text deliverables present
    * on disk. ONLY the video is ever deferrable (design §7.2/D-3, Codex M-7 — a
    * NARROW flag, not a broad deferredProducts param). Default off ⇒
-   * finalizeRecoveredRun's behaviour is byte-identical (the parity test pins it).
+   * finalizeRecoveredRun's behaviour is identical to pre-S187 (the parity test pins
+   * BEHAVIOUR — the off filter is a no-op, the research re-assert is skipped).
    */
   deferVideo?: boolean;
 }
@@ -156,7 +157,8 @@ interface FinalizeCoreOpts {
 /**
  * S187 P0-2 — thin public wrapper preserving the EXACT finalizeRecoveredRun
  * signature (the sweep + the parity test call this). Delegates to finalizeCore
- * with no deferral — byte-identical to the pre-S187 body.
+ * with no deferral — behaviour-identical to the pre-S187 body (the parity test
+ * pins behaviour, not literal source; S188 MERGE gate Codex INFO).
  */
 export async function finalizeRecoveredRun(
   args: FinalizeArgs,
@@ -440,6 +442,20 @@ export interface FinalizeBestEffortArgs {
  * guard + markUsageCompleted billing reconcile. PATCHes completed +
  * studio_recovery_status='recovered' + studio_recovery_video_deferred=true.
  * Refuses unless a persisted videoTaskId proves THIS run launched the render.
+ *
+ * PUBLISH RE-ASSERT — deliberately NOT done here (design §7.2 named it as
+ * defense-in-depth; recorded deviation, S188 MERGE gate Gemini MAJOR-1). It is
+ * provably NOT a fail-open for the ONLY caller: the publish gate is enforced
+ * fail-closed at executor.ts (the Gate-A defer probe refuses to defer unless
+ * publishOk, AND the executor PUBLISH gate runs on the deferred fall-through)
+ * BEFORE a run can ever park as failed+studio_recovery_status='pending'. This
+ * function is sweep-only (no CLI entry — the break-glass CLI calls
+ * finalizeRecoveredRun), and the sweep only ever processes already-parked rows,
+ * so a publish-failed job cannot reach it. A correct re-assert would need the
+ * job user_context + the URGENT bypass snapshot + a state.json read threaded into
+ * the sweep — new surface guarding an unreachable state. TRIPWIRE: if a NON-sweep
+ * caller (or a sweep that no longer pre-gates publish) is ever added, re-assert
+ * publish here via isPublishRequired + evaluatePublishGate over state.json.
  */
 export async function finalizeBestEffortRun(
   args: FinalizeBestEffortArgs,

@@ -127,6 +127,14 @@ export interface CompletenessOptions {
   recoveryBudgetMs: number;
   /** Re-list interval while a product is still rendering. */
   pollIntervalMs: number;
+  /**
+   * S187 P0-2 (Branch (c)) — dark-launch flag override. Defaults to the module
+   * const STUDIO_VIDEO_RENDER_ENABLED (the production source of truth); threaded
+   * here ONLY so unit tests can exercise the flag-ON render-classification path
+   * (a load-time const cannot be flipped post-import under node --test). The
+   * executor never sets it ⇒ production reads the const, so behaviour is unchanged.
+   */
+  videoRenderEnabled?: boolean;
 }
 
 export interface CompletenessResult {
@@ -242,6 +250,9 @@ export async function enforceStudioCompleteness(
   opts: CompletenessOptions,
   deps: CompletenessDeps,
 ): Promise<CompletenessResult> {
+  // S187 P0-2: resolve the dark-launch flag ONCE — opts override (tests) else the
+  // module const (production). Used by the Branch-(c) render classification below.
+  const videoRenderEnabled = opts.videoRenderEnabled ?? STUDIO_VIDEO_RENDER_ENABLED;
   // Obligations come from the DURABLE DB selection, NOT pipeline-written state.
   const selected = obligedProducts(obliged);
   const entries = await deps
@@ -422,7 +433,7 @@ export async function enforceStudioCompleteness(
       // recoverable, so adding the render video here makes a mixed (b)+(c) run park
       // (not hard-fail) only when audio-blip AND video-render are BOTH recoverable.
       const renderPending =
-        !lastWinner && STUDIO_VIDEO_RENDER_ENABLED && product === "video"
+        !lastWinner && videoRenderEnabled && product === "video"
           ? classifyVideoRender(deps, notebookId, expectedId, runFloorMs, namingTs)
           : null;
       if (lastWinner && cls === "transient") {
