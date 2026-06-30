@@ -30,7 +30,7 @@ import {
 import type { ResearchJob } from "@/lib/types/queue";
 import type { StudioProductKey, AssertExact } from "@/lib/studio-products";
 import { useToast } from "@/components/ToastProvider";
-import { isRecoveringStatus, studioStatusCardLabel } from "@/lib/run-status";
+import { isRecoveringStatus, studioStatusCardLabel, studioRecoveryKind } from "@/lib/run-status";
 
 // ── Phase timeline definition ──────────────────────────────────────
 
@@ -140,11 +140,17 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
   );
 
   const isComplete = job?.status === "completed";
-  // S158: a status='failed' row mid studio-recovery is NOT terminal — the
-  // artifacts are confirmed in NLM and the worker is re-downloading them
-  // out-of-band. Treat it as in-progress ("Finalizing media"), keep polling +
-  // timing, and suppress the Retry/Edit terminal affordances.
+  // S158/S187: a failed row mid studio-recovery is NOT terminal — the artifacts
+  // are confirmed in NLM and the worker is finishing them out-of-band
+  // (re-downloading a blipped product, or waiting on a still-rendering video).
+  // Treat it as in-progress (kind-aware copy below), keep polling + timing, and
+  // suppress the Retry/Edit terminal affordances.
   const isRecovering = isRecoveringStatus(job?.status, job?.studio_recovery_status);
+  // S187 P0-2 — 'render' (video still rendering) vs 'download' (S158 blip retry),
+  // so the recovering header + panel copy stay honest for a render park.
+  const recoveryKind = isRecovering
+    ? studioRecoveryKind(job?.studio_recovery_payload)
+    : "download";
   const isFailed = job?.status === "failed" && !isRecovering;
   const isTerminal = isComplete || isFailed;
   const pct = job?.progress_pct ?? 0;
@@ -289,7 +295,9 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
               : isFailed
                 ? "Research Failed"
                 : isRecovering
-                  ? "Finalizing Media"
+                  ? recoveryKind === "render"
+                    ? "Rendering Video"
+                    : "Finalizing Media"
                   : "Research In Progress"}
           </h1>
         </div>
@@ -509,11 +517,15 @@ export default function ProgressPage({ params }: { params: Promise<{ id: string 
               <div className="flex items-start gap-4">
                 <Loader2 className="h-6 w-6 text-amber-400 shrink-0 mt-0.5 animate-spin" />
                 <div>
-                  <h3 className="text-lg font-medium text-amber-400">Finalizing your media</h3>
+                  <h3 className="text-lg font-medium text-amber-400">
+                    {recoveryKind === "render"
+                      ? "Rendering your video"
+                      : "Finalizing your media"}
+                  </h3>
                   <p className="mt-2 text-sm text-zinc-300">
-                    Your research is done and the media outputs are confirmed generated. A brief
-                    delivery hiccup delayed the download, so the system is automatically retrying.
-                    No action is needed — this page will update as soon as everything lands.
+                    {recoveryKind === "render"
+                      ? "Your research is done and every other output is ready. The cinematic video is still rendering in NotebookLM — the system is automatically waiting for it to finish. No action is needed; this page will update as soon as it lands."
+                      : "Your research is done and the media outputs are confirmed generated. A brief delivery hiccup delayed the download, so the system is automatically retrying. No action is needed — this page will update as soon as everything lands."}
                   </p>
                 </div>
               </div>

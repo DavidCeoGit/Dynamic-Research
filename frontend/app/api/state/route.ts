@@ -89,6 +89,48 @@ function normalizeState(raw: StateLike): StateLike {
   };
 }
 
+/**
+ * S187 P0-2 (Branch (c)) — fetch the studio-recovery dimension for a run from
+ * research_queue. These are DB columns (NOT part of state.json), so the results
+ * page can only see studio_recovery_video_deferred if /api/state merges them in
+ * (design G12/M-9: the results page reads /api/state). Keyed by topic_slug +
+ * org — the SAME lookup as /api/runs/[slug]/plan-review. Best-effort: any DB
+ * error, or no matching row (legacy storage-only runs have no queue row — S41),
+ * yields {} so a missing recovery row never blocks the state response. orgId is
+ * session-derived (never request-supplied), so this cannot read across orgs.
+ */
+async function fetchRecoveryFields(
+  orgId: string,
+  slug: string,
+): Promise<{
+  studio_recovery_video_deferred?: boolean;
+  studio_recovery_status?: string;
+}> {
+  try {
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from("research_queue")
+      .select("studio_recovery_video_deferred, studio_recovery_status")
+      .eq("topic_slug", slug)
+      .eq("organization_id", orgId)
+      .maybeSingle();
+    if (!data) return {};
+    const out: {
+      studio_recovery_video_deferred?: boolean;
+      studio_recovery_status?: string;
+    } = {};
+    if (typeof data.studio_recovery_video_deferred === "boolean") {
+      out.studio_recovery_video_deferred = data.studio_recovery_video_deferred;
+    }
+    if (typeof data.studio_recovery_status === "string") {
+      out.studio_recovery_status = data.studio_recovery_status;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const slugParam = searchParams.get("slug");
@@ -108,7 +150,8 @@ export async function GET(request: Request) {
     }
     try {
       const state = await readStateJson(orgId, slugParam, stateFilename);
-      return Response.json(normalizeState(state as StateLike));
+      const recovery = await fetchRecoveryFields(orgId, slugParam);
+      return Response.json({ ...normalizeState(state as StateLike), ...recovery });
     } catch (err) {
       return Response.json(
         { error: "Failed to read state.json", detail: String(err) },
@@ -177,7 +220,8 @@ export async function GET(request: Request) {
 
   try {
     const state = await readStateJson(orgId, newestSlug, newestFilename);
-    return Response.json(normalizeState(state as StateLike));
+    const recovery = await fetchRecoveryFields(orgId, newestSlug);
+    return Response.json({ ...normalizeState(state as StateLike), ...recovery });
   } catch (err) {
     return Response.json(
       { error: "Failed to read state.json", detail: String(err) },

@@ -291,6 +291,32 @@ export default function RunDetailPage({
         </div>
       )}
 
+      {/* ── S187 P0-2 (Branch c): best-effort video-deferred banner ── */}
+      {/* Non-blocking. A best-effort run completes (status='completed') with
+          studio_recovery_video_deferred=true when every other deliverable
+          landed but the Studio video never finished rendering within the
+          window (design G12 / §7.4). */}
+      {state.studio_recovery_video_deferred && (
+        <div
+          className="mt-4 flex items-start gap-3 rounded-lg border border-sky-500/40 bg-sky-500/10 px-4 py-3 text-sm text-sky-200"
+          role="status"
+        >
+          <span aria-hidden="true" className="mt-0.5 text-base leading-none">
+            🎬
+          </span>
+          <div className="flex-1">
+            <p className="font-medium text-sky-100">
+              The video was unavailable for this run
+            </p>
+            <p className="mt-0.5 text-xs opacity-90">
+              Every other deliverable completed normally. The cinematic video
+              couldn&apos;t be finalized within the render window, so this run
+              shipped without it — you can regenerate just the video with Replay.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* ── Phase timeline stepper ─────────────────────────── */}
       <div className="mt-8 rounded-lg border border-zinc-800 bg-zinc-900 p-6">
         <PhaseTimeline
