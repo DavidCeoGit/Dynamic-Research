@@ -2,7 +2,9 @@ import * as fs from "node:fs/promises";
 import { updateJob } from "../api-client.js";
 import { readPipelineState } from "./read-state-file.js";
 import { findStateFile } from "./find-state-file.js";
-import type { PipelineState, ResearchJob } from "../types.js";
+import { obligedProducts } from "./studio-completeness.js";
+import { pickWinners } from "./studio-winner.js";
+import type { PipelineState, ResearchJob, SelectedProducts } from "../types.js";
 
 // Phase number → { name, progressPct } mapping from /research-compare
 const PHASE_MAP: Record<string, { name: string; pct: number }> = {
@@ -263,7 +265,14 @@ export async function verifyPipelineCompletion(workDir: string): Promise<Complet
     };
   }
 
-  return evaluateCompletion(state);
+  // S187 P0-2: attach the parsed state to a NON-complete verdict too, so the
+  // executor's flag-gated Gate-A defer interception can read notebook_id + build
+  // the success verdict that flows into Gate B WITHOUT re-reading state.json. The
+  // pure evaluateCompletion is UNCHANGED (its unit tests are unaffected) — only
+  // this async wrapper attaches state on failure. On a non-deferred failure the
+  // executor fails before Gate B, so the attached state is inert there.
+  const verdict = evaluateCompletion(state);
+  return verdict.success ? verdict : { ...verdict, state };
 }
 
 /**
@@ -326,5 +335,108 @@ export function evaluateCompletion(state: PipelineState): CompletionVerdict {
     success: true,
     reason: `Pipeline reached terminal state (phase ${phaseRaw}, phase_status: "${phaseStatusStr}")`,
     state,
+  };
+}
+
+/**
+ * S187 P0-2 — the 5 research-text DELIVERABLES (design G11). `context` (pipeline
+ * INPUT) and `state` (internal state file) are EXCLUDED — their absence is not a
+ * deliverable gap. `report` is a STUDIO product, not research-text.
+ */
+const RESEARCH_TEXT_ROLES = [
+  "brief",
+  "perplexity",
+  "comparison",
+  "vendor-evaluation",
+  "notebooklm",
+] as const;
+
+export interface VideoDeferProbeInput {
+  /** state.notebook_id — required present (else nothing is NLM-recoverable). */
+  notebookId: string | null | undefined;
+  /** Deliverable files in Projects/<slug>/ as {name,size}; the probe filters 0-byte. */
+  entries: Array<{ name: string; size: number }>;
+  /** DURABLE DB obligation (job.selected_products), never the LLM-written state. */
+  selected: SelectedProducts | null | undefined;
+  /**
+   * evaluatePublishGateForJob(...).ok — TRUE for non-publish jobs. Computed by the
+   * caller (it holds the job + the pre-spawn bypass snapshot); kept out of this
+   * pure probe so it stays trivially unit-testable.
+   */
+  publishOk: boolean;
+}
+
+export interface VideoDeferProbeResult {
+  defer: boolean;
+  reason: string;
+}
+
+/**
+ * S187 P0-2 — the Gate-A DELIVERABLE-PRESENCE probe (design §5.1; Gemini C-1 /
+ * Codex M-6/M-8). Pure + total. Decides whether a phase-non-complete run is the
+ * "ONLY the Studio video is still missing" case that may DEFER to Gate B's render
+ * classification — vs a genuine crash that must stay terminal. Defers ONLY when
+ * EVERY check holds:
+ *   1. notebook_id present (the video is recoverable from NLM at all);
+ *   2. publish gate satisfied (publish jobs) — never best-effort a FAILED publish;
+ *   3. video is a SELECTED obligation (else not a render case);
+ *   4. EVERY non-video selected studio product present non-empty (a non-video
+ *      studio gap = crash → terminal, the Gemini C-1 fail-open);
+ *   5. the video itself is absent (else nothing to defer);
+ *   6. EVERY research-text deliverable present non-empty (a missing research doc =
+ *      phase-2/6 crash → terminal — the exact fail-open Gemini C-1 flagged).
+ * The CALLER (executor) must already have run terminal-error classification + the
+ * dark-launch flag check; this probe assumes neither and NEVER trusts the
+ * LLM-written phase — only durable signals (DB obligation + on-disk deliverables
+ * + the publish verdict).
+ */
+export function shouldDeferForVideoRender(
+  input: VideoDeferProbeInput,
+): VideoDeferProbeResult {
+  const { notebookId, entries, selected, publishOk } = input;
+  if (typeof notebookId !== "string" || notebookId.length === 0) {
+    return {
+      defer: false,
+      reason: "no notebook_id — a still-rendering video is not recoverable",
+    };
+  }
+  if (!publishOk) {
+    return {
+      defer: false,
+      reason: "publish gate not satisfied — terminal, never best-effort",
+    };
+  }
+  const obliged = obligedProducts(selected);
+  if (!obliged.includes("video")) {
+    return {
+      defer: false,
+      reason: "video is not a selected product — not a render-defer case",
+    };
+  }
+  const nonEmpty = entries.filter((e) => e.size > 0);
+  const winners = pickWinners(nonEmpty.map((e) => ({ name: e.name })));
+  const missingNonVideoStudio = obliged.filter((p) => p !== "video" && !winners[p]);
+  if (missingNonVideoStudio.length > 0) {
+    return {
+      defer: false,
+      reason: `non-video studio product(s) missing: ${missingNonVideoStudio.join(", ")} — terminal (not a clean video-only gap)`,
+    };
+  }
+  if (winners["video"]) {
+    return { defer: false, reason: "video already on disk — no defer needed" };
+  }
+  const missingResearch = RESEARCH_TEXT_ROLES.filter(
+    (role) => !nonEmpty.some((e) => e.name.endsWith(`-${role}.md`)),
+  );
+  if (missingResearch.length > 0) {
+    return {
+      defer: false,
+      reason: `research deliverable(s) missing: ${missingResearch.join(", ")} — terminal (phase crash, never best-effort)`,
+    };
+  }
+  return {
+    defer: true,
+    reason:
+      "only the Studio video is missing; all non-video studio + research deliverables present, publish gate satisfied — defer to render classification",
   };
 }

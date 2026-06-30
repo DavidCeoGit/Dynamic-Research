@@ -53,14 +53,17 @@ import {
   classifyDownloadFailure,
   realDownloadArtifact,
   realListArtifacts,
+  realListArtifactsWithStatus,
   type DownloadResult,
   type NlmArtifactRef,
+  type NlmArtifactRefWithStatus,
 } from "./nlm-artifact-cli.js";
 import {
   artifactCreatedAtMs,
   deriveRunStart,
   safeMs,
 } from "./artifact-timestamps.js";
+import { STUDIO_VIDEO_RENDER_ENABLED } from "./worker-config.js";
 
 // Canonical product order — single-sourced (S169) from conventions.json via
 // plan-types' STUDIO_PRODUCT_LIST (itself derived from the conventions Record).
@@ -83,6 +86,16 @@ const PRODUCT_TO_NLM_TYPE: Record<string, string> = {
 export interface CompletenessDeps {
   /** COMPLETED artifacts (status_id===3) of an NLM type, newest-first. null on CLI/parse error. */
   listArtifacts: (notebookId: string, nlmType: string) => NlmArtifactRef[] | null;
+  /**
+   * S187 P0-2 (Branch (c)) — ALL artifacts of a type WITH status_id (incl. a
+   * still-rendering status_id-1 video), newest-first. null on CLI/parse error.
+   * Used ONLY to detect + anti-stale-match a rendering video; realListArtifacts
+   * stays the completed-only download source for every existing path.
+   */
+  listArtifactsWithStatus: (
+    notebookId: string,
+    nlmType: string,
+  ) => NlmArtifactRefWithStatus[] | null;
   /**
    * Download a specific artifact BY ID to outPath. `ok` is true only on a
    * non-empty file; on failure the captured exitCode/signal/stderr drive the
@@ -135,6 +148,13 @@ export interface CompletenessResult {
   notebookId?: string;
   /** Last captured NLM download stderr across recoverable products (design G9). */
   recoveryStderr?: string;
+  /**
+   * S187 P0-2 — true when Branch (c) classified the still-missing video as still
+   * RENDERING in NLM (a recovery_kind:'render' product was added to
+   * recoverablePending). Run-level convenience for logging/notify/tests; the
+   * per-product recovery_kind is the source of truth.
+   */
+  videoStillRendering?: boolean;
 }
 
 /**
@@ -167,6 +187,46 @@ function expectedArtifactId(state: PipelineState, product: string): string | nul
     (typeof e?.id === "string" && e.id) ||
     "";
   return v || null;
+}
+
+/**
+ * S187 P0-2 (Branch (c)) — classify a still-missing VIDEO that produced NO
+ * confirmed completed artifact. Returns a recovery_kind:'render' pending product
+ * iff a STATUS-AWARE NLM list shows an artifact that is PROVABLY this run's video
+ * (exact videoTaskId, else created_at >= the strict runFloorMs floor), regardless
+ * of its current status_id (a just-completed status_id-3 is included to close the
+ * sub-second race — the sweep's render arm downloads it on the first tick). null
+ * (⇒ unchanged terminal hard-fail) when: the list CLI blips (conservative — a
+ * one-shot classify can't safely keep-waiting without a placeholder filename),
+ * the video was never launched, or the only matches are foreign/stale (older than
+ * the floor, no exact id). The filename uses the artifact's REAL title so the
+ * sweep's on-disk idempotency skip-check matches the eventual download.
+ */
+function classifyVideoRender(
+  deps: CompletenessDeps,
+  notebookId: string,
+  expectedId: string | null,
+  runFloorMs: number | null,
+  namingTs: string,
+): StudioRecoveryProduct | null {
+  const arts = deps.listArtifactsWithStatus(notebookId, "video");
+  if (arts == null) return null; // CLI blip at the one-shot classify → conservative terminal
+  const match = arts.find((a) => {
+    if (expectedId) return a.id === expectedId; // exact this-run identity (any status)
+    if (runFloorMs == null) return false; // no exact id + no floor ⇒ cannot prove THIS run's
+    const c = artifactCreatedAtMs(a);
+    return c == null ? false : c >= runFloorMs; // strict anti-stale floor (no negative skew)
+  });
+  if (!match) return null; // never-launched / foreign / stale → terminal
+  return {
+    product: "video",
+    artifactId: match.id,
+    nlmType: "video",
+    filename: studioFilename(match.title, namingTs, "video"),
+    recovery_kind: "render",
+    videoTaskId: expectedId ?? match.id,
+    runFloorMs: runFloorMs == null ? undefined : runFloorMs,
+  };
 }
 
 /**
@@ -354,6 +414,17 @@ export async function enforceStudioCompleteness(
             lastDownload?.signal ?? null,
           )
         : null;
+      // S187 P0-2 Branch (c): a still-missing VIDEO with NO confirmed completed
+      // artifact (lastWinner null) may be THIS run's video still RENDERING in NLM.
+      // Flag-gated (OFF ⇒ unchanged hard-fail). A confirmed+transient download
+      // failure is Branch (b) below (not render). Composability: the executor's
+      // purelyTransient gate already requires EVERY stillMissing product to be
+      // recoverable, so adding the render video here makes a mixed (b)+(c) run park
+      // (not hard-fail) only when audio-blip AND video-render are BOTH recoverable.
+      const renderPending =
+        !lastWinner && STUDIO_VIDEO_RENDER_ENABLED && product === "video"
+          ? classifyVideoRender(deps, notebookId, expectedId, runFloorMs, namingTs)
+          : null;
       if (lastWinner && cls === "transient") {
         result.recoverablePending.push({
           product,
@@ -371,6 +442,18 @@ export async function enforceStudioCompleteness(
         deps.log(
           `[studio-completeness] RECOVERABLE-PENDING ${product} (artifact ${lastWinner.id}) ` +
             `after ${attempts} attempt(s) — handing to the out-of-band recovery sweep`,
+        );
+      } else if (renderPending) {
+        result.recoverablePending.push(renderPending);
+        result.videoStillRendering = true;
+        result.notes.push(
+          `video: still rendering in NLM (artifact ${renderPending.artifactId}) — ` +
+            `recoverable-pending(render); the decoupled sweep polls until status_id 3`,
+        );
+        deps.log(
+          `[studio-completeness] RECOVERABLE-PENDING(render) video ` +
+            `(artifact ${renderPending.artifactId}, videoTaskId ${renderPending.videoTaskId}) — ` +
+            `handing to the out-of-band render-poll sweep`,
         );
       } else {
         result.notes.push(
@@ -398,6 +481,7 @@ export async function enforceStudioCompleteness(
 export function defaultDeps(log: (msg: string) => void): CompletenessDeps {
   return {
     listArtifacts: realListArtifacts,
+    listArtifactsWithStatus: realListArtifactsWithStatus,
     downloadArtifact: realDownloadArtifact,
     listDir: async (dir: string) => {
       // S161 R2-3: stat each regular file so the gate can reject 0-byte winners.

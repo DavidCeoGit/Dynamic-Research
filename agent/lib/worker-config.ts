@@ -52,6 +52,18 @@ export const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 export const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 export const DRY_RUN = process.env.DRY_RUN === "true";
 
+// S187 P0-2 dark-launch flag (design §13): Branch (c) "Studio video still
+// rendering at the checkpoint" → best-effort completion. DEFAULT OFF — when unset
+// or not exactly "true", BOTH the Gate-A defer interception (state-evaluation) and
+// the studio-completeness render classification stay inert, so a still-rendering
+// video hard-fails EXACTLY as pre-S187 (zero behaviour change). Flip to "true" in
+// the DR-Deploy .env only AFTER a shadow-observed run. Shared export so the
+// executor (Gate-A) and the decoupled sweep read ONE source and cannot drift.
+// NOTE: gates only NEW render-parks; an already-parked render row keeps draining
+// through the sweep even if the flag is later turned off.
+export const STUDIO_VIDEO_RENDER_ENABLED =
+  process.env.STUDIO_VIDEO_RENDER_ENABLED === "true";
+
 // S69: Per-job cost cap (second-line defense complementing the plan-review
 // gate). Worker estimates cumulative cost mid-flight by parsing assistant
 // usage events streaming out of `claude -p --output-format json --verbose`

@@ -130,9 +130,45 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * SAME single code path (design §7/§9). Never spawns claude -p; pure
  * upload/patch over already-on-disk deliverables.
  */
+// S187 P0-2 — the 5 research-text DELIVERABLES (design G11). Mirrors
+// state-evaluation.RESEARCH_TEXT_ROLES + conventions.json research.roles (minus
+// the non-deliverable context/state). Inlined to avoid coupling this script to
+// state-evaluation; the MERGE gate may single-source it.
+const RESEARCH_TEXT_ROLES = [
+  "brief",
+  "perplexity",
+  "comparison",
+  "vendor-evaluation",
+  "notebooklm",
+] as const;
+
+interface FinalizeCoreOpts {
+  /**
+   * S187 P0-2 — best-effort video deferral: EXCLUDE 'video' from the obligation
+   * re-assertion AND additionally require the 5 research-text deliverables present
+   * on disk. ONLY the video is ever deferrable (design §7.2/D-3, Codex M-7 — a
+   * NARROW flag, not a broad deferredProducts param). Default off ⇒
+   * finalizeRecoveredRun's behaviour is byte-identical (the parity test pins it).
+   */
+  deferVideo?: boolean;
+}
+
+/**
+ * S187 P0-2 — thin public wrapper preserving the EXACT finalizeRecoveredRun
+ * signature (the sweep + the parity test call this). Delegates to finalizeCore
+ * with no deferral — byte-identical to the pre-S187 body.
+ */
 export async function finalizeRecoveredRun(
   args: FinalizeArgs,
   deps: FinalizeDeps,
+): Promise<FinalizeResult> {
+  return finalizeCore(args, deps);
+}
+
+async function finalizeCore(
+  args: FinalizeArgs,
+  deps: FinalizeDeps,
+  opts: FinalizeCoreOpts = {},
 ): Promise<FinalizeResult> {
   const { jobId, workDir, slug, status } = args;
   const force = args.force ?? false;
@@ -197,7 +233,12 @@ export async function finalizeRecoveredRun(
   // studio product must have a non-empty convention winner on disk. --force
   // does NOT bypass this — only the lint gate above.
   if (status === "completed") {
-    const obliged = obligedProducts(row.selected_products);
+    // S187 P0-2: best-effort EXCLUDES video from the obligation re-assert (it is
+    // deferred). deferVideo defaults off ⇒ the filter is a no-op and the obliged
+    // set is byte-identical to the pre-S187 behaviour.
+    const obliged = obligedProducts(row.selected_products).filter(
+      (p) => !(opts.deferVideo && p === "video"),
+    );
     const winners = pickWinners(onDiskFiles.map((name) => ({ name })));
     const missingObliged = obliged.filter((p) => !winners[p]);
     if (missingObliged.length > 0) {
@@ -219,6 +260,34 @@ export async function finalizeRecoveredRun(
       `[finalize] obligation re-assert PASSED: ${obliged.length} obliged product(s) all present ` +
         `(${obliged.join(", ") || "none"})`,
     );
+    // S187 P0-2 — best-effort ADDITIONALLY re-asserts the research-text
+    // deliverables on disk. A missing research doc means a phase crash, NOT a
+    // clean video-only gap, and must never best-effort-complete (Gemini C-1). The
+    // all-5 recovery path doesn't need this (the video isn't deferred there); the
+    // keystone here mirrors the Gate-A probe so the safety holds even if the probe
+    // is bypassed/changed.
+    if (opts.deferVideo) {
+      const missingResearch = RESEARCH_TEXT_ROLES.filter(
+        (role) => !onDiskFiles.some((n) => n.endsWith(`-${role}.md`)),
+      );
+      if (missingResearch.length > 0) {
+        log(
+          `[finalize] REFUSING best-effort ${jobId}: research deliverable(s) absent on disk: ` +
+            `${missingResearch.join(", ")} (on-disk: ${onDiskFiles.join(", ") || "-"})`,
+        );
+        return {
+          ok: false,
+          refused: true,
+          reason: `research deliverable(s) missing on disk: ${missingResearch.join(", ")}`,
+          uploaded: 0,
+          skipped: 0,
+          failed: 0,
+        };
+      }
+      log(
+        `[finalize] best-effort research re-assert PASSED: all ${RESEARCH_TEXT_ROLES.length} research deliverables present`,
+      );
+    }
   }
 
   // ── Upload artifacts ────────────────────────────────────────────────────
@@ -348,6 +417,63 @@ export async function finalizeRecoveredRun(
   }
 
   return { ok: true, uploaded, skipped, failed, httpStatus: patch.httpStatus };
+}
+
+/** S187 P0-2 — args for the best-effort (video-deferred) completion edge. */
+export interface FinalizeBestEffortArgs {
+  jobId: string;
+  workDir: string;
+  slug: string;
+  /** The ONLY deferrable product — a literal so the type forbids deferring anything else. */
+  deferred: "video";
+  /** The persisted render task id (from studio_recovery_payload) — launch proof. */
+  videoTaskId: string;
+}
+
+/**
+ * S187 P0-2 (Branch (c)) — best-effort completion edge: complete a run with its
+ * Studio VIDEO deferred (the render exceeded the window). NARROW + separately
+ * auditable (design §7.2/D-3, Codex M-7): only the video is deferrable, NEVER
+ * --force. Delegates to finalizeCore with deferVideo, which (a) EXCLUDES video
+ * from the obligation re-assert, (b) ADDITIONALLY requires the 5 research-text
+ * deliverables, (c) runs the SAME lint + non-empty inventory + failed-upload C2
+ * guard + markUsageCompleted billing reconcile. PATCHes completed +
+ * studio_recovery_status='recovered' + studio_recovery_video_deferred=true.
+ * Refuses unless a persisted videoTaskId proves THIS run launched the render.
+ */
+export async function finalizeBestEffortRun(
+  args: FinalizeBestEffortArgs,
+  deps: FinalizeDeps,
+): Promise<FinalizeResult> {
+  if (typeof args.videoTaskId !== "string" || args.videoTaskId.length === 0) {
+    return {
+      ok: false,
+      refused: true,
+      reason:
+        "finalizeBestEffortRun: missing videoTaskId — refusing (cannot prove the render was launched)",
+      uploaded: 0,
+      skipped: 0,
+      failed: 0,
+    };
+  }
+  return finalizeCore(
+    {
+      jobId: args.jobId,
+      workDir: args.workDir,
+      slug: args.slug,
+      status: "completed",
+      errorMessage:
+        "video render exceeded window — completed best-effort (non-video deliverables + research docs present); video deferred",
+      force: false,
+      extraPatch: {
+        studio_recovery_status: "recovered",
+        studio_recovery_video_deferred: true,
+        studio_recovery_error: "video render exceeded window",
+      },
+    },
+    deps,
+    { deferVideo: true },
+  );
 }
 
 /**

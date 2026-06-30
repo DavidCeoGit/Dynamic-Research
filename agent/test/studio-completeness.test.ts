@@ -77,6 +77,7 @@ function harness(over: Partial<CompletenessDeps> & { dir?: string[] } = {}): Har
   const downloads: Array<{ id: string; type: string; out: string }> = [];
   const deps: CompletenessDeps = {
     listArtifacts: over.listArtifacts ?? (() => []),
+    listArtifactsWithStatus: over.listArtifactsWithStatus ?? (() => []),
     downloadArtifact:
       over.downloadArtifact ??
       (async (_nb, id, type, out) => {
@@ -337,6 +338,7 @@ describe("enforceStudioCompleteness", () => {
         callTimes.push(t);
         return [];
       },
+      listArtifactsWithStatus: () => [],
       downloadArtifact: async () => OK,
       listDir: async () => [],
       now: () => t,

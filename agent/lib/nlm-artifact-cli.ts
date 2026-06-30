@@ -31,6 +31,21 @@ export interface NlmArtifactRef {
 }
 
 /**
+ * S187 P0-2 — a STATUS-AWARE artifact ref. realListArtifacts only ever emits
+ * refs for COMPLETED artifacts (and drops status_id); this carries status_id so
+ * Branch (c) can SEE a still-rendering video. The underlying
+ * `notebooklm artifact list --json` already returns status_id — the completed-
+ * only list simply discards it.
+ *   status_id 1 = in_progress (rendering)   3 = completed   (other = failed/unknown)
+ */
+export interface NlmArtifactRefWithStatus {
+  id: string;
+  title: string;
+  created_at: string;
+  status_id?: number;
+}
+
+/**
  * S158 — the captured outcome of one download attempt. The S129 gate previously
  * DISCARDED `r.status`/`r.stderr`/`r.signal` (the literal S156 diagnostic gap,
  * design G9); the recovery taxonomy classifies on the captured result, never on
@@ -119,6 +134,53 @@ export function realListArtifacts(
     );
     arts.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
     return arts.map((a) => ({ id: a.id, title: a.title, created_at: a.created_at }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * S187 P0-2 — list ALL artifacts of a type (ANY status), newest-first, WITH
+ * status_id. Same throw-safe "returns null on ANY failure" contract as
+ * realListArtifacts (the S162 whole-body guard subsumes the JSON.parse try) —
+ * the ONLY differences are: (1) NO status_id===3 filter, and (2) status_id is
+ * carried through. Branch (c) uses it to detect a still-rendering video
+ * (status_id 1) and to anti-stale-match it by exact id / created_at >=
+ * runFloorMs. realListArtifacts is left UNTOUCHED for its completed-only callers
+ * (the in-gate + sweep download paths).
+ */
+export function realListArtifactsWithStatus(
+  notebookId: string,
+  nlmType: string,
+): NlmArtifactRefWithStatus[] | null {
+  try {
+    const r = spawnSync(
+      NLM_BIN,
+      ["artifact", "list", "-n", notebookId, "--type", nlmType, "--json"],
+      {
+        encoding: "utf-8",
+        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 60_000,
+      },
+    );
+    if (r.status !== 0) return null;
+    const parsed = JSON.parse(r.stdout ?? "") as {
+      artifacts?: Array<{
+        id: string;
+        title: string;
+        created_at: string;
+        status_id?: number;
+      }>;
+    };
+    const arts = (parsed.artifacts ?? []).slice();
+    arts.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
+    return arts.map((a) => ({
+      id: a.id,
+      title: a.title,
+      created_at: a.created_at,
+      status_id: a.status_id,
+    }));
   } catch {
     return null;
   }

@@ -93,6 +93,11 @@ function harness(over: {
     listArtifacts:
       over.listArtifacts ??
       ((_nb, type) => (type === "video" ? [{ id: "vid-1", title: "X", created_at: "2026-06-15T19:34:36" }] : [])),
+    // S187 P0-2 — render-arm deps (defaults: empty status-aware list ⇒ no rendering
+    // match; best-effort returns ok; alert no-op). Existing tests don't exercise the
+    // render path; the S187 render tests build their own scenarios.
+    listArtifactsWithStatus: () => [],
+    finalizeBestEffort: async () => ({ ok: true, uploaded: 4, skipped: 0, failed: 0 }),
     downloadArtifact: async (_nb, id, _type, _out, timeoutMs) => {
       downloads.push({ id, timeoutMs });
       if (over.downloadThrows) {
@@ -125,6 +130,7 @@ function harness(over: {
     sendExhaustedAlert: async () => {
       emails.exhausted++;
     },
+    sendBestEffortAlert: async () => {},
     projectsDir: "/projects",
     now: () => over.now ?? NOW,
     log: () => {},

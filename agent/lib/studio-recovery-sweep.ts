@@ -36,17 +36,25 @@ import * as fs from "node:fs/promises";
 import { createClient } from "@supabase/supabase-js";
 import {
   realListArtifacts,
+  realListArtifactsWithStatus,
   realDownloadArtifact,
   type NlmArtifactRef,
+  type NlmArtifactRefWithStatus,
   type DownloadResult,
 } from "./nlm-artifact-cli.js";
 import {
   finalizeRecoveredRun,
+  finalizeBestEffortRun,
   defaultFinalizeDeps,
   type FinalizeArgs,
+  type FinalizeBestEffortArgs,
   type FinalizeResult,
 } from "../scripts/finalize-recovered-run.js";
-import { sendCompletionEmail, sendStudioRecoveryExhaustedEmail } from "./notify.js";
+import {
+  sendCompletionEmail,
+  sendStudioRecoveryExhaustedEmail,
+  sendStudioVideoDeferredAlert,
+} from "./notify.js";
 import type { StudioRecoveryPayload } from "../types.js";
 
 // ── Tunables (env-guarded; a NaN/negative env can never make a cap infinite) ──
@@ -68,6 +76,14 @@ const MIN_ATTEMPTS_FOR_AGE_EXHAUST = envInt(
 const MAX_AGE_MS = envMs("STUDIO_RECOVERY_SWEEP_MAX_AGE_MS", 172_800_000); // 48h
 const DOWNLOAD_TIMEOUT_MS = envMs("STUDIO_RECOVERY_SWEEP_DOWNLOAD_TIMEOUT_MS", 90_000);
 const GRACE_MS = envMs("STUDIO_RECOVERY_SWEEP_GRACE_MS", 120_000); // 2 min
+// S187 P0-2 (Branch (c)) — the render window: a still-rendering video that has NOT
+// reached status_id 3 within this age (from first_failed_at, attempts-gated like
+// MAX_AGE_MS) is completed BEST-EFFORT (4/5 + video deferred). Much tighter than the
+// 48h download age cap so a genuine render outage never strands the run for 2 days.
+const STUDIO_VIDEO_RENDER_MAX_AGE_MS = envMs(
+  "STUDIO_VIDEO_RENDER_MAX_AGE_MS",
+  7_200_000,
+); // 120 min
 const PROJECTS_DIR =
   process.env.PROJECTS_DIR ??
   "/c/Users/ceo/Documents/AI Training/Anti Gravity/Dynamic Research/Projects";
@@ -127,6 +143,12 @@ export interface RecoverySweepDeps {
   isFilePresent: (filePath: string) => Promise<boolean>;
   /** COMPLETED (status_id 3) artifacts of an NLM type, newest-first. */
   listArtifacts: (notebookId: string, nlmType: string) => NlmArtifactRef[] | null;
+  /** S187 P0-2 — ALL artifacts of a type WITH status_id (to see a still-rendering
+   *  video the completed-only listArtifacts can't). null on CLI/parse error. */
+  listArtifactsWithStatus: (
+    notebookId: string,
+    nlmType: string,
+  ) => NlmArtifactRefWithStatus[] | null;
   /** Download a specific artifact BY ID to outPath (shorter sweep timeout). */
   downloadArtifact: (
     notebookId: string,
@@ -137,10 +159,19 @@ export interface RecoverySweepDeps {
   ) => Promise<DownloadResult>;
   /** Upload + obligation-checked completed PATCH (the shared finalize core). */
   finalize: (args: FinalizeArgs) => Promise<FinalizeResult>;
+  /** S187 P0-2 — best-effort completion (video deferred): re-asserts the NON-video
+   *  obligation set + research docs + publish, then PATCHes completed +
+   *  studio_recovery_video_deferred=true. NEVER --force; only 'video' deferrable. */
+  finalizeBestEffort: (args: FinalizeBestEffortArgs) => Promise<FinalizeResult>;
   /** PATCH studio_recovery_* (+ error_message) columns (RLS-bypassing). */
   patchRecovery: (jobId: string, body: Record<string, unknown>) => Promise<boolean>;
-  /** Notify the requester on heal (completion email). */
-  sendCompleted: (args: { to: string; slug: string; topic: string }) => Promise<void>;
+  /** Notify the requester on heal (completion email). videoDeferred ⇒ best-effort copy. */
+  sendCompleted: (args: {
+    to: string;
+    slug: string;
+    topic: string;
+    videoDeferred?: boolean;
+  }) => Promise<void>;
   /** Notify the requester on exhaustion (terminal failed email). */
   sendFailed: (args: { to: string; slug: string; topic: string; errorMessage: string }) => Promise<void>;
   /** Operator alert on exhaustion. */
@@ -151,6 +182,14 @@ export interface RecoverySweepDeps {
     attempts: number;
     reason: ExhaustReason;
     products: string[];
+    ageHours: number;
+  }) => Promise<void>;
+  /** S187 P0-2 — operator OUTAGE alert when a run completes BEST-EFFORT with its
+   *  video deferred (the "+ ALERT" half of best-effort + alert, design I4). */
+  sendBestEffortAlert: (args: {
+    jobId: string;
+    slug: string;
+    topic: string;
     ageHours: number;
   }) => Promise<void>;
   /** S161 R2-1 (optional, belt-and-suspenders): best-effort remove orphan `*.part`
@@ -220,7 +259,14 @@ export async function runStudioRecoverySweepOnce(
         typeof p.product === "string" &&
         typeof p.artifactId === "string" &&
         typeof p.nlmType === "string" &&
-        typeof p.filename === "string",
+        typeof p.filename === "string" &&
+        // S187 P0-2 — optional Branch-(c) fields validated ONLY when present, so a
+        // legacy download row (no recovery_kind) stays well-formed (Codex M-5).
+        (p.recovery_kind === undefined ||
+          p.recovery_kind === "download" ||
+          p.recovery_kind === "render") &&
+        (p.videoTaskId === undefined || typeof p.videoTaskId === "string") &&
+        (p.runFloorMs === undefined || typeof p.runFloorMs === "number"),
     );
   if (!payload || typeof payload.notebookId !== "string" || !payload.notebookId || !productsWellFormed) {
     return finishExhausted(deps, c, newAttempts, "payload-missing", [], ageHours);
@@ -255,7 +301,7 @@ export async function runStudioRecoverySweepOnce(
   // strand-while-healthy.
   let recovered: RecoverySweepResult | null;
   try {
-    recovered = await attemptRecovery(deps, c, payload, newAttempts, productNames, ageHours);
+    recovered = await attemptRecovery(deps, c, payload, newAttempts, productNames, ageHours, ageMs);
   } catch (err) {
     deps.log(
       `[studio-recovery] ${c.id}: UNEXPECTED throw during recovery attempt ` +
@@ -307,6 +353,7 @@ async function attemptRecovery(
   newAttempts: number,
   productNames: string[],
   ageHours: number,
+  ageMs: number,
 ): Promise<RecoverySweepResult | null> {
   const projectsDir = path.join(deps.projectsDir, c.topic_slug);
 
@@ -332,6 +379,10 @@ async function attemptRecovery(
   // transient-kill this feature exists to prevent). Only a SUCCESSFUL list whose
   // completed set lacks our id (and no on-disk file) is a genuine artifact-gone.
   let allPresent = true;
+  // S187 P0-2 — products still missing AFTER this tick (drives the best-effort
+  // render-window check below). A product is "missing" iff it isn't on disk after
+  // its arm ran (download blip, render still in progress, or a transient list).
+  const missing: StudioRecoveryPayload["products"] = [];
   for (const product of payload.products) {
     const outPath = path.join(projectsDir, product.filename);
     if (await deps.isFilePresent(outPath)) {
@@ -341,10 +392,68 @@ async function attemptRecovery(
       );
       continue;
     }
+
+    // S187 P0-2 (Branch (c)) — render arm: a 'render' product is polled via the
+    // STATUS-AWARE list (the completed-only listArtifacts can't see a rendering
+    // video). Anti-stale match by the persisted videoTaskId / runFloorMs. status_id
+    // 3 → download by the LIST-CANONICAL id (S138 Layer-1). Still rendering OR a
+    // transient list blip → not present this tick (keep waiting, bounded by the
+    // render window). It NEVER artifact-gone-exhausts — a render product's absence
+    // from the COMPLETED set is EXPECTED while rendering, not proof of loss.
+    if (product.recovery_kind === "render") {
+      const renderArts = deps.listArtifactsWithStatus(payload.notebookId, product.nlmType);
+      if (renderArts === null) {
+        allPresent = false;
+        missing.push(product);
+        deps.log(
+          `[studio-recovery] ${c.id}: status-aware list FAILED for ${product.product} ` +
+            `(transient) — will retry, not exhausting`,
+        );
+        continue;
+      }
+      const match = renderArts.find((a) => {
+        if (product.videoTaskId) return a.id === product.videoTaskId;
+        if (product.runFloorMs == null) return false;
+        const ms = Date.parse(a.created_at ?? "");
+        return Number.isFinite(ms) ? ms >= (product.runFloorMs as number) : false;
+      });
+      if (!match || match.status_id !== 3) {
+        allPresent = false;
+        missing.push(product);
+        deps.log(
+          `[studio-recovery] ${c.id}: ${product.product} still rendering ` +
+            `(status_id ${match?.status_id ?? "—"}) — keep waiting`,
+        );
+        continue;
+      }
+      const rdl = await deps.downloadArtifact(
+        payload.notebookId,
+        match.id,
+        product.nlmType,
+        outPath,
+        DOWNLOAD_TIMEOUT_MS,
+      );
+      if (rdl.ok) {
+        deps.log(
+          `[studio-recovery] ${c.id}: render COMPLETE — downloaded ${product.product} → ${product.filename}`,
+        );
+      } else {
+        allPresent = false;
+        missing.push(product);
+        deps.log(
+          `[studio-recovery] ${c.id}: ${product.product} rendered but download failed ` +
+            `(exit=${rdl.exitCode ?? "?"} signal=${rdl.signal ?? "-"}) — retry`,
+        );
+      }
+      continue;
+    }
+
+    // ── download arm (Branch (b), existing — unchanged) ──
     const arts = deps.listArtifacts(payload.notebookId, product.nlmType);
     if (arts === null) {
       // C1: transient artifact-list failure — do NOT exhaust. Retry via the caps.
       allPresent = false;
+      missing.push(product);
       deps.log(
         `[studio-recovery] ${c.id}: artifact list FAILED for ${product.product} ` +
           `(transient) — will retry, not exhausting`,
@@ -372,6 +481,7 @@ async function attemptRecovery(
       deps.log(`[studio-recovery] ${c.id}: re-downloaded ${product.product} → ${product.filename}`);
     } else {
       allPresent = false;
+      missing.push(product);
       deps.log(
         `[studio-recovery] ${c.id}: ${product.product} re-download still failing ` +
           `(exit=${dl.exitCode ?? "?"} signal=${dl.signal ?? "-"})`,
@@ -440,6 +550,69 @@ async function attemptRecovery(
     deps.log(
       `[studio-recovery] ${c.id}: finalize did NOT complete (${fin.refused ? "obligation REFUSED" : "error"}: ` +
         `${fin.reason ?? ""}) — treating as continued-transient`,
+    );
+  }
+
+  // S187 P0-2 (Branch (c)) — BEST-EFFORT completion. If the ONLY still-missing
+  // products are render-kind AND the render window is exhausted (attempts-gated,
+  // like MAX_AGE_MS), complete the run with the video DEFERRED (4/5 + research
+  // docs). finalizeBestEffortRun re-asserts the full NON-video obligation set +
+  // research docs + publish, so it REFUSES on any non-video gap — it can never
+  // fire for a download product still missing or a research-doc crash. Anything
+  // else (download product still missing, OR the render window not yet exhausted)
+  // → null → the caller's bump/cap tail keeps waiting (the video may still land).
+  const renderWindowExhausted =
+    ageMs >= STUDIO_VIDEO_RENDER_MAX_AGE_MS &&
+    newAttempts >= MIN_ATTEMPTS_FOR_AGE_EXHAUST;
+  const renderOnlyRemaining =
+    missing.length > 0 && missing.every((p) => p.recovery_kind === "render");
+  if (renderOnlyRemaining && renderWindowExhausted) {
+    // The video is the only deferrable render product; pass its persisted
+    // videoTaskId so finalizeBestEffortRun can prove the render was launched
+    // (it refuses on an empty id).
+    const renderVideo = missing.find((p) => p.recovery_kind === "render");
+    let beFin: FinalizeResult;
+    try {
+      beFin = await deps.finalizeBestEffort({
+        jobId: c.id,
+        workDir: projectsDir,
+        slug: c.topic_slug,
+        deferred: "video",
+        videoTaskId: renderVideo?.videoTaskId ?? "",
+      });
+    } catch (err) {
+      // Same strand-guard as the finalize path: a throw → continued-transient
+      // (the caps backstop it), never a strand.
+      deps.log(
+        `[studio-recovery] ${c.id}: finalizeBestEffort THREW (${(err as Error).message}) — ` +
+          `treating as continued-transient (caps backstop)`,
+      );
+      return null;
+    }
+    if (beFin.ok) {
+      deps.log(
+        `[studio-recovery] ${c.id}: BEST-EFFORT completed (video deferred, render window ` +
+          `exhausted) after ${newAttempts} attempt(s)`,
+      );
+      if (c.notify_email) {
+        await deps
+          .sendCompleted({
+            to: c.notify_email,
+            slug: c.topic_slug,
+            topic: c.topic,
+            videoDeferred: true,
+          })
+          .catch(() => undefined);
+      }
+      await deps
+        .sendBestEffortAlert({ jobId: c.id, slug: c.topic_slug, topic: c.topic, ageHours })
+        .catch(() => undefined);
+      return { ran: true, outcome: "recovered", jobId: c.id, attempts: newAttempts };
+    }
+    deps.log(
+      `[studio-recovery] ${c.id}: best-effort finalize did NOT complete ` +
+        `(${beFin.refused ? "obligation REFUSED" : "error"}: ${beFin.reason ?? ""}) — ` +
+        `treating as continued-transient`,
     );
   }
 
@@ -633,8 +806,10 @@ function buildDefaultDeps(
       }
     },
     listArtifacts: realListArtifacts,
+    listArtifactsWithStatus: realListArtifactsWithStatus,
     downloadArtifact: realDownloadArtifact,
     finalize: (args) => finalizeRecoveredRun(args, finalizeDeps),
+    finalizeBestEffort: (args) => finalizeBestEffortRun(args, finalizeDeps),
     patchRecovery: async (jobId, body) => {
       const res = await fetch(`${url}/rest/v1/research_queue?id=eq.${jobId}`, {
         method: "PATCH",
@@ -652,7 +827,13 @@ function buildDefaultDeps(
       return res.ok;
     },
     sendCompleted: (a) =>
-      sendCompletionEmail({ to: a.to, slug: a.slug, topic: a.topic, status: "completed" }),
+      sendCompletionEmail({
+        to: a.to,
+        slug: a.slug,
+        topic: a.topic,
+        status: "completed",
+        videoDeferred: a.videoDeferred,
+      }),
     sendFailed: (a) =>
       sendCompletionEmail({
         to: a.to,
@@ -662,6 +843,7 @@ function buildDefaultDeps(
         errorMessage: a.errorMessage,
       }),
     sendExhaustedAlert: (a) => sendStudioRecoveryExhaustedEmail(a),
+    sendBestEffortAlert: (a) => sendStudioVideoDeferredAlert(a),
     projectsDir: PROJECTS_DIR,
     now: () => Date.now(),
     log,

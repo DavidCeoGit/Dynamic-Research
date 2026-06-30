@@ -46,6 +46,29 @@ export interface StudioRecoveryProduct {
   artifactId: string;
   nlmType: string;
   filename: string;
+  /**
+   * S187 P0-2 (Branch (c)): how the decoupled sweep recovers this product.
+   * ABSENT ⇒ 'download' (backward-compat for in-flight pre-S187 pending rows —
+   * Codex M-5). 'render' = the Studio video was still rendering at the worker
+   * checkpoint; the sweep polls a STATUS-AWARE NLM list until status_id 3, then
+   * downloads. The render-vs-download distinction lives HERE, not in the status
+   * enum (design §7.1/D-2 — studio_recovery_status reuses 'pending').
+   */
+  recovery_kind?: "download" | "render";
+  /**
+   * S187 P0-2 ('render' only): the exact in-progress NLM artifact id (==
+   * state.artifacts.video.task_id). The sweep matches on this so a foreign /
+   * prior-run video rendering in a REUSED notebook can never be attached to
+   * this run (Gemini C-3 / Codex C-3 anti-stale identity).
+   */
+  videoTaskId?: string;
+  /**
+   * S187 P0-2 ('render' only): the run-start floor in ms (from deriveRunStart).
+   * An in-progress artifact created BEFORE this floor belongs to a prior run and
+   * is ignored. Persisted in the payload because the sweep cannot recompute it
+   * (G6 — the sweep loads only DB columns + payload, never the workdir/state).
+   */
+  runFloorMs?: number;
 }
 
 /**
@@ -270,6 +293,14 @@ export interface ResearchJob {
   studio_recovery_next_attempt_at?: string | null;
   studio_recovery_payload?: StudioRecoveryPayload | null;
   studio_recovery_error?: string | null;
+  /**
+   * S187 P0-2 — set true when a run completed BEST-EFFORT with its Studio video
+   * deferred (the render exceeded the window). Mirrors the additive migration
+   * column 20260629_studio_recovery_video_deferred.sql; the results page selects
+   * it to surface an honest "video unavailable for this run" banner. Optional so
+   * pre-migration rows deserialize cleanly.
+   */
+  studio_recovery_video_deferred?: boolean;
   /**
    * S102 file-upload (migration 20260610_research_queue_attachments.sql).
    * Optional so rows from before the migration deserialize cleanly. The

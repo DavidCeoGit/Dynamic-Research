@@ -364,6 +364,15 @@ export const studioRecoveryPayloadSchema = z.object({
         artifactId: z.string().min(1).max(200),
         nlmType: z.string().min(1).max(40),
         filename: z.string().min(1).max(400),
+        // S187 P0-2 (Branch (c)) — optional per-product fields. recovery_kind
+        // ABSENT ⇒ 'download' (backward-compat). videoTaskId/runFloorMs ride on
+        // 'render' products so the sweep can anti-stale-match a still-rendering
+        // video. MUST be allowlisted here or the agent route silently STRIPS them
+        // (the executor's render-park write goes through this schema). Mirrors
+        // the agent-side StudioRecoveryProduct (agent/types.ts) + productsWellFormed.
+        recovery_kind: z.enum(["download", "render"]).optional(),
+        videoTaskId: z.string().min(1).max(200).optional(),
+        runFloorMs: z.number().int().min(0).optional(),
       }),
     )
     // S172 single-source (site L): cap tied to the canonical product count, not a

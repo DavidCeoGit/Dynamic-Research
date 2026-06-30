@@ -59,6 +59,7 @@ import {
   SUPABASE_KEY,
   STUDIO_RECOVERY_MAX_MS,
   STUDIO_RECOVERY_POLL_MS,
+  STUDIO_VIDEO_RENDER_ENABLED,
 } from "./lib/worker-config.js";
 import { getSupabase } from "./lib/worker-supabase.js";
 import {
@@ -71,6 +72,7 @@ import {
   verifyPipelineCompletion,
   readStateForRecovery,
   recoverableNotebookId,
+  shouldDeferForVideoRender,
   type CompletionVerdict,
 } from "./lib/state-evaluation.js";
 import { notifyTerminal } from "./lib/terminal-notify.js";
@@ -395,9 +397,60 @@ export async function executeJob(job: ResearchJob): Promise<string> {
         );
       }
 
-      await failJob(job.id, verdict.reason);
-      await notifyTerminal(job, "failed", verdict.reason);
-      throw new Error(verdict.reason);
+      // S187 P0-2 (Branch (c)) — Gate-A defer interception. Flag-gated (default
+      // OFF). Fires ONLY when (a) NO terminal error was classified above (Codex
+      // M-8: never park a credit/auth/billing/model failure as "rendering"), and
+      // (b) the deliverable-presence probe confirms the ONLY missing deliverable
+      // is the Studio video (every non-video studio + research doc present, publish
+      // gate satisfied). On defer the run does NOT fail here — it falls through to
+      // the success path → Gate B (enforceStudioCompleteness), which classifies the
+      // video as render → recoverablePending → the purelyTransient park below writes
+      // status='failed'+studio_recovery_status='pending'. If Gate B can't CONFIRM
+      // the render it still hard-fails (no fail-open). verdict.state is present on
+      // the failure verdict (attached by verifyPipelineCompletion, S187).
+      let deferred = false;
+      if (!classified && STUDIO_VIDEO_RENDER_ENABLED && verdict.state) {
+        const entries: Array<{ name: string; size: number }> = [];
+        try {
+          const dirents = await fs.readdir(projectsDir, { withFileTypes: true });
+          for (const d of dirents) {
+            if (!d.isFile()) continue;
+            try {
+              const st = await fs.stat(path.join(projectsDir, d.name));
+              entries.push({ name: d.name, size: st.size });
+            } catch {
+              // unreadable entry — treat as absent
+            }
+          }
+        } catch {
+          // projectsDir missing/unreadable — entries stays [] → probe terminal
+        }
+        const publishOk = evaluatePublishGateForJob(
+          job,
+          verdict.state,
+          bypassSnapshot,
+        ).ok;
+        const probe = shouldDeferForVideoRender({
+          notebookId: verdict.state.notebook_id,
+          entries,
+          selected: job.selected_products,
+          publishOk,
+        });
+        if (probe.defer) {
+          deferred = true;
+          log(job.id, `[executor] Gate-A DEFER (video still rendering): ${probe.reason}`);
+        } else {
+          log(job.id, `[executor] Gate-A defer declined → terminal: ${probe.reason}`);
+        }
+      }
+
+      if (!deferred) {
+        await failJob(job.id, verdict.reason);
+        await notifyTerminal(job, "failed", verdict.reason);
+        throw new Error(verdict.reason);
+      }
+      // Deferred: fall through to the success path. verdict.state is set, so the
+      // publish gate + Gate B below read it normally; Gate B parks the run.
     }
     log(job.id, verdict.reason);
 
@@ -511,6 +564,13 @@ export async function executeJob(job: ResearchJob): Promise<string> {
               artifactId: rp.artifactId,
               nlmType: rp.nlmType,
               filename: rp.filename,
+              // S187 P0-2: carry Branch-(c) render fields through. Download
+              // products omit them → absent ⇒ 'download' (backward-compat); a
+              // 'render' video carries recovery_kind + the videoTaskId/runFloorMs
+              // anti-stale identity the sweep needs (it never loads the workdir).
+              ...(rp.recovery_kind ? { recovery_kind: rp.recovery_kind } : {}),
+              ...(rp.videoTaskId ? { videoTaskId: rp.videoTaskId } : {}),
+              ...(rp.runFloorMs != null ? { runFloorMs: rp.runFloorMs } : {}),
             })),
           };
           let dimensionWritten = false;
