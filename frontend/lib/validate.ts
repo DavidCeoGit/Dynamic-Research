@@ -138,7 +138,7 @@ export const perplexitySchema = z.object({
 export const notebookLMSchema = z.object({
   persona: z.string().max(25000).default(""),
   researchMode: z.enum(["deep", "standard"]).default("deep"),
-  priorities: z.array(z.string().max(2000)).default([]),
+  priorities: z.array(z.string().max(5000)).default([]),
 });
 
 export const customizationsSchema = z.object({
