@@ -38,6 +38,9 @@ type NotifyArgs = {
   topic: string;
   status: "completed" | "failed";
   errorMessage?: string;
+  /** S187 P0-2 — best-effort completion with the Studio video deferred → honest
+   *  copy (drop "cinematic video", add a "video unavailable for this run" note). */
+  videoDeferred?: boolean;
   // S85 plan-review convergence (design §5b option 2) — advisory reservations
   // recorded when the plan proceeded under terminal-ladder rule R5. Folded into
   // the success email as non-blocking notes. Local shape mirrors
@@ -132,13 +135,25 @@ function buildSuccessEmail(
           : "") +
         `</ul></div>`
       : "";
+  // S187 P0-2 — honest best-effort copy: when the Studio video was deferred (render
+  // exceeded the window), drop "cinematic video" from the product list + add a note.
+  const videoDeferred = args.videoDeferred ?? false;
+  const productList = videoDeferred
+    ? "audio overview, slide deck, executive report, and infographic"
+    : "audio overview, cinematic video, slide deck, executive report, and infographic";
+  const deferredTextNote = videoDeferred
+    ? `\n\nNote: the cinematic video was unavailable for this run and is not included — every other deliverable is ready.`
+    : "";
+  const deferredHtmlNote = videoDeferred
+    ? `<p style="margin:0 0 12px 0;padding:10px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;color:#92400e;font-size:13px">🎬 The cinematic video was unavailable for this run and is not included — every other deliverable is ready.</p>`
+    : "";
   const text =
     `Your research run finished and the deliverables are ready to view.\n\n` +
     `Topic: ${args.topic}\n\n` +
     `Gallery: ${galleryUrl}\n\n` +
-    `The gallery includes every deliverable produced for this topic — audio overview, ` +
-    `cinematic video, slide deck, executive report, and infographic — plus the underlying ` +
+    `The gallery includes the deliverables produced for this topic — ${productList} — plus the underlying ` +
     `research artifacts (Perplexity output, NotebookLM synthesis, and the three-way comparison).` +
+    deferredTextNote +
     reservationText +
     `\n\nIf anything looks off, reply to this email.\n\n` +
     `— Dynamic Research`;
@@ -149,7 +164,8 @@ function buildSuccessEmail(
     `<p style="margin:0 0 24px 0">` +
     `<a href="${galleryUrl}" style="display:inline-block;padding:10px 18px;background:#0070f3;color:#fff;text-decoration:none;border-radius:6px;font-weight:500">View gallery →</a>` +
     `</p>` +
-    `<p style="margin:0 0 12px 0;color:#555">The gallery includes every deliverable produced for this topic — audio overview, cinematic video, slide deck, executive report, and infographic — plus the underlying research artifacts (Perplexity output, NotebookLM synthesis, three-way comparison).</p>` +
+    deferredHtmlNote +
+    `<p style="margin:0 0 12px 0;color:#555">The gallery includes the deliverables produced for this topic — ${productList} — plus the underlying research artifacts (Perplexity output, NotebookLM synthesis, three-way comparison).</p>` +
     reservationHtml +
     `<p style="margin:24px 0 0 0;color:#888;font-size:13px">If anything looks off, reply to this email.</p>` +
     `</div>`;
@@ -447,6 +463,45 @@ async function postOperatorAlert(subject: string, text: string, html: string): P
   } catch (err) {
     console.warn(`[notify] operator-alert threw: ${(err as Error).message}`);
   }
+}
+
+/**
+ * S187 P0-2 (Branch (c)) — operator OUTAGE alert: a run completed BEST-EFFORT with
+ * its Studio video deferred (the Veo3 render did not reach status_id 3 within the
+ * render window). The "+ ALERT" half of best-effort + alert (design I4): the user
+ * still got 4/5 + research docs, but a genuine render outage warrants operator
+ * attention. Recipient = PREFLIGHT_NOTIFY_EMAIL; skips-on-unset; never throws.
+ */
+export async function sendStudioVideoDeferredAlert(args: {
+  jobId: string;
+  slug: string;
+  topic: string;
+  ageHours: number;
+}): Promise<void> {
+  const subject = `[Dynamic Research] Video deferred — run completed best-effort (${args.slug})`;
+  const galleryUrl = `${GALLERY_BASE_URL}/${args.slug}/gallery`;
+  const text =
+    `A research run completed BEST-EFFORT with its Studio video deferred — the video render ` +
+    `did not finish within the render window (~${args.ageHours}h). The user received every other ` +
+    `deliverable (audio, slides, report, infographic) + the research docs; the run is marked ` +
+    `completed with studio_recovery_video_deferred=true.\n\n` +
+    `Job: ${args.jobId}\n` +
+    `Slug: ${args.slug}\n` +
+    `Topic: ${args.topic}\n` +
+    `Gallery: ${galleryUrl}\n\n` +
+    `This is expected on a genuine Veo3 render outage. If it recurs, check NotebookLM video ` +
+    `render health.\n\n— Dynamic Research`;
+  const html =
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;color:#111;line-height:1.5">` +
+    `<h2 style="margin:0 0 16px 0">🎬 Video deferred — run completed best-effort</h2>` +
+    `<p style="margin:0 0 12px 0">A research run completed BEST-EFFORT with its Studio video deferred — the render did not finish within the render window (~${escapeHtml(String(args.ageHours))}h). The user received every other deliverable + research docs; the run is marked completed with <code>studio_recovery_video_deferred=true</code>.</p>` +
+    `<p style="margin:0 0 6px 0"><strong>Job:</strong> ${escapeHtml(args.jobId)}</p>` +
+    `<p style="margin:0 0 6px 0"><strong>Slug:</strong> ${escapeHtml(args.slug)}</p>` +
+    `<p style="margin:0 0 12px 0"><strong>Topic:</strong> ${escapeHtml(args.topic)}</p>` +
+    `<p style="margin:0 0 12px 0"><a href="${galleryUrl}" style="color:#0070f3">View gallery →</a></p>` +
+    `<p style="margin:12px 0 0 0;color:#888;font-size:13px">Expected on a genuine Veo3 render outage. If it recurs, check NotebookLM video render health.</p>` +
+    `</div>`;
+  await postOperatorAlert(subject, text, html);
 }
 
 export interface PreflightBackoffEmailArgs {

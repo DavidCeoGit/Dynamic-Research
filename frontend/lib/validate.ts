@@ -364,6 +364,15 @@ export const studioRecoveryPayloadSchema = z.object({
         artifactId: z.string().min(1).max(200),
         nlmType: z.string().min(1).max(40),
         filename: z.string().min(1).max(400),
+        // S187 P0-2 (Branch (c)) — optional per-product fields. recovery_kind
+        // ABSENT ⇒ 'download' (backward-compat). videoTaskId/runFloorMs ride on
+        // 'render' products so the sweep can anti-stale-match a still-rendering
+        // video. MUST be allowlisted here or the agent route silently STRIPS them
+        // (the executor's render-park write goes through this schema). Mirrors
+        // the agent-side StudioRecoveryProduct (agent/types.ts) + productsWellFormed.
+        recovery_kind: z.enum(["download", "render"]).optional(),
+        videoTaskId: z.string().min(1).max(200).optional(),
+        runFloorMs: z.number().int().min(0).optional(),
       }),
     )
     // S172 single-source (site L): cap tied to the canonical product count, not a
@@ -419,6 +428,12 @@ export const agentUpdateSchema = z.object({
   studio_recovery_next_attempt_at: z.string().datetime().nullable().optional(),
   studio_recovery_payload: studioRecoveryPayloadSchema.nullable().optional(),
   studio_recovery_error: z.string().max(500).nullable().optional(),
+  // S187 P0-2 — best-effort video-deferred marker. The worker writes this via a
+  // direct Supabase REST PATCH (finalize-recovered-run:patchRow), NOT this agent
+  // route, so it is allowlisted here only for cross-tier parity with
+  // agent/types.ts + frontend/lib/types/queue.ts (mirror completeness, not a
+  // runtime dependency of the agent route).
+  studio_recovery_video_deferred: z.boolean().optional(),
 });
 
 // ── Form-level schema (extends API payload with transient form fields) ──
