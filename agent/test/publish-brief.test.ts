@@ -164,3 +164,49 @@ test("prompt: PUBLISH block absent when publishRequired is explicitly false", ()
   const p = buildPrompt(j, MANIFEST);
   assert.ok(!p.includes("PUBLISH-REQUIRED RUN"), "PUBLISH block emitted for publishRequired=false");
 });
+
+// ── S193 Fix A (L1) — anti-stop CRITICAL emission ────────────────────
+// The Class-A failure: the `claude -p` pipeline agent ends its turn while an
+// async NotebookLM op (Phase-3 corpus import / Studio render) is still pending,
+// writes a "finalizing in background" phase_status, and stops — the completion
+// gate then hard-fails a near-complete job (4 confirmed prod events incl. ConQr
+// 3ce18f2c). L1 injects a top-level anti-stop CRITICAL that is ALWAYS-emitted
+// (Class A struck NON-publish jobs, so a publish-gated placement would leave the
+// exact failing shape unprotected). These tests pin the always-emit + the
+// ordering-outside-publishBlock invariant the MERGE gate flagged as key targets.
+
+test("prompt: anti-stop CRITICAL present for a NON-publish job (ALWAYS-emitted, outside publishBlock)", () => {
+  const p = buildPrompt(baseJob(), MANIFEST);
+  // The exact failing shape was a non-publish job — this is the load-bearing assertion.
+  assert.ok(p.includes("NON-INTERACTIVE SINGLE-SHOT EXECUTION"), "anti-stop CRITICAL missing from a non-publish brief");
+  assert.ok(
+    /MUST NOT end your turn while ANY asynchronous NotebookLM operation/.test(p),
+    "anti-stop core directive missing",
+  );
+  // Names BOTH pending-op classes the failures came from.
+  assert.ok(p.includes("wait=False"), "missing Phase-3 corpus-import (wait=False) specificity");
+  assert.ok(/Studio render \(audio\/video\/slides\/infographic\)/.test(p), "missing Studio-render pending-op class");
+  // Fail-forward (never fail-open on completion) + the bounded-poll cross-ref to the slash prompt.
+  assert.ok(p.includes("FAIL FORWARD"), "missing fail-forward directive");
+  assert.ok(p.includes("Phase 5.5 Step A.1"), "missing cross-reference to the bounded corpus-import poll");
+  // The confirming clause that "background" is a WAIT point, not a stop.
+  assert.ok(/NEVER a valid stopping point/.test(p), "missing 'background is not a stopping point' clause");
+});
+
+test("prompt: anti-stop CRITICAL present for a publish-required job too (both branches)", () => {
+  const p = buildPrompt(publishJob(), MANIFEST);
+  assert.ok(p.includes("NON-INTERACTIVE SINGLE-SHOT EXECUTION"), "anti-stop CRITICAL missing from a publish brief");
+  assert.ok(p.includes("PUBLISH-REQUIRED RUN (fail-closed)"), "publish block should still be present");
+});
+
+test("prompt: anti-stop CRITICAL is emitted BEFORE (outside) the publishBlock", () => {
+  // A publish-gated placement would leave the exact Class-A shape (non-publish)
+  // unprotected — assert the anti-stop block lives in the always-emitted region,
+  // ahead of the conditionally-appended publish block.
+  const p = buildPrompt(publishJob(), MANIFEST);
+  const antiStopIdx = p.indexOf("NON-INTERACTIVE SINGLE-SHOT EXECUTION");
+  const publishIdx = p.indexOf("PUBLISH-REQUIRED RUN (fail-closed)");
+  assert.ok(antiStopIdx > 0, "anti-stop CRITICAL not found");
+  assert.ok(publishIdx > 0, "publish block not found");
+  assert.ok(antiStopIdx < publishIdx, "anti-stop CRITICAL must precede the publishBlock (proves it is outside it)");
+});
