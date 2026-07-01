@@ -210,3 +210,37 @@ test("prompt: anti-stop CRITICAL is emitted BEFORE (outside) the publishBlock", 
   assert.ok(publishIdx > 0, "publish block not found");
   assert.ok(antiStopIdx < publishIdx, "anti-stop CRITICAL must precede the publishBlock (proves it is outside it)");
 });
+
+// ── S195 Fix C — anti-stop CRITICAL hardening (widened narration + relocated-gate pointer) ──
+// S193 dogfooded L1 and it DRIFTED: 33 min into the run the agent reframed the
+// still-running Phase-3 corpus import as "awaiting import completion" / "Non-terminal"
+// (vocabulary the original CRITICAL did not name) and ended its turn at the Phase 5 -> 5.5
+// boundary. [C] hardens the always-emitted CRITICAL three ways: (1) widen the negated-
+// narration set to the words the agent actually used; (2) forbid a premature complete-
+// prefixed phase_status (the gate treats any "complete"-prefix as terminal, so
+// "complete (pending import)" would falsely complete or hard-fail a half-done job);
+// (3) emit a phase-5-exit-local pointer to the relocated Step 5e corpus-readiness gate.
+// The Class-A shape was a NON-publish job, so these pin the always-emitted (baseJob) brief.
+
+test("prompt: anti-stop CRITICAL negates the S193 reframing vocabulary (awaiting/resuming/non-terminal/yielding)", () => {
+  const p = buildPrompt(baseJob(), MANIFEST);
+  // The exact words the S193-dogfood agent used to justify stopping must now be named invalid stops.
+  for (const term of ["awaiting", "resuming", "non-terminal", "yielding", "in progress"]) {
+    assert.ok(p.includes(term), `anti-stop CRITICAL missing negated narration term "${term}"`);
+  }
+  assert.ok(/"will resume"|"can be picked up later"/.test(p), "missing the 'resumable' reframing negation");
+});
+
+test("prompt: anti-stop CRITICAL forbids a premature complete-prefixed phase_status (m-1)", () => {
+  const p = buildPrompt(baseJob(), MANIFEST);
+  assert.ok(p.includes("complete (pending import)"), "missing premature complete-parenthetical example");
+  assert.ok(p.includes('BEGINS with "complete"'), "missing complete-prefix forbiddance phrasing");
+  assert.ok(p.includes("FORBIDDEN"), "missing explicit FORBIDDEN marker on premature-complete");
+});
+
+test("prompt: anti-stop CRITICAL points at the relocated Phase 5->5.5 Step 5e gate", () => {
+  const p = buildPrompt(baseJob(), MANIFEST);
+  assert.ok(p.includes("Step 5e"), "missing pointer to the relocated Step 5e corpus-readiness gate");
+  assert.ok(p.includes("Phase 5 -> 5.5 boundary"), "missing Phase 5->5.5 boundary callout");
+  assert.ok(p.includes("CORPUS_IMPORT_READY"), "missing the readiness sentinel the gate must return");
+});
