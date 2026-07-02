@@ -42,6 +42,11 @@ backup-claude-config/
 **/.worker.pid
 **/.preflight-backoff
 **/.staging-sweep-last
+# S197 studio-product-checker runtime state (breadcrumbs carry job UUIDs +
+# local paths — never commit)
+agent/.run/
+agent/.studio-checker/
+agent/studio-checker.log*
 agent/scripts/.phase-a-bootstrap-state.json
 # MRPF PUBLISH gate: operator-only URGENT risk-acceptance files (<job-id>.txt).
 # Never committed — a sign-off is per-job human authorization, not a reusable artifact.

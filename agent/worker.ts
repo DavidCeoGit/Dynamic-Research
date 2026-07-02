@@ -38,6 +38,7 @@ import {
 import { sendPreflightBackoffEmail } from "./lib/notify.js";
 import { maybeRunStagingSweep } from "./lib/staging-sweep.js";
 import { maybeRunStudioRecoverySweep } from "./lib/studio-recovery-sweep.js";
+import { maybeGcChildBreadcrumbs } from "./lib/child-breadcrumb.js";
 import type { ResearchJob } from "./types.js";
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -265,6 +266,12 @@ async function poll(): Promise<void> {
       // a file-backed marker (.staging-sweep-last); best-effort, never throws.
       if (!DRY_RUN) {
         await maybeRunStagingSweep({ logFn: (m) => log(m) });
+        // S197 (studio-product-checker §4.2 GC, fresh-Claude INFO): remove
+        // child-PID breadcrumbs orphaned by a hard worker death whose jobs
+        // have since left status='running'. A crumb whose job IS still
+        // running is kept — it is exactly the checker's CHILD_DEAD evidence.
+        // Cheap (readdir-only when no crumbs exist) + best-effort.
+        await maybeGcChildBreadcrumbs({ logFn: (m) => log(m) });
       }
       return;
     }

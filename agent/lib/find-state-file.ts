@@ -125,6 +125,51 @@ export async function archiveStaleStateFiles(workDir: string): Promise<string[]>
 }
 
 /**
+ * S197 (studio-product-checker §10.9, fresh-Claude C-1 sibling): the child's
+ * pre-submit Studio snapshot. Written solely by the child (research-compare.md
+ * step 1.7) and — before S197 — persisted FOREVER across re-queues of the same
+ * slug, because the claim-time archive above sweeps ONLY state-file candidates
+ * (isStateFileName). A stale snapshot poisons any launch-marker/run-floor
+ * reader: the checker freshness-gates against claimed_at regardless (its own
+ * belt), but archiving at claim removes the hazard class at the source.
+ */
+export const STUDIO_BEFORE_IDS_NAME = "studio_before_ids.json";
+
+/**
+ * Move a prior attempt's studio_before_ids.json into SUPERSEDED_STATE_DIR at
+ * claim time (same forensics-preserving rename pattern as
+ * archiveStaleStateFiles). BEST-EFFORT contract — unlike the state-file
+ * sibling this NEVER throws: a leftover marker is not a publish fail-open
+ * hazard (the child unconditionally REWRITES the snapshot at step 1.7 before
+ * any generate, and the checker ignores markers older than claimed_at), so
+ * failing the job over an archive error would add risk, not remove it.
+ * Returns the archived names ([] on no-op or any error).
+ */
+export async function archiveStaleStudioMarkers(workDir: string): Promise<string[]> {
+  try {
+    const src = path.join(workDir, STUDIO_BEFORE_IDS_NAME);
+    try {
+      await fs.stat(src);
+    } catch {
+      return []; // no marker — the common case
+    }
+    const archiveDir = path.join(workDir, SUPERSEDED_STATE_DIR);
+    await fs.mkdir(archiveDir, { recursive: true });
+    let existing: string[] = [];
+    try {
+      existing = await fs.readdir(archiveDir);
+    } catch {
+      // just created — empty
+    }
+    const dest = path.join(archiveDir, `${existing.length}-${STUDIO_BEFORE_IDS_NAME}`);
+    await fs.rename(src, dest);
+    return [STUDIO_BEFORE_IDS_NAME];
+  } catch {
+    return []; // best-effort — see contract above
+  }
+}
+
+/**
  * Parse the run timestamp embedded in a state-file name into a sortable epoch
  * (ms). Matches ONLY a fully start/end-anchored "<YYYYMMDD>-<HHMMSS>-state.json"
  * (the shape the pipeline writes); a slug-named "<slug>-state.json" that merely

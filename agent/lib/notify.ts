@@ -504,6 +504,84 @@ export async function sendStudioVideoDeferredAlert(args: {
   await postOperatorAlert(subject, text, html);
 }
 
+// ── S197 studio-product-checker operator alert ──────────────────────
+
+/**
+ * One finding row from a studio-product-checker invocation (design §5.2/§5.3).
+ * `detail` is checker-composed: status_id / elapsed-vs-threshold / liveness /
+ * phase context / next-move hint. It must carry NO untrusted user content —
+ * ids, slugs, status numbers and checker-authored text only (§9); this
+ * function HTML-escapes everything regardless (defense-in-depth).
+ */
+export interface StudioCheckerFinding {
+  jobId: string;
+  slug: string;
+  /** Detection-matrix alert class, e.g. STALLED_PRODUCT, CHILD_DEAD_JOB_RUNNING. */
+  condition: string;
+  product?: string;
+  kind: "alert" | "escalation" | "recovered" | "fyi";
+  detail: string;
+}
+
+/**
+ * S197 (checker design §5.3) — ONE batched operator email per checker
+ * invocation that produced findings. Composes the existing postOperatorAlert
+ * channel (recipient PREFLIGHT_NOTIFY_EMAIL, skip-on-unset, swallow-errors —
+ * the sendStudioVideoDeferredAlert S187 pattern). Dedup does NOT live here:
+ * notify.ts has zero dedup primitives by contract — once-per-condition +
+ * escalation + recovered logic is the checker's latch-file job; this function
+ * sends exactly what it is handed. No-op on an empty findings list.
+ */
+export async function sendStudioStallAlert(args: {
+  findings: StudioCheckerFinding[];
+}): Promise<void> {
+  const findings = args.findings ?? [];
+  if (findings.length === 0) return;
+
+  const alerts = findings.filter((f) => f.kind === "alert" || f.kind === "escalation");
+  const jobs = [...new Set(findings.map((f) => f.jobId))];
+  const subject =
+    `[Dynamic Research] Studio checker: ` +
+    `${alerts.length} alert(s), ${findings.length} finding(s) across ${jobs.length} job(s)`;
+
+  const kindTag = (k: StudioCheckerFinding["kind"]): string =>
+    k === "escalation" ? "ESCALATION" : k === "recovered" ? "RECOVERED" : k === "fyi" ? "FYI" : "ALERT";
+
+  const lines = findings.map(
+    (f) =>
+      `[${kindTag(f.kind)}] ${f.condition}` +
+      `${f.product ? ` (${f.product})` : ""} — job ${f.jobId} / ${f.slug}\n    ${f.detail}`,
+  );
+  const text =
+    `The 5-min studio-product-checker (read-only watchdog) reported:\n\n` +
+    lines.join("\n\n") +
+    `\n\nThe checker never acts — it observes NLM artifact status, child/worker liveness ` +
+    `and workdir state for status='running' jobs. Latches + full log: ` +
+    `agent/.studio-checker/ + agent/studio-checker.log in the deploy clone.\n\n` +
+    `— Dynamic Research studio checker`;
+
+  const rowsHtml = findings
+    .map(
+      (f) =>
+        `<tr>` +
+        `<td style="padding:6px 10px;border-bottom:1px solid #eee;white-space:nowrap"><strong>${escapeHtml(kindTag(f.kind))}</strong></td>` +
+        `<td style="padding:6px 10px;border-bottom:1px solid #eee">${escapeHtml(f.condition)}${f.product ? ` <span style="color:#666">(${escapeHtml(f.product)})</span>` : ""}</td>` +
+        `<td style="padding:6px 10px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px">${escapeHtml(f.jobId.slice(0, 8))}… / ${escapeHtml(f.slug)}</td>` +
+        `<td style="padding:6px 10px;border-bottom:1px solid #eee;font-size:13px">${escapeHtml(f.detail)}</td>` +
+        `</tr>`,
+    )
+    .join("");
+  const html =
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:720px;margin:0 auto;color:#111;line-height:1.5">` +
+    `<h2 style="margin:0 0 16px 0">🔍 Studio checker findings</h2>` +
+    `<p style="margin:0 0 12px 0">The 5-min studio-product-checker (read-only watchdog) reported:</p>` +
+    `<table style="border-collapse:collapse;width:100%">${rowsHtml}</table>` +
+    `<p style="margin:16px 0 0 0;color:#888;font-size:13px">The checker never acts — it observes NLM artifact status, child/worker liveness and workdir state for running jobs. Latches + full log: <code>agent/.studio-checker/</code> + <code>agent/studio-checker.log</code> in the deploy clone.</p>` +
+    `</div>`;
+
+  await postOperatorAlert(subject, text, html);
+}
+
 export interface PreflightBackoffEmailArgs {
   /** "preflight" = startup check failed; "terminal" = mid-execution classifier fired. */
   origin: "preflight" | "terminal";
