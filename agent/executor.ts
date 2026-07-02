@@ -361,7 +361,9 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     exitCodeForUsage = exitCode;
     stdoutForUsage = getStdout();
 
-    stateWatcher.stop();
+    // S199 F2: AWAIT the watcher's final progress flush so it can never land
+    // after the terminal completeJob/failJob writes downstream.
+    await stateWatcher.stop();
 
     // S136 Layer 2: a MAX_JOB_DURATION cap-kill whose studio artifacts already
     // finished in NotebookLM should be RECOVERED (download → upload → complete)
@@ -860,7 +862,9 @@ async function runStudioOnly(
   // S136: waitForProcess now returns {code, killReason}; the studio-only regen
   // path keeps its existing fail-fast behavior (no duration recovery here yet).
   const { code: exitCode } = await waitForProcess(child, job);
-  stateWatcher.stop();
+  // S199 F2: await the final flush — same terminal-write ordering guarantee as
+  // the main path.
+  await stateWatcher.stop();
 
   if (exitCode !== 0) {
     const reason = await readStudioFailureReason(workDir, exitCode);

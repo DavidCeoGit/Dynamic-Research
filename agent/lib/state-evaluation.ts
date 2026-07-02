@@ -29,7 +29,12 @@ function log(context: string, msg: string): void {
 // ── State file watcher ──────────────────────────────────────────────
 
 export interface StateWatcher {
-  stop: () => void;
+  /** Stops the poll AND fires the final unthrottled progress flush. Resolves
+   * when the flush PATCH has settled — callers MUST await it before writing
+   * terminal job state (completeJob/failJob), or a floating flush could land
+   * after the terminal PATCH and regress the row's display fields. (Gemini
+   * C-2 + Codex MAJOR-2, S199.) */
+  stop: () => Promise<void>;
 }
 
 // ── State-field coercion safety (S166/S168) ─────────────────────────
@@ -111,7 +116,13 @@ export function summarizeStateProgress(
   if (isNonPrimitiveStateField(phase) || isNonPrimitiveStateField(phaseStatus)) {
     return { kind: "malformed", detail: "phase/phase_status is not a primitive" };
   }
-  const phaseKey = phase as string;
+  // Normalize the phase to a STRING too: a child writing JSON `"phase": 5`
+  // (number) must map/compare identically to `"5"`, and an unknown numeric
+  // phase must not leak a NUMBER into current_phase — the frontend route
+  // schema requires a string (frontend/lib/validate.ts z.string()) and would
+  // 400 the whole PATCH. Post-guard `phase` is a primitive, never throws.
+  // (Codex MERGE MINOR, S199.)
+  const phaseKey = String(phase ?? "");
   const mapped = PHASE_MAP[phaseKey];
   const pct = mapped?.pct ?? lastPct;
   const phaseName = mapped?.name ?? phaseKey;
@@ -212,7 +223,7 @@ export function makeStateSync(
     }
   };
 
-  const syncOnce = async (throttled: boolean): Promise<void> => {
+  const doSync = async (throttled: boolean): Promise<void> => {
     const result = await deps.readState(workDir);
 
     // ABSENT (not written yet) and transient IO (file vanished/locked between
@@ -278,6 +289,24 @@ export function makeStateSync(
       });
   };
 
+  // ── Pass serialization (Codex MERGE MAJOR-1, S199) ──
+  // Every pass runs on ONE promise chain, so passes never overlap: a slow
+  // PATCH can neither resolve after a LATER pass's PATCH (out-of-order write
+  // permanently regressing the row — the in-memory cursor is already ahead,
+  // so no later tick repairs it) nor interleave with the catch-revert. Each
+  // pass also READS the state file only after its predecessor fully settled,
+  // so a chained flush always syncs the newest text. doSync is total, but the
+  // chain link swallows defensively so one rejection can't wedge all future
+  // passes; callers still observe their own pass's outcome via the returned
+  // (unswallowed) promise.
+  let chain: Promise<void> = Promise.resolve();
+
+  const syncOnce = (throttled: boolean): Promise<void> => {
+    const run = chain.then(() => doSync(throttled));
+    chain = run.catch(() => {});
+    return run;
+  };
+
   return { syncOnce };
 }
 
@@ -288,28 +317,39 @@ export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher 
     now: Date.now,
   });
   let stopped = false;
+  let tickInFlight = false;
+  let flushPromise: Promise<void> | null = null;
 
   const interval = setInterval(() => {
-    if (stopped) return;
+    // Skip-if-busy: with the serialized chain a hung PATCH would otherwise
+    // queue a new pass every 5s unboundedly; at most one tick is ever queued.
+    if (stopped || tickInFlight) return;
+    tickInFlight = true;
     // syncOnce is total by construction; the belt logs, never rejects unhandled.
-    void sync
+    sync
       .syncOnce(true)
-      .catch((err) => log(job.id, `progress sync tick failed unexpectedly: ${err}`));
+      .catch((err) => log(job.id, `progress sync tick failed unexpectedly: ${err}`))
+      .finally(() => {
+        tickInFlight = false;
+      });
   }, 5_000);
 
   return {
-    stop() {
-      if (stopped) return;
+    stop(): Promise<void> {
+      if (stopped) return flushPromise ?? Promise.resolve();
       stopped = true;
       clearInterval(interval);
-      // Final unthrottled flush — floating by design: the executor's terminal
-      // writes (completeJob/failJob) land seconds-to-minutes after stop(), and
-      // this PATCH resolves in ~100ms, so ordering holds without awaiting; a
-      // job's dying status must not be lost to the 30s throttle window.
-      // (Gemini MERGE CRITICAL, S199.)
-      void sync
+      // Final unthrottled flush — serialized behind any in-flight pass and
+      // RETURNED so the executor awaits it BEFORE its terminal writes: a
+      // floating flush could land after completeJob/failJob on a fast
+      // terminal path and leave a completed row displaying stale progress
+      // (Codex MAJOR-2). The flush is still what carries a child's dying
+      // phase_status past the throttle window — failJob never writes
+      // phase_status (Gemini C-2). (S199)
+      flushPromise = sync
         .syncOnce(false)
         .catch((err) => log(job.id, `progress sync flush failed unexpectedly: ${err}`));
+      return flushPromise;
     },
   };
 }

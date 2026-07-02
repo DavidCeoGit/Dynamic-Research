@@ -180,6 +180,28 @@ describe("summarizeStateProgress — status normalization (S199 Gemini MAJOR/MIN
     const missing = { phase: "5" } as unknown as PipelineState;
     assert.equal(summarizeStateProgress(missing, "5", 60, "").kind, "unchanged");
   });
+
+  test("numeric phase normalizes to string: JSON `\"phase\": 5` maps and carries string fields (Codex MINOR)", () => {
+    const r = summarizeStateProgress(mk(5, "x"), "", 0, "");
+    assert.equal(r.kind, "update");
+    if (r.kind !== "update") return;
+    assert.equal(r.phase, "5");
+    assert.equal(r.phaseName, "Synthesis");
+    assert.equal(r.pct, 60);
+  });
+
+  test("numeric 5 against tracked string '5' → unchanged (no spurious update on type flip)", () => {
+    assert.equal(summarizeStateProgress(mk(5, "x"), "5", 60, "x").kind, "unchanged");
+  });
+
+  test("unknown NUMERIC phase → phaseName is the STRING form (route schema requires string)", () => {
+    const r = summarizeStateProgress(mk(8, "x"), "", 0, "");
+    assert.equal(r.kind, "update");
+    if (r.kind !== "update") return;
+    assert.equal(r.phaseName, "8");
+    assert.equal(typeof r.phaseName, "string");
+    assert.equal(typeof r.phase, "string");
+  });
 });
 
 // ── makeStateSync behavioral contract (S199 Gemini CRITICAL ×2) ──────
@@ -191,17 +213,29 @@ describe("makeStateSync — throttle / revert-on-failure / stop-flush", () => {
     let nowMs = 100_000;
     let result: StateReadResult = { kind: "absent" };
     let failCount = 0;
+    let gatesToArm = 0;
+    const releases: Array<() => void> = [];
     const stats = { attempts: 0 };
+    const events: string[] = [];
     const calls: Array<{ current_phase: string; phase_status: string; progress_pct: number }> = [];
     const sync = makeStateSync(JOB, "wd-irrelevant", {
       readState: async () => result,
       update: async (_id, patch) => {
         stats.attempts++;
+        events.push(`start:${patch.current_phase}`);
         if (failCount > 0) {
           failCount--;
+          events.push(`fail:${patch.current_phase}`);
           throw new Error("simulated supabase 502");
         }
-        calls.push(patch);
+        if (gatesToArm > 0) {
+          gatesToArm--;
+          await new Promise<void>((res) => {
+            releases.push(res);
+          });
+        }
+        calls.push(patch); // pushed at PATCH completion → calls order == DB landing order
+        events.push(`end:${patch.current_phase}`);
       },
       now: () => nowMs,
     });
@@ -209,6 +243,7 @@ describe("makeStateSync — throttle / revert-on-failure / stop-flush", () => {
       sync,
       calls,
       stats,
+      events,
       setState: (phase: unknown, status: unknown) => {
         result = { kind: "ok", state: mk(phase, status), path: "wd/state.json" };
       },
@@ -221,8 +256,17 @@ describe("makeStateSync — throttle / revert-on-failure / stop-flush", () => {
       failNext: (n: number) => {
         failCount = n;
       },
+      gateNext: (n: number) => {
+        gatesToArm = n;
+      },
+      release: () => {
+        releases.shift()?.();
+      },
     };
   }
+
+  /** Flush pending microtasks (one macrotask turn). */
+  const settle = () => new Promise<void>((r) => setImmediate(r));
 
   test("status-update inside the 30s window is deferred, then lands with the LATEST text", async () => {
     const h = harness();
@@ -315,6 +359,75 @@ describe("makeStateSync — throttle / revert-on-failure / stop-flush", () => {
     await h.sync.syncOnce(true); // update → write 1
     await h.sync.syncOnce(true); // unchanged
     await h.sync.syncOnce(false); // flush with nothing pending → no extra write
+    assert.equal(h.calls.length, 1);
+  });
+
+  // ── Pass serialization (S199 Codex MAJOR-1 / MAJOR-2) ──────────────
+
+  test("Codex MAJOR-1 counterexample: a slow phase-5 PATCH cannot be outrun by a later phase-6 pass", async () => {
+    const h = harness();
+    h.setState("5", "draft");
+    h.gateNext(1);
+    const p1 = h.sync.syncOnce(true); // starts; its PATCH hangs at the gate
+    await settle();
+    assert.deepEqual(h.events, ["start:Synthesis"]);
+
+    h.setState("6", "evaluating");
+    const p2 = h.sync.syncOnce(true); // chained: must not even START until p1 settles
+    await settle();
+    assert.deepEqual(h.events, ["start:Synthesis"], "second pass ran while first was in flight");
+
+    h.release(); // phase-5 PATCH completes
+    await p1;
+    await p2;
+    assert.deepEqual(h.events, [
+      "start:Synthesis",
+      "end:Synthesis",
+      "start:Vendor Evaluation",
+      "end:Vendor Evaluation",
+    ]);
+    // Landing order == chain order: the row ends on the NEWER phase, never
+    // regressed by a late-resolving older PATCH.
+    assert.deepEqual(
+      h.calls.map((c) => c.current_phase),
+      ["Synthesis", "Vendor Evaluation"],
+    );
+  });
+
+  test("Codex MAJOR-2 contract: the flush is serialized behind an in-flight pass and resolves only after its own PATCH", async () => {
+    const h = harness();
+    h.setState("5.5", "poll 1");
+    h.gateNext(1);
+    const p1 = h.sync.syncOnce(true); // hangs at the PATCH
+    await settle();
+
+    h.setState("5.5", "Fatal error: dying words");
+    const flush = h.sync.syncOnce(false);
+    let flushSettled = false;
+    void flush.then(() => {
+      flushSettled = true;
+    });
+    await settle();
+    assert.equal(flushSettled, false, "flush resolved while a pass was still in flight");
+    assert.equal(h.calls.length, 0);
+
+    h.release();
+    await p1;
+    await flush;
+    // The flush read the NEWEST text (after p1 settled) and bypassed the window.
+    assert.deepEqual(
+      h.calls.map((c) => c.phase_status),
+      ["poll 1", "Fatal error: dying words"],
+    );
+  });
+
+  test("a rejecting pass does not wedge the chain — subsequent passes still run", async () => {
+    const h = harness();
+    // Violate readState's never-throw contract deliberately (null.kind throws).
+    h.setResult(null as unknown as StateReadResult);
+    await assert.rejects(h.sync.syncOnce(true));
+    h.setState("5", "running");
+    await h.sync.syncOnce(true);
     assert.equal(h.calls.length, 1);
   });
 });
