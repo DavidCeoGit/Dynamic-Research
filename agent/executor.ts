@@ -28,7 +28,15 @@ import {
   downloadAttachments,
   type AttachmentDownloadResult,
 } from "./lib/attachments.js";
-import { archiveStaleStateFiles, findStateFile } from "./lib/find-state-file.js";
+import {
+  archiveStaleStateFiles,
+  archiveStaleStudioMarkers,
+  findStateFile,
+} from "./lib/find-state-file.js";
+import {
+  writeChildBreadcrumb,
+  deleteChildBreadcrumb,
+} from "./lib/child-breadcrumb.js";
 import {
   sendDeliveryDelayedEmail,
 } from "./lib/notify.js";
@@ -101,6 +109,15 @@ export async function executeJob(job: ResearchJob): Promise<string> {
   await fs.mkdir(workDir, { recursive: true });
   await fs.mkdir(projectsDir, { recursive: true });
 
+  // S197 (studio-product-checker §4.2, fresh-Claude M-1): a hard worker death
+  // (power loss, kill -9) never runs the finally below, so a prior attempt of
+  // this SAME job id can leave an orphaned child-PID breadcrumb. Delete it at
+  // claim time so the re-claim's pre-spawn window (attachments, manifest, the
+  // multi-minute plan-review gate) can't present a stale crumb as a live
+  // child. The checker also freshness-gates on spawnedAt >= claimed_at — this
+  // is the belt. Best-effort by contract (never throws).
+  await deleteChildBreadcrumb(job.id, (m) => log(job.id, m));
+
   // S161 R2-1 (belt-and-suspenders): clear any orphan `*.part` download temps left
   // in the REUSED projectsDir by a prior killed/crashed run (realDownloadArtifact
   // writes the binary to `<final>.part` and only renames it into place on success;
@@ -148,6 +165,20 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     log(
       job.id,
       `[stale-state] archived ${archivedState.length} prior-attempt state file(s): ${archivedState.join(", ")}`,
+    );
+  }
+
+  // S197 (studio-product-checker §10.9, fresh-Claude C-1 sibling): also sweep
+  // a prior attempt's studio_before_ids.json launch marker into the same
+  // .superseded-state/ archive. BEST-EFFORT (never throws, unlike the
+  // fail-closed state-file archive above): a leftover marker is not a publish
+  // fail-open hazard — the child rewrites the snapshot at step 1.7 before any
+  // generate, and the checker ignores markers older than claimed_at.
+  const archivedMarkers = await archiveStaleStudioMarkers(workDir);
+  if (archivedMarkers.length > 0) {
+    log(
+      job.id,
+      `[stale-state] archived prior-attempt studio marker(s): ${archivedMarkers.join(", ")}`,
     );
   }
 
@@ -294,12 +325,39 @@ export async function executeJob(job: ResearchJob): Promise<string> {
       throw err;
     }
 
+    // S197 (studio-product-checker §4.2): job→child-PID breadcrumb — the only
+    // worker-side state the independent checker consumes for child liveness.
+    // Semantics: "child spawned, exit NOT yet observed by the worker." Written
+    // only when the OS assigned a pid (a missing pid degrades the checker
+    // gracefully rather than planting a crumb that can never match a live
+    // process). Best-effort by contract (never throws).
+    if (Number.isInteger(claudeProcess.pid)) {
+      await writeChildBreadcrumb(
+        job.id,
+        {
+          pid: claudeProcess.pid as number,
+          spawnedAt: new Date().toISOString(),
+          workDir,
+          projectsDir,
+        },
+        (m) => log(job.id, m),
+      );
+    }
+
     const stateWatcher = watchStateFile(job, workDir);
 
     // S69: pass getStdout so waitForProcess can compute in-flight cost
     // estimates and trip MAX_JOB_COST_CENTS. Back-compat: arg is optional;
     // callers that don't pass it (none currently) just skip the cost check.
     const { code: exitCode, killReason } = await waitForProcess(claudeProcess, job, getStdout);
+
+    // S197 (§4.2, Gemini CRITICAL-1): the child's exit is now OBSERVED —
+    // delete the breadcrumb HERE, not at the end of executeJob. The S129 gate
+    // + uploads below can legitimately run 15+ min with no DB movement; a
+    // crumb lingering through that tail would false-storm the checker's
+    // CHILD_DEAD_JOB_RUNNING on every healthy run.
+    await deleteChildBreadcrumb(job.id, (m) => log(job.id, m));
+
     exitCodeForUsage = exitCode;
     stdoutForUsage = getStdout();
 
@@ -679,6 +737,10 @@ export async function executeJob(job: ResearchJob): Promise<string> {
     finalStatus = "complete";
     return slug;
   } finally {
+    // S197 (§4.2) failsafe: covers throw paths between the breadcrumb write
+    // and the post-waitForProcess delete (e.g. waitForProcess itself throwing).
+    // Idempotent + never throws; on the normal path the crumb is already gone.
+    await deleteChildBreadcrumb(job.id, (m) => log(job.id, m));
     if (spawnSucceeded) {
       try {
         const sb = createClient(SUPABASE_URL, SUPABASE_KEY);

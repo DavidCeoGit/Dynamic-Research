@@ -75,7 +75,12 @@ const STUDIO_ORDER = STUDIO_PRODUCT_LIST;
 // Conventions product name → NotebookLM CLI type. The CLI uses "slide-deck"
 // for what conventions calls "slides"; both `artifact list --type` and
 // `download <type>` take this value. Cinematic videos share the "video" type.
-const PRODUCT_TO_NLM_TYPE: Record<string, string> = {
+// S197: exported READONLY for the studio-product-checker (design §5.1, Codex
+// MINOR) — the checker must import this map, never re-author it (the regen
+// script's separate PRODUCT_DEFS is the drift this single-source prevents).
+// A parity test (studio-product-checker.test.ts) pins slides → slide-deck +
+// key-set equality with STUDIO_PRODUCT_LIST.
+export const PRODUCT_TO_NLM_TYPE: Readonly<Record<string, string>> = {
   audio: "audio",
   video: "video",
   slides: "slide-deck",

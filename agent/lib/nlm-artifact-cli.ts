@@ -186,6 +186,141 @@ export function realListArtifactsWithStatus(
   }
 }
 
+// ── S197 structured-error list variant (studio-product-checker §5.1) ──
+
+export type DetailedListFailureReason = "auth" | "cli-crash" | "timeout" | "parse";
+
+/**
+ * S197 (checker design §5.1, Gemini CRITICAL-2): the null-contract wrappers
+ * above collapse EVERY failure mode — auth-redirect, cp1252 crash, timeout,
+ * bad JSON — into a silent `null`, which makes the checker's auth-degraded
+ * classification (§5.2 #8) impossible through them. This ADDITIVE variant
+ * returns a structured failure instead. The null-contract functions and every
+ * existing consumer (gate / sweep / regen) are UNTOUCHED.
+ */
+export type DetailedListResult =
+  | { ok: true; artifacts: NlmArtifactRefWithStatus[] }
+  | { ok: false; reason: DetailedListFailureReason; detail: string };
+
+/**
+ * Auth-expiry signatures observed from the NLM CLI when storage_state.json
+ * cookies have rotated: the CLI prints an "Authentication expired" style
+ * message and/or the accounts.google.com redirect URL (Bug 5 family; the
+ * slash prompt's poll loop keys on the same signature — research-compare.md
+ * auth probe). Scanned across BOTH streams (the CLI splits errors).
+ */
+const AUTH_FAILURE_PATTERNS: RegExp[] = [
+  /authentication (has )?expired/i,
+  /accounts\.google\.com/i,
+  /not (currently )?authenticated/i,
+  /re-?run .*auth login/i,
+];
+
+/** Minimal spawnSync-shaped result the pure classifier below consumes —
+ * injectable so every classification branch is unit-testable (the S160/S162
+ * spawn-seam precedent). */
+export interface DetailedListSpawnResult {
+  status: number | null;
+  signal: string | null;
+  stdout?: string;
+  stderr?: string;
+  errorCode?: string;
+}
+
+/**
+ * PURE classification of a captured list-spawn result (no IO, fully testable):
+ *   timeout   — spawnSync ETIMEDOUT / killed-by-signal with null status
+ *   auth      — auth-expiry signature on either stream (any exit code)
+ *   cli-crash — any other non-zero exit
+ *   parse     — exit 0 but non-JSON / non-array payload
+ */
+export function classifyDetailedList(r: DetailedListSpawnResult): DetailedListResult {
+  const combined = [r.stderr, r.stdout].filter(Boolean).join("\n");
+  if (r.errorCode === "ETIMEDOUT" || (r.status === null && r.signal)) {
+    return {
+      ok: false,
+      reason: "timeout",
+      detail: `list timed out (signal=${r.signal ?? "?"})`.slice(0, 500),
+    };
+  }
+  if (r.status !== 0) {
+    if (AUTH_FAILURE_PATTERNS.some((re) => re.test(combined))) {
+      return { ok: false, reason: "auth", detail: combined.slice(0, 500) };
+    }
+    return {
+      ok: false,
+      reason: "cli-crash",
+      detail: `exit ${r.status}: ${combined}`.slice(0, 500),
+    };
+  }
+  // Exit 0 can still carry an auth redirect on some CLI paths — check before parse.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(r.stdout ?? "");
+  } catch {
+    if (AUTH_FAILURE_PATTERNS.some((re) => re.test(combined))) {
+      return { ok: false, reason: "auth", detail: combined.slice(0, 500) };
+    }
+    return {
+      ok: false,
+      reason: "parse",
+      detail: `non-JSON stdout: ${(r.stdout ?? "").slice(0, 300)}`,
+    };
+  }
+  const artsRaw = (parsed as { artifacts?: unknown })?.artifacts;
+  if (!Array.isArray(artsRaw)) {
+    return { ok: false, reason: "parse", detail: "artifacts is not an array" };
+  }
+  const arts = artsRaw
+    .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
+    .map((a) => ({
+      id: typeof a.id === "string" ? a.id : "",
+      title: typeof a.title === "string" ? a.title : "",
+      created_at: typeof a.created_at === "string" ? a.created_at : "",
+      status_id: typeof a.status_id === "number" ? a.status_id : undefined,
+    }))
+    .filter((a) => a.id !== "");
+  arts.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
+  return { ok: true, artifacts: arts };
+}
+
+/**
+ * List ALL artifacts of a type (ANY status), newest-first, WITH status_id —
+ * same data as realListArtifactsWithStatus but with a structured error
+ * instead of null. Never throws (the S162 whole-body guard: spawnSync throws
+ * synchronously on an invalid arg — empty NLM_BIN, NUL byte).
+ */
+export function realListArtifactsWithStatusDetailed(
+  notebookId: string,
+  nlmType: string,
+): DetailedListResult {
+  try {
+    const r = spawnSync(
+      NLM_BIN,
+      ["artifact", "list", "-n", notebookId, "--type", nlmType, "--json"],
+      {
+        encoding: "utf-8",
+        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 60_000,
+      },
+    );
+    return classifyDetailedList({
+      status: r.status,
+      signal: r.signal ?? null,
+      stdout: r.stdout,
+      stderr: r.stderr,
+      errorCode: (r.error as NodeJS.ErrnoException | undefined)?.code,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "cli-crash",
+      detail: `spawn threw: ${(err as Error).message}`.slice(0, 500),
+    };
+  }
+}
+
 /**
  * Default spawnSync timeout for the in-gate recovery download. The decoupled
  * sweep passes a SHORTER timeout (~90s) so a per-tick budget can bound added
