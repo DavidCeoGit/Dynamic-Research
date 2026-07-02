@@ -30,8 +30,10 @@ import {
   summarizeStateProgress,
   makeStateSync,
   MAX_PHASE_STATUS_LEN,
+  MAX_PHASE_LEN,
   SAME_PHASE_STATUS_MIN_INTERVAL_MS,
 } from "../lib/state-evaluation.js";
+import type { StateSyncDeps } from "../lib/state-evaluation.js";
 import type { StateReadResult } from "../lib/read-state-file.js";
 import type { PipelineState, ResearchJob } from "../types.js";
 
@@ -201,6 +203,25 @@ describe("summarizeStateProgress — status normalization (S199 Gemini MAJOR/MIN
     assert.equal(r.phaseName, "8");
     assert.equal(typeof r.phaseName, "string");
     assert.equal(typeof r.phase, "string");
+  });
+
+  test("lens F1: a runaway phase string is capped — phase AND phaseName never exceed MAX_PHASE_LEN", () => {
+    const huge = "z".repeat(1_000_000);
+    const r = summarizeStateProgress(mk(huge, "ok"), "", 0, "");
+    assert.equal(r.kind, "update");
+    if (r.kind !== "update") return;
+    assert.equal(r.phase.length, MAX_PHASE_LEN);
+    assert.equal(r.phaseName.length, MAX_PHASE_LEN);
+  });
+
+  test("lens F2: missing / null / empty phase → malformed, never a blank current_phase write", () => {
+    // Old code emitted current_phase: undefined (stripped by JSON.stringify —
+    // silently load-bearing: the DB column kept its last good value). The v3
+    // String() normalization would have BLANKED it. Must be malformed instead.
+    const missingPhase = { phase_status: "heartbeat poll 7" } as unknown as PipelineState;
+    assert.equal(summarizeStateProgress(missingPhase, "5.5", 70, "x").kind, "malformed");
+    assert.equal(summarizeStateProgress(mk(null, "hb"), "5.5", 70, "x").kind, "malformed");
+    assert.equal(summarizeStateProgress(mk("", "hb"), "5.5", 70, "x").kind, "malformed");
   });
 });
 
@@ -429,5 +450,41 @@ describe("makeStateSync — throttle / revert-on-failure / stop-flush", () => {
     h.setState("5", "running");
     await h.sync.syncOnce(true);
     assert.equal(h.calls.length, 1);
+  });
+
+  test("lens F4: a failed flush PATCH reverts, and the immediate second unthrottled pass lands the dying text", async () => {
+    const h = harness();
+    h.setState("5.5", "poll 1");
+    await h.sync.syncOnce(true); // write 1
+    assert.equal(h.calls.length, 1);
+
+    h.advance(10_000);
+    h.setState("5.5", "ERROR: PUBLISH fail-closed — dying words");
+    h.failNext(1);
+    await h.sync.syncOnce(false); // flush shot 1: PATCH fails → dedupe reverted
+    assert.equal(h.calls.length, 1);
+
+    await h.sync.syncOnce(false); // flush shot 2 (stop()'s retry): re-seen → lands
+    assert.equal(h.calls.length, 2);
+    assert.equal(h.calls[1].phase_status, "ERROR: PUBLISH fail-closed — dying words");
+  });
+
+  test("lens INFO: a SYNCHRONOUSLY-throwing update seam still reverts (try/catch, not .catch)", async () => {
+    let callNo = 0;
+    const landed: string[] = [];
+    const sync = makeStateSync(JOB, "wd-irrelevant", {
+      readState: async () =>
+        ({ kind: "ok", state: mk("5", "x"), path: "p" }) as StateReadResult,
+      update: ((_id: string, patch: { current_phase: string }) => {
+        if (callNo++ === 0) throw new Error("synchronous throw, not a rejection");
+        landed.push(patch.current_phase);
+        return Promise.resolve();
+      }) as unknown as StateSyncDeps["update"],
+      now: () => 0,
+    });
+    await sync.syncOnce(true); // must not escape as an unhandled throw; must revert
+    assert.deepEqual(landed, []);
+    await sync.syncOnce(true); // revert made the transition re-seen → retried
+    assert.deepEqual(landed, ["Synthesis"]);
   });
 });

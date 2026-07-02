@@ -346,24 +346,31 @@ export async function executeJob(job: ResearchJob): Promise<string> {
 
     const stateWatcher = watchStateFile(job, workDir);
 
-    // S69: pass getStdout so waitForProcess can compute in-flight cost
-    // estimates and trip MAX_JOB_COST_CENTS. Back-compat: arg is optional;
-    // callers that don't pass it (none currently) just skip the cost check.
-    const { code: exitCode, killReason } = await waitForProcess(claudeProcess, job, getStdout);
+    let waitOutcome!: Awaited<ReturnType<typeof waitForProcess>>;
+    try {
+      // S69: pass getStdout so waitForProcess can compute in-flight cost
+      // estimates and trip MAX_JOB_COST_CENTS. Back-compat: arg is optional;
+      // callers that don't pass it (none currently) just skip the cost check.
+      waitOutcome = await waitForProcess(claudeProcess, job, getStdout);
 
-    // S197 (§4.2, Gemini CRITICAL-1): the child's exit is now OBSERVED —
-    // delete the breadcrumb HERE, not at the end of executeJob. The S129 gate
-    // + uploads below can legitimately run 15+ min with no DB movement; a
-    // crumb lingering through that tail would false-storm the checker's
-    // CHILD_DEAD_JOB_RUNNING on every healthy run.
-    await deleteChildBreadcrumb(job.id, (m) => log(job.id, m));
+      // S197 (§4.2, Gemini CRITICAL-1): the child's exit is now OBSERVED —
+      // delete the breadcrumb HERE, not at the end of executeJob. The S129 gate
+      // + uploads below can legitimately run 15+ min with no DB movement; a
+      // crumb lingering through that tail would false-storm the checker's
+      // CHILD_DEAD_JOB_RUNNING on every healthy run.
+      await deleteChildBreadcrumb(job.id, (m) => log(job.id, m));
+    } finally {
+      // S199 F2: stop in a FINALLY so a waitForProcess rejection (child
+      // "error" event) can't leak a live watcher into the daemon — it would
+      // PATCH on every 30s text change for the daemon's lifetime. AWAITED so
+      // the final progress flush settles before any terminal completeJob/
+      // failJob write downstream. stop() is idempotent.
+      await stateWatcher.stop();
+    }
+    const { code: exitCode, killReason } = waitOutcome;
 
     exitCodeForUsage = exitCode;
     stdoutForUsage = getStdout();
-
-    // S199 F2: AWAIT the watcher's final progress flush so it can never land
-    // after the terminal completeJob/failJob writes downstream.
-    await stateWatcher.stop();
 
     // S136 Layer 2: a MAX_JOB_DURATION cap-kill whose studio artifacts already
     // finished in NotebookLM should be RECOVERED (download → upload → complete)
@@ -861,10 +868,15 @@ async function runStudioOnly(
   const stateWatcher = watchStateFile(job, workDir);
   // S136: waitForProcess now returns {code, killReason}; the studio-only regen
   // path keeps its existing fail-fast behavior (no duration recovery here yet).
-  const { code: exitCode } = await waitForProcess(child, job);
-  // S199 F2: await the final flush — same terminal-write ordering guarantee as
-  // the main path.
-  await stateWatcher.stop();
+  let waitOutcome!: Awaited<ReturnType<typeof waitForProcess>>;
+  try {
+    waitOutcome = await waitForProcess(child, job);
+  } finally {
+    // S199 F2: finally + awaited — same watcher-leak-proofing and
+    // terminal-write ordering guarantee as the main path.
+    await stateWatcher.stop();
+  }
+  const { code: exitCode } = waitOutcome;
 
   if (exitCode !== 0) {
     const reason = await readStudioFailureReason(workDir, exitCode);

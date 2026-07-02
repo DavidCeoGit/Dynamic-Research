@@ -72,6 +72,13 @@ export function recoverableNotebookId(state: PipelineState | null): string | nul
 // legitimate status line observed in prod. Exported for tests. (S199 F2.)
 export const MAX_PHASE_STATUS_LEN = 500;
 
+// Same cap idea for the phase key: `phase` is written by the SAME untrusted
+// child, and an uncapped phase would flow into current_phase, the PATCH body,
+// and a worker.log line — the exact saturation the status cap exists to stop,
+// one key over. Legitimate phases are ≤4 chars ("5.5a"); 100 is generous.
+// Exported for tests. (fresh-lens MAJOR F1, S199.)
+export const MAX_PHASE_LEN = 100;
+
 /** Discriminated outcome of summarizing an OK-parsed state into a progress
  * update. "malformed" = the parsed JSON object's phase/phase_status are not
  * usable primitives (see summarizeStateProgress). "status-update" = same
@@ -120,9 +127,19 @@ export function summarizeStateProgress(
   // (number) must map/compare identically to `"5"`, and an unknown numeric
   // phase must not leak a NUMBER into current_phase — the frontend route
   // schema requires a string (frontend/lib/validate.ts z.string()) and would
-  // 400 the whole PATCH. Post-guard `phase` is a primitive, never throws.
-  // (Codex MERGE MINOR, S199.)
-  const phaseKey = String(phase ?? "");
+  // 400 the whole PATCH. Capped like the status text (fresh-lens F1: an
+  // uncapped phase is the same saturation vector one key over). Post-guard
+  // `phase` is a primitive, never throws. (Codex MERGE MINOR + lens F1, S199.)
+  const phaseKey = String(phase ?? "").slice(0, MAX_PHASE_LEN);
+  // A missing/null/empty phase is NOT a usable progress signal. The pre-S199
+  // code emitted `current_phase: undefined`, which JSON.stringify STRIPPED
+  // from the PATCH — silently load-bearing protection: the DB column kept its
+  // last good value. Explicitly coercing to "" would instead BLANK the live
+  // process page on one partial/drifted heartbeat write (fresh-lens MAJOR F2,
+  // reproduced). Route it to the malformed path: logged once, synced never.
+  if (phaseKey === "") {
+    return { kind: "malformed", detail: "phase is missing/empty" };
+  }
   const mapped = PHASE_MAP[phaseKey];
   const pct = mapped?.pct ?? lastPct;
   const phaseName = mapped?.name ?? phaseKey;
@@ -186,10 +203,12 @@ export interface StateSyncDeps {
  *     never throttled.
  *   - throttled=false (the stop() flush): the throttle is bypassed so the
  *     final child-written status — possibly read on a throttled tick,
- *     possibly written in the last ≤5s — reaches the DB. failJob writes only
- *     status/error_message, never phase_status, so without this flush a
- *     child's dying message ("Fatal error: …") would be silently lost behind
- *     a stale heartbeat. (Gemini MERGE CRITICAL, S199.)
+ *     possibly written in the last ≤5s — reaches the DB (BEST EFFORT: the
+ *     caller retries the flush once; a persistent outage at exit can still
+ *     lose it — fresh-lens F4). failJob writes only status/error_message,
+ *     never phase_status, so without this flush a child's dying message
+ *     ("Fatal error: …") would be silently lost behind a stale heartbeat.
+ *     (Gemini MERGE CRITICAL, S199.)
  *   - dedupe state advances BEFORE the await (overlapping passes must not
  *     double-send during a slow PATCH) and REVERTS on a failed PATCH so a
  *     later pass RETRIES instead of permanently blinding the worker to a
@@ -275,18 +294,21 @@ export function makeStateSync(
 
     // All three fields on BOTH kinds: every PATCH is best-effort, so any later
     // successful write self-heals whatever an earlier failed one left stale.
-    await deps
-      .update(job.id, {
+    // try/catch (not .catch) so even a SYNCHRONOUSLY-throwing update seam
+    // still reverts — a promise-attached .catch never materializes if the
+    // call itself throws (fresh-lens INFO, S199).
+    try {
+      await deps.update(job.id, {
         current_phase: summary.phaseName,
         phase_status: summary.phaseStatus,
         progress_pct: summary.pct,
-      })
-      .catch((err) => {
-        lastPhase = prevPhase;
-        lastPct = prevPct;
-        lastPhaseStatus = prevStatus;
-        log(job.id, `Failed to update progress: ${err}`);
       });
+    } catch (err) {
+      lastPhase = prevPhase;
+      lastPct = prevPct;
+      lastPhaseStatus = prevStatus;
+      log(job.id, `Failed to update progress: ${err}`);
+    }
   };
 
   // ── Pass serialization (Codex MERGE MAJOR-1, S199) ──
@@ -310,10 +332,19 @@ export function makeStateSync(
   return { syncOnce };
 }
 
+// Abort bound on every progress-sync PATCH. fetch/undici has NO default
+// request timeout (only ~300s header/body timeouts a trickling response
+// resets), and the executor now AWAITS the stop() flush before its terminal
+// writes — an unbounded hung PATCH would gate job completion for its full
+// duration (fresh-lens MAJOR F3, 15s+ demonstrated live). 30s >> a healthy
+// PATCH (~100-300ms); an aborted PATCH rejects → catch-revert → paced retry.
+const SYNC_PATCH_TIMEOUT_MS = 30_000;
+
 export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
   const sync = makeStateSync(job, workDir, {
     readState: readPipelineState,
-    update: updateJob,
+    update: (id, patch) =>
+      updateJob(id, patch, { signal: AbortSignal.timeout(SYNC_PATCH_TIMEOUT_MS) }),
     now: Date.now,
   });
   let stopped = false;
@@ -343,11 +374,18 @@ export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher 
       // RETURNED so the executor awaits it BEFORE its terminal writes: a
       // floating flush could land after completeJob/failJob on a fast
       // terminal path and leave a completed row displaying stale progress
-      // (Codex MAJOR-2). The flush is still what carries a child's dying
+      // (Codex MAJOR-2). The flush is what carries a child's dying
       // phase_status past the throttle window — failJob never writes
-      // phase_status (Gemini C-2). (S199)
+      // phase_status (Gemini C-2). TWO passes, not one: the second is a free
+      // no-op when the first succeeded ("unchanged") and a single bounded
+      // retry when the first hit a transient read blip or a failed PATCH
+      // (which reverted the dedupe state, so the text is re-seen). BEST
+      // EFFORT, not a guarantee — a persistent outage at exit can still lose
+      // the final text (fresh-lens F4). Worst-case stop() latency stays
+      // bounded by the per-PATCH abort: ≤ ~3 × SYNC_PATCH_TIMEOUT_MS. (S199)
       flushPromise = sync
         .syncOnce(false)
+        .then(() => sync.syncOnce(false))
         .catch((err) => log(job.id, `progress sync flush failed unexpectedly: ${err}`));
       return flushPromise;
     },
