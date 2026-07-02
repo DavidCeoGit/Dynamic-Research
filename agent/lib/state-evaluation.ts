@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import { updateJob } from "../api-client.js";
-import { readPipelineState } from "./read-state-file.js";
+import { readPipelineState, type StateReadResult } from "./read-state-file.js";
 import { findStateFile } from "./find-state-file.js";
 import { obligedProducts } from "./studio-completeness.js";
 import { pickWinners } from "./studio-winner.js";
@@ -29,7 +29,12 @@ function log(context: string, msg: string): void {
 // ── State file watcher ──────────────────────────────────────────────
 
 export interface StateWatcher {
-  stop: () => void;
+  /** Stops the poll AND fires the final unthrottled progress flush. Resolves
+   * when the flush PATCH has settled — callers MUST await it before writing
+   * terminal job state (completeJob/failJob), or a floating flush could land
+   * after the terminal PATCH and regress the row's display fields. (Gemini
+   * C-2 + Codex MAJOR-2, S199.) */
+  stop: () => Promise<void>;
 }
 
 // ── State-field coercion safety (S166/S168) ─────────────────────────
@@ -60,13 +65,30 @@ export function recoverableNotebookId(state: PipelineState | null): string | nul
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
+// Cap on the phase_status text mirrored to the DB. The text is written by the
+// LLM child and is unbounded in principle; each PATCH (and the frontend's 5s
+// poll of the row) would otherwise carry whatever it wrote — a runaway child
+// dumping context into phase_status must not saturate the row. ~4x the longest
+// legitimate status line observed in prod. Exported for tests. (S199 F2.)
+export const MAX_PHASE_STATUS_LEN = 500;
+
+// Same cap idea for the phase key: `phase` is written by the SAME untrusted
+// child, and an uncapped phase would flow into current_phase, the PATCH body,
+// and a worker.log line — the exact saturation the status cap exists to stop,
+// one key over. Legitimate phases are ≤4 chars ("5.5a"); 100 is generous.
+// Exported for tests. (fresh-lens MAJOR F1, S199.)
+export const MAX_PHASE_LEN = 100;
+
 /** Discriminated outcome of summarizing an OK-parsed state into a progress
  * update. "malformed" = the parsed JSON object's phase/phase_status are not
- * usable primitives (see summarizeStateProgress). */
+ * usable primitives (see summarizeStateProgress). "status-update" = same
+ * (phase, pct) but the phase_status TEXT changed — the caller throttles these
+ * (they can recur every poll tick), unlike phase-transition "update"s. */
 export type ProgressSummary =
   | { kind: "malformed"; detail: string }
   | { kind: "unchanged" }
-  | { kind: "update"; phase: string; phaseName: string; pct: number; phaseStatus: string };
+  | { kind: "update"; phase: string; phaseName: string; pct: number; phaseStatus: string }
+  | { kind: "status-update"; phase: string; phaseName: string; pct: number; phaseStatus: string };
 
 /**
  * Pure + total: map an OK-parsed state to a progress-update decision. NEVER
@@ -81,37 +103,133 @@ export type ProgressSummary =
  * log — the old whole-tick try/catch silently swallowed it; this guard restores
  * that safety while still surfacing it as a (deduped) signal. (Codex MERGE
  * CRITICAL, S166.) Exported for unit testing.
+ *
+ * S199 F2: dedupe used to key on (phase, pct) only, so same-phase changes to
+ * the phase_status TEXT never reached the DB — the process page sat on a
+ * ~50-min-stale label through an entire Studio render (run 8bcd4644) even
+ * though state.json was fresh. A same-(phase, pct) state whose phase_status
+ * differs from lastPhaseStatus is now its own "status-update" kind so the
+ * caller can sync it WITH throttling (status text can change every tick;
+ * phase transitions can't).
  */
 export function summarizeStateProgress(
   state: PipelineState,
   lastPhase: string,
   lastPct: number,
+  lastPhaseStatus: string,
 ): ProgressSummary {
   const phase: unknown = state.phase;
   const phaseStatus: unknown = state.phase_status;
   if (isNonPrimitiveStateField(phase) || isNonPrimitiveStateField(phaseStatus)) {
     return { kind: "malformed", detail: "phase/phase_status is not a primitive" };
   }
-  const phaseKey = phase as string;
+  // Normalize the phase to a STRING too: a child writing JSON `"phase": 5`
+  // (number) must map/compare identically to `"5"`, and an unknown numeric
+  // phase must not leak a NUMBER into current_phase — the frontend route
+  // schema requires a string (frontend/lib/validate.ts z.string()) and would
+  // 400 the whole PATCH. Capped like the status text (fresh-lens F1: an
+  // uncapped phase is the same saturation vector one key over). Post-guard
+  // `phase` is a primitive, never throws. (Codex MERGE MINOR + lens F1, S199.)
+  const phaseKey = String(phase ?? "").slice(0, MAX_PHASE_LEN);
+  // A missing/null/empty phase is NOT a usable progress signal. The pre-S199
+  // code emitted `current_phase: undefined`, which JSON.stringify STRIPPED
+  // from the PATCH — silently load-bearing protection: the DB column kept its
+  // last good value. Explicitly coercing to "" would instead BLANK the live
+  // process page on one partial/drifted heartbeat write (fresh-lens MAJOR F2,
+  // reproduced). Route it to the malformed path: logged once, synced never.
+  if (phaseKey === "") {
+    return { kind: "malformed", detail: "phase is missing/empty" };
+  }
   const mapped = PHASE_MAP[phaseKey];
   const pct = mapped?.pct ?? lastPct;
   const phaseName = mapped?.name ?? phaseKey;
+  // Normalize once: always a STRING — a missing/null/non-string primitive
+  // status coerces (so it can neither desync the dedupe comparison nor be
+  // silently stripped from the PATCH payload by JSON.stringify) — and
+  // truncated to the DB cap. Post-guard `phaseStatus` is a primitive, so
+  // String() never throws. Dedupe compares EXACTLY what would be written.
+  // (Gemini MERGE MAJOR + MINOR, S199.)
+  const statusText = (
+    typeof phaseStatus === "string" ? phaseStatus : String(phaseStatus ?? "")
+  ).slice(0, MAX_PHASE_STATUS_LEN);
   if (phaseKey === lastPhase && pct === lastPct) {
-    return { kind: "unchanged" };
+    if (statusText === lastPhaseStatus) {
+      return { kind: "unchanged" };
+    }
+    return {
+      kind: "status-update",
+      phase: phaseKey,
+      phaseName,
+      pct,
+      phaseStatus: statusText,
+    };
   }
   return {
     kind: "update",
     phase: phaseKey,
     phaseName,
     pct,
-    phaseStatus: phaseStatus as string,
+    phaseStatus: statusText,
   };
 }
 
-export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
+// Same-phase status-text writes are throttled to one per this window; phase
+// TRANSITIONS are never throttled. 30s matches the cadence of the slash
+// prompt's Studio-poll heartbeat (which rewrites state.json phase_status
+// ~every 30s without moving phase) while bounding Supabase PATCH traffic to
+// ≤2 writes/min per job against the 5s poll tick. Exported for tests. (S199 F2)
+export const SAME_PHASE_STATUS_MIN_INTERVAL_MS = 30_000;
+
+/** Injectable seams for makeStateSync — real wiring lives in watchStateFile;
+ * tests drive syncOnce with fakes (the throttle / revert-on-failure / flush
+ * behavior is otherwise locked inside a real setInterval + live Supabase
+ * client and untestable). */
+export interface StateSyncDeps {
+  readState: (workDir: string) => Promise<StateReadResult>;
+  update: (
+    id: string,
+    patch: { current_phase: string; phase_status: string; progress_pct: number },
+  ) => Promise<unknown>; // updateJob returns Promise<ResearchJob>; the sync only awaits/catches
+  now: () => number;
+}
+
+/**
+ * One read → classify → PATCH pass over the newest state file, factored out of
+ * watchStateFile so its failure semantics are unit-testable:
+ *   - throttled=true (the 5s interval tick): a same-phase "status-update"
+ *     within SAME_PHASE_STATUS_MIN_INTERVAL_MS of the last write is SKIPPED
+ *     without recording the new text — re-seen next tick, lands when the
+ *     window opens (deferred, not dropped). Phase-transition "update"s are
+ *     never throttled.
+ *   - throttled=false (the stop() flush): the throttle is bypassed so the
+ *     final child-written status — possibly read on a throttled tick,
+ *     possibly written in the last ≤5s — reaches the DB (BEST EFFORT: the
+ *     caller retries the flush once; a persistent outage at exit can still
+ *     lose it — fresh-lens F4). failJob writes only status/error_message,
+ *     never phase_status, so without this flush a child's dying message
+ *     ("Fatal error: …") would be silently lost behind a stale heartbeat.
+ *     (Gemini MERGE CRITICAL, S199.)
+ *   - dedupe state advances BEFORE the await (overlapping passes must not
+ *     double-send during a slow PATCH) and REVERTS on a failed PATCH so a
+ *     later pass RETRIES instead of permanently blinding the worker to a
+ *     DB↔state mismatch — a transiently-failed phase-transition write used
+ *     to leave the row stale for the remainder of the phase. Retries stay
+ *     paced: 5s for phase transitions, the 30s window for same-phase text
+ *     (the throttle clock is deliberately NOT reverted). (Gemini MERGE
+ *     CRITICAL, S199.)
+ * Total: never throws — readState is total by contract (typed StateReadResult,
+ * see read-state-file.ts), summarizeStateProgress is total, the PATCH is
+ * .catch'd.
+ */
+export function makeStateSync(
+  job: ResearchJob,
+  workDir: string,
+  deps: StateSyncDeps,
+): { syncOnce: (throttled: boolean) => Promise<void> } {
   let lastPhase = "";
   let lastPct = 0;
-  let stopped = false;
+  let lastPhaseStatus = "";
+  let lastProgressWriteMs = 0;
   // Dedupe: a present-but-unusable state file (unparseable OR a JSON object with
   // non-primitive phase/phase_status) is logged ONCE per bad episode — the 5s
   // poll would otherwise spam every tick. Re-armed after the next usable parse.
@@ -124,14 +242,12 @@ export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher 
     }
   };
 
-  const interval = setInterval(async () => {
-    if (stopped) return;
-
-    const result = await readPipelineState(workDir);
+  const doSync = async (throttled: boolean): Promise<void> => {
+    const result = await deps.readState(workDir);
 
     // ABSENT (not written yet) and transient IO (file vanished/locked between
     // find and read, or workdir not yet enumerable) are EXPECTED during a live
-    // run — ignore and retry on the next tick.
+    // run — ignore and retry on the next pass.
     if (result.kind === "absent" || result.kind === "io-error") return;
 
     if (result.kind === "corrupt") {
@@ -143,35 +259,135 @@ export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher 
 
     // kind === "ok": the helper guarantees a JSON object but NOT primitive
     // fields; summarizeStateProgress is total and flags a non-primitive
-    // phase/phase_status as "malformed" instead of throwing inside this async
-    // interval (Codex MERGE CRITICAL, S166).
-    const summary = summarizeStateProgress(result.state, lastPhase, lastPct);
+    // phase/phase_status as "malformed" instead of throwing inside an async
+    // interval tick (Codex MERGE CRITICAL, S166).
+    const summary = summarizeStateProgress(result.state, lastPhase, lastPct, lastPhaseStatus);
     if (summary.kind === "malformed") {
       noteCorrupt(summary.detail);
       return;
     }
 
-    loggedCorrupt = false; // re-arm: a usable state parsed cleanly this tick
+    loggedCorrupt = false; // re-arm: a usable state parsed cleanly this pass
+    if (summary.kind === "unchanged") return;
+    if (
+      summary.kind === "status-update" &&
+      throttled &&
+      deps.now() - lastProgressWriteMs < SAME_PHASE_STATUS_MIN_INTERVAL_MS
+    ) {
+      // Throttled: skip WITHOUT recording the new text — deferred, not dropped.
+      return;
+    }
+
+    const prevPhase = lastPhase;
+    const prevPct = lastPct;
+    const prevStatus = lastPhaseStatus;
+    lastPhase = summary.phase;
+    lastPct = summary.pct;
+    lastPhaseStatus = summary.phaseStatus;
+    lastProgressWriteMs = deps.now();
+
     if (summary.kind === "update") {
-      lastPhase = summary.phase;
-      lastPct = summary.pct;
-
       log(job.id, `Phase: ${summary.phaseName} (${summary.pct}%) — ${summary.phaseStatus}`);
+    } else {
+      log(job.id, `Status: ${summary.phaseStatus}`);
+    }
 
-      await updateJob(job.id, {
+    // All three fields on BOTH kinds: every PATCH is best-effort, so any later
+    // successful write self-heals whatever an earlier failed one left stale.
+    // try/catch (not .catch) so even a SYNCHRONOUSLY-throwing update seam
+    // still reverts — a promise-attached .catch never materializes if the
+    // call itself throws (fresh-lens INFO, S199).
+    try {
+      await deps.update(job.id, {
         current_phase: summary.phaseName,
         phase_status: summary.phaseStatus,
         progress_pct: summary.pct,
-      }).catch((err) => {
-        log(job.id, `Failed to update progress: ${err}`);
       });
+    } catch (err) {
+      lastPhase = prevPhase;
+      lastPct = prevPct;
+      lastPhaseStatus = prevStatus;
+      log(job.id, `Failed to update progress: ${err}`);
     }
+  };
+
+  // ── Pass serialization (Codex MERGE MAJOR-1, S199) ──
+  // Every pass runs on ONE promise chain, so passes never overlap: a slow
+  // PATCH can neither resolve after a LATER pass's PATCH (out-of-order write
+  // permanently regressing the row — the in-memory cursor is already ahead,
+  // so no later tick repairs it) nor interleave with the catch-revert. Each
+  // pass also READS the state file only after its predecessor fully settled,
+  // so a chained flush always syncs the newest text. doSync is total, but the
+  // chain link swallows defensively so one rejection can't wedge all future
+  // passes; callers still observe their own pass's outcome via the returned
+  // (unswallowed) promise.
+  let chain: Promise<void> = Promise.resolve();
+
+  const syncOnce = (throttled: boolean): Promise<void> => {
+    const run = chain.then(() => doSync(throttled));
+    chain = run.catch(() => {});
+    return run;
+  };
+
+  return { syncOnce };
+}
+
+// Abort bound on every progress-sync PATCH. fetch/undici has NO default
+// request timeout (only ~300s header/body timeouts a trickling response
+// resets), and the executor now AWAITS the stop() flush before its terminal
+// writes — an unbounded hung PATCH would gate job completion for its full
+// duration (fresh-lens MAJOR F3, 15s+ demonstrated live). 30s >> a healthy
+// PATCH (~100-300ms); an aborted PATCH rejects → catch-revert → paced retry.
+const SYNC_PATCH_TIMEOUT_MS = 30_000;
+
+export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
+  const sync = makeStateSync(job, workDir, {
+    readState: readPipelineState,
+    update: (id, patch) =>
+      updateJob(id, patch, { signal: AbortSignal.timeout(SYNC_PATCH_TIMEOUT_MS) }),
+    now: Date.now,
+  });
+  let stopped = false;
+  let tickInFlight = false;
+  let flushPromise: Promise<void> | null = null;
+
+  const interval = setInterval(() => {
+    // Skip-if-busy: with the serialized chain a hung PATCH would otherwise
+    // queue a new pass every 5s unboundedly; at most one tick is ever queued.
+    if (stopped || tickInFlight) return;
+    tickInFlight = true;
+    // syncOnce is total by construction; the belt logs, never rejects unhandled.
+    sync
+      .syncOnce(true)
+      .catch((err) => log(job.id, `progress sync tick failed unexpectedly: ${err}`))
+      .finally(() => {
+        tickInFlight = false;
+      });
   }, 5_000);
 
   return {
-    stop() {
+    stop(): Promise<void> {
+      if (stopped) return flushPromise ?? Promise.resolve();
       stopped = true;
       clearInterval(interval);
+      // Final unthrottled flush — serialized behind any in-flight pass and
+      // RETURNED so the executor awaits it BEFORE its terminal writes: a
+      // floating flush could land after completeJob/failJob on a fast
+      // terminal path and leave a completed row displaying stale progress
+      // (Codex MAJOR-2). The flush is what carries a child's dying
+      // phase_status past the throttle window — failJob never writes
+      // phase_status (Gemini C-2). TWO passes, not one: the second is a free
+      // no-op when the first succeeded ("unchanged") and a single bounded
+      // retry when the first hit a transient read blip or a failed PATCH
+      // (which reverted the dedupe state, so the text is re-seen). BEST
+      // EFFORT, not a guarantee — a persistent outage at exit can still lose
+      // the final text (fresh-lens F4). Worst-case stop() latency stays
+      // bounded by the per-PATCH abort: ≤ ~3 × SYNC_PATCH_TIMEOUT_MS. (S199)
+      flushPromise = sync
+        .syncOnce(false)
+        .then(() => sync.syncOnce(false))
+        .catch((err) => log(job.id, `progress sync flush failed unexpectedly: ${err}`));
+      return flushPromise;
     },
   };
 }

@@ -99,11 +99,17 @@ export async function updateJob(
     studio_recovery_payload?: StudioRecoveryPayload | null;
     studio_recovery_error?: string | null;
   },
+  // S199 F2: optional abort seam so callers on latency-sensitive paths (the
+  // progress-sync flush that terminal writes now AWAIT) can bound a hung
+  // PATCH — fetch/undici has no default request timeout, only ~300s
+  // header/body timeouts that a trickling response resets indefinitely.
+  opts?: { signal?: AbortSignal },
 ): Promise<ResearchJob> {
   const res = await fetch(`${API_BASE}/api/queue/${id}`, {
     method: "PATCH",
     headers: agentHeaders(),
     body: JSON.stringify(update),
+    signal: opts?.signal,
   });
   await ensureOk(res, `updateJob(${id})`);
   return res.json() as Promise<ResearchJob>;

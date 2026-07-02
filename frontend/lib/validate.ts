@@ -398,8 +398,14 @@ export const planJsonRouteGuardSchema = z
 
 /** Schema for agent progress updates. */
 export const agentUpdateSchema = z.object({
-  current_phase: z.string().optional(),
-  phase_status: z.string().optional(),
+  // Length caps = defense-in-depth (S199 fresh-lens F1): the agent already
+  // truncates at its summarize boundary (MAX_PHASE_LEN=100 /
+  // MAX_PHASE_STATUS_LEN=500 in agent/lib/state-evaluation.ts), but the route
+  // must not accept a megabyte row-saturating value from any writer. Generous
+  // headroom over the agent caps so legitimate writers (completeJob etc.)
+  // never trip them.
+  current_phase: z.string().max(200).optional(),
+  phase_status: z.string().max(1000).optional(),
   progress_pct: z.number().int().min(0).max(100).optional(),
   status: z.enum(["pending", "running", "completed", "failed", "cancelled"]).optional(),
   result_slug: z.string().optional(),
