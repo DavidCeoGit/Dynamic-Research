@@ -62,11 +62,14 @@ export function recoverableNotebookId(state: PipelineState | null): string | nul
 
 /** Discriminated outcome of summarizing an OK-parsed state into a progress
  * update. "malformed" = the parsed JSON object's phase/phase_status are not
- * usable primitives (see summarizeStateProgress). */
+ * usable primitives (see summarizeStateProgress). "status-update" = same
+ * (phase, pct) but the phase_status TEXT changed — the caller throttles these
+ * (they can recur every poll tick), unlike phase-transition "update"s. */
 export type ProgressSummary =
   | { kind: "malformed"; detail: string }
   | { kind: "unchanged" }
-  | { kind: "update"; phase: string; phaseName: string; pct: number; phaseStatus: string };
+  | { kind: "update"; phase: string; phaseName: string; pct: number; phaseStatus: string }
+  | { kind: "status-update"; phase: string; phaseName: string; pct: number; phaseStatus: string };
 
 /**
  * Pure + total: map an OK-parsed state to a progress-update decision. NEVER
@@ -81,11 +84,20 @@ export type ProgressSummary =
  * log — the old whole-tick try/catch silently swallowed it; this guard restores
  * that safety while still surfacing it as a (deduped) signal. (Codex MERGE
  * CRITICAL, S166.) Exported for unit testing.
+ *
+ * S199 F2: dedupe used to key on (phase, pct) only, so same-phase changes to
+ * the phase_status TEXT never reached the DB — the process page sat on a
+ * ~50-min-stale label through an entire Studio render (run 8bcd4644) even
+ * though state.json was fresh. A same-(phase, pct) state whose phase_status
+ * differs from lastPhaseStatus is now its own "status-update" kind so the
+ * caller can sync it WITH throttling (status text can change every tick;
+ * phase transitions can't).
  */
 export function summarizeStateProgress(
   state: PipelineState,
   lastPhase: string,
   lastPct: number,
+  lastPhaseStatus: string,
 ): ProgressSummary {
   const phase: unknown = state.phase;
   const phaseStatus: unknown = state.phase_status;
@@ -97,7 +109,16 @@ export function summarizeStateProgress(
   const pct = mapped?.pct ?? lastPct;
   const phaseName = mapped?.name ?? phaseKey;
   if (phaseKey === lastPhase && pct === lastPct) {
-    return { kind: "unchanged" };
+    if ((phaseStatus as string) === lastPhaseStatus) {
+      return { kind: "unchanged" };
+    }
+    return {
+      kind: "status-update",
+      phase: phaseKey,
+      phaseName,
+      pct,
+      phaseStatus: phaseStatus as string,
+    };
   }
   return {
     kind: "update",
@@ -108,9 +129,18 @@ export function summarizeStateProgress(
   };
 }
 
+// Same-phase status-text writes are throttled to one per this window; phase
+// TRANSITIONS are never throttled. 30s matches the cadence of the slash
+// prompt's Studio-poll heartbeat (which rewrites state.json phase_status
+// ~every 30s without moving phase) while bounding Supabase PATCH traffic to
+// ≤2 writes/min per job against the 5s poll tick. (S199 F2)
+const SAME_PHASE_STATUS_MIN_INTERVAL_MS = 30_000;
+
 export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher {
   let lastPhase = "";
   let lastPct = 0;
+  let lastPhaseStatus = "";
+  let lastProgressWriteMs = 0;
   let stopped = false;
   // Dedupe: a present-but-unusable state file (unparseable OR a JSON object with
   // non-primitive phase/phase_status) is logged ONCE per bad episode — the 5s
@@ -145,7 +175,7 @@ export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher 
     // fields; summarizeStateProgress is total and flags a non-primitive
     // phase/phase_status as "malformed" instead of throwing inside this async
     // interval (Codex MERGE CRITICAL, S166).
-    const summary = summarizeStateProgress(result.state, lastPhase, lastPct);
+    const summary = summarizeStateProgress(result.state, lastPhase, lastPct, lastPhaseStatus);
     if (summary.kind === "malformed") {
       noteCorrupt(summary.detail);
       return;
@@ -155,9 +185,31 @@ export function watchStateFile(job: ResearchJob, workDir: string): StateWatcher 
     if (summary.kind === "update") {
       lastPhase = summary.phase;
       lastPct = summary.pct;
+      lastPhaseStatus = summary.phaseStatus;
+      lastProgressWriteMs = Date.now();
 
       log(job.id, `Phase: ${summary.phaseName} (${summary.pct}%) — ${summary.phaseStatus}`);
 
+      await updateJob(job.id, {
+        current_phase: summary.phaseName,
+        phase_status: summary.phaseStatus,
+        progress_pct: summary.pct,
+      }).catch((err) => {
+        log(job.id, `Failed to update progress: ${err}`);
+      });
+    } else if (summary.kind === "status-update") {
+      // Throttled tick: return WITHOUT recording the new text, so the change
+      // is re-seen next tick and lands once the window opens — deferred, not
+      // dropped (only the latest text is ever written).
+      if (Date.now() - lastProgressWriteMs < SAME_PHASE_STATUS_MIN_INTERVAL_MS) return;
+      lastPhaseStatus = summary.phaseStatus;
+      lastProgressWriteMs = Date.now();
+
+      log(job.id, `Status: ${summary.phaseStatus}`);
+
+      // All three fields, not phase_status alone: the phase-transition PATCH
+      // above is best-effort (.catch → log), so a failed one would otherwise
+      // leave a stale current_phase/progress_pct beside fresh status text.
       await updateJob(job.id, {
         current_phase: summary.phaseName,
         phase_status: summary.phaseStatus,
