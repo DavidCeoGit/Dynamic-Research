@@ -82,6 +82,9 @@ export const CONFIRM_SIGHTINGS: Record<AlertClass, number> = {
   WORKER_LOCATION_MISMATCH: 2,
   NLM_AUTH_DEGRADED: 2,
   NLM_CLI_BLIND: 3,
+  // Overridden dynamically in the latch pass (fresh-lens M-2, spec v4.1):
+  // the wedge confirms at ceil(wedgeQuietMs/cadence)+1 spaced sightings —
+  // the quiet period is CHECKER-OBSERVED, never artifact created_at age.
   CHILD_WEDGED_POST_STUDIO: 2,
   // S197 MERGE-gate addition (Codex MAJOR-4, mirrors row 9's philosophy): a
   // checker whose PID probes persistently fail must say "I am blind on
@@ -115,7 +118,9 @@ export interface CheckerConfig {
   tAppearMs: Record<string, number>;
   /** In-progress-render → stall-alert threshold per product (§5.4, video cap-clamped). */
   tRenderMs: Record<string, number>;
-  /** #10: quiet period after ALL products completed before wedge fires (25 min). */
+  /** #10: CHECKER-OBSERVED all-complete duration before the wedge confirms
+   * (25 min) — realized as ceil(wedgeQuietMs/cadence)+1 spaced sightings,
+   * never as artifact created_at age (that is submit time; fresh-lens M-2). */
   wedgeQuietMs: number;
   /** ± window for breadcrumb spawnedAt vs process CreationDate (§4.2). */
   pidCreationSlackMs: number;
@@ -388,6 +393,7 @@ export async function runStudioCheckerOnce(
   let workerCondition: "alive" | "dead" | "elsewhere" | "indeterminate" = "alive";
   let workerDetail = "";
   let workerProbeFailed = false;
+  let workerProbeAttempted = false;
   if (jobs.length > 0) {
     const workerPid = await deps.readWorkerPidFile();
     if (workerPid === null) {
@@ -396,12 +402,15 @@ export async function runStudioCheckerOnce(
       workerCondition = "dead";
       workerDetail = `.worker.pid absent at agentRuntimeDir()`;
     } else {
+      workerProbeAttempted = true;
       const probe = await deps.probePid(workerPid);
       if (!probe.ok) {
         workerCondition = "indeterminate";
         workerProbeFailed = true;
         workerDetail = `worker PID probe failed — skipping worker-liveness conditions this invocation`;
-      } else if (probe.exists && /worker/i.test(probe.commandLine ?? "")) {
+        // fresh-lens m-6: require the script name, not the bare word "worker" —
+        // this box runs other projects' node workers too.
+      } else if (probe.exists && /worker\.(ts|js)/i.test(probe.commandLine ?? "")) {
         workerCondition = "alive";
       } else {
         workerCondition = "dead";
@@ -433,6 +442,7 @@ export async function runStudioCheckerOnce(
   let authFailures = 0;
   let nonAuthFailures = 0;
   let probeFailures = workerProbeFailed ? 1 : 0;
+  let probesAttempted = workerProbeAttempted ? 1 : 0;
   // Codex MERGE M-2: keys whose check was SKIPPED this invocation (list
   // failure, missing state/notebook, probe failure, per-job throw). A frozen
   // key is neither incremented nor RECOVERED — "unobservable" must never
@@ -543,6 +553,7 @@ export async function runStudioCheckerOnce(
         spawnedMs !== null &&
         spawnedMs >= claimedMs;
       if (crumbFresh && crumb) {
+        probesAttempted++;
         const probe = await deps.probePid(crumb.pid);
         if (!probe.ok) {
           probeFailures++;
@@ -719,18 +730,26 @@ export async function runStudioCheckerOnce(
         selected.every((p) => completedAtMs[p] !== undefined) &&
         childAliveConfirmed
       ) {
+        // fresh-lens MERGE M-2: "quiet" must be CHECKER-OBSERVED time, not
+        // artifact created_at age — NLM stamps created_at at SUBMIT, so a
+        // healthy 40-min render is already "25 min quiet" the instant it
+        // completes, and the child is legitimately alive downloading + running
+        // Phase 6/7 (the S130 cry-wolf class). The observation therefore fires
+        // on every all-complete sighting and the QUIET requirement lives in
+        // the confirmation count: ceil(wedgeQuietMs/cadence)+1 consecutive
+        // sightings (~25+ min of observed all-complete) — see the confirm
+        // override in the latch pass. Spec §5.2 #10 amended accordingly (v4.1).
         const newest = Math.max(...selected.map((p) => completedAtMs[p]));
-        const quiet = now - newest;
-        if (quiet >= cfg.wedgeQuietMs) {
-          observations.push({
-            cls: "CHILD_WEDGED_POST_STUDIO",
-            jobId: job.id,
-            slug: job.topic_slug,
-            detail:
-              `all ${selected.length} selected products completed in NLM ${minutes(quiet)}min ago, child pid alive, ` +
-              `row still running (S133 wedged-child signature). ${statePhase} FYI — the duration cap is the backstop.`,
-          });
-        }
+        observations.push({
+          cls: "CHILD_WEDGED_POST_STUDIO",
+          jobId: job.id,
+          slug: job.topic_slug,
+          detail:
+            `all ${selected.length} selected products completed in NLM (newest submitted ` +
+            `${minutes(now - newest)}min ago), child pid alive, row still running — sustained ` +
+            `across ~${minutes(cfg.wedgeQuietMs)}min of checker observation (S133 wedged-child ` +
+            `signature). ${statePhase} FYI — the duration cap is the backstop.`,
+        });
       }
     } catch (err) {
       // Codex M-2: an errored job is UNOBSERVED, not condition-free — freeze
@@ -778,6 +797,22 @@ export async function runStudioCheckerOnce(
     });
   }
 
+  // fresh-lens MERGE M-1: the global latches need the SAME blind≠absent freeze
+  // as per-product keys. When zero list calls happened this invocation (no
+  // running rows, all rows pre-studio, or a fetch error), the NLM_* conditions
+  // were UNOBSERVABLE — a real auth outage whose job died must not emit a
+  // false "RECOVERED: NLM_AUTH_DEGRADED" mid-incident. Likewise zero PID
+  // probes freezes PROCESS_PROBE_BLIND.
+  const globalUnobs = new Set<string>();
+  if (listCalls === 0) {
+    globalUnobs.add("NLM_AUTH_DEGRADED");
+    globalUnobs.add("NLM_CLI_BLIND");
+  }
+  if (probesAttempted === 0) {
+    globalUnobs.add("PROCESS_PROBE_BLIND");
+  }
+  unobservable.set("", globalUnobs);
+
   // 6. Latch + dedup + escalation + recovered (§5.3).
   const byJob = new Map<string, Observation[]>();
   for (const o of observations) {
@@ -817,13 +852,25 @@ export async function runStudioCheckerOnce(
         alerted: false,
         escalated: false,
       };
-      c.consecutive += 1;
-      c.lastSeenMs = now;
+      // fresh-lens m-3: "consecutive sightings" are only meaningful when
+      // spaced ~a cadence apart — a manual run adjacent to the scheduled tick
+      // (or a Task Scheduler catch-up double-fire) must not double-count one
+      // moment in time and confirm a 2-sighting condition instantly.
+      if (c.consecutive === 0 || now - c.lastSeenMs >= 0.8 * cfg.cadenceMs) {
+        c.consecutive += 1;
+        c.lastSeenMs = now;
+      }
       if (o.measureMs !== undefined) c.measureMs = o.measureMs;
       if (o.thresholdMs !== undefined) c.thresholdMs = o.thresholdMs;
       latch.conditions[key] = c;
 
-      const confirm = CONFIRM_SIGHTINGS[o.cls];
+      // fresh-lens M-2: the wedge's quiet period IS its confirmation count —
+      // ceil(wedgeQuietMs / cadence) + 1 spaced sightings ≈ ≥wedgeQuietMs of
+      // checker-observed all-complete (spec §5.2 #10, v4.1).
+      const confirm =
+        o.cls === "CHILD_WEDGED_POST_STUDIO"
+          ? Math.max(2, Math.ceil(cfg.wedgeQuietMs / cfg.cadenceMs) + 1)
+          : CONFIRM_SIGHTINGS[o.cls];
       if (!c.alerted && c.consecutive >= confirm) {
         c.alerted = true;
         findings.push({
@@ -969,7 +1016,7 @@ function realFindWorkerProcesses(): Array<{ pid: number; commandLine: string }> 
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'worker' } | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`,
+        `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'worker\\.(ts|js)' } | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`,
       ],
       { encoding: "utf-8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
     );
@@ -1208,7 +1255,16 @@ export async function acquireLock(
       } catch {
         // vanished/corrupt lock — treat as stale
       }
-      await fs.rm(lockPath, { force: true });
+      // fresh-lens m-4: take the stale lock over by ATOMIC rename-aside — an
+      // rm-based takeover raced (contender B's rm could delete contender A's
+      // freshly-created lock). Only ONE rename succeeds; the loser falls
+      // through, retries the 'wx' create, and yields to whoever won it.
+      try {
+        await fs.rename(lockPath, `${lockPath}.stale`);
+        await fs.rm(`${lockPath}.stale`, { force: true }).catch(() => undefined);
+      } catch {
+        // another contender renamed/removed it first — retry the atomic create
+      }
     }
     log("[checker] lock contention persisted after stale takeover attempt — exiting 0");
     return false;

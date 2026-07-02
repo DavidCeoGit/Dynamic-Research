@@ -422,15 +422,21 @@ describe("detection matrix (§5.2)", () => {
     assert.equal(byClass(r3.findings, "NLM_CLI_BLIND").length, 1);
   });
 
-  it("row 10: all products completed ≥25min, child alive, row running → WEDGED FYI after 2 sightings", async () => {
+  it("row 10 (v4.1): wedge needs SUSTAINED checker-observed all-complete (6 sightings), never created_at age", async () => {
+    // fresh-lens M-2: created_at is SUBMIT time — an artifact from a healthy
+    // 40-min render is already ">25min old" the instant it completes. The
+    // early ticks must therefore NOT fire even though created_at is old.
     const w = makeWorld({
       listResult: () => ({
         ok: true,
-        artifacts: [{ id: "vid-1", title: "t", created_at: iso(NOW0 - 30 * MIN), status_id: 3 }],
+        artifacts: [{ id: "vid-1", title: "t", created_at: iso(NOW0 - 40 * MIN), status_id: 3 }],
       }),
     });
-    const f = await runN(w, 2);
-    const wedged = byClass(f, "CHILD_WEDGED_POST_STUDIO");
+    const early = await runN(w, 5); // 25/5min cadence ⇒ confirm = 6 sightings
+    assert.equal(byClass(early, "CHILD_WEDGED_POST_STUDIO").length, 0);
+    w.setNow(NOW0 + 5 * 5 * MIN);
+    const r6 = await runStudioCheckerOnce(w.deps, w.cfg);
+    const wedged = byClass(r6.findings, "CHILD_WEDGED_POST_STUDIO");
     assert.equal(wedged.length, 1);
     assert.equal(wedged[0].kind, "fyi");
   });
@@ -446,9 +452,41 @@ describe("detection matrix (§5.2)", () => {
         artifacts: [{ id: "vid-1", title: "t", created_at: iso(NOW0 - 30 * MIN), status_id: 3 }],
       }),
     });
-    const f = await runN(w, 2);
+    const f = await runN(w, 7);
     assert.equal(byClass(f, "CHILD_WEDGED_POST_STUDIO").length, 0);
-    assert.equal(byClass(f, "CHILD_DEAD_JOB_RUNNING").length, 1);
+    assert.equal(byClass(f, "CHILD_DEAD_JOB_RUNNING").filter((x) => x.kind === "alert").length, 1);
+  });
+
+  it("fresh-lens M-1: zero-list-call invocations FREEZE global latches (no false auth RECOVERED mid-outage)", async () => {
+    const w = makeWorld({
+      listResult: () => ({ ok: false, reason: "auth", detail: "Authentication expired" }),
+    });
+    const f2 = await runN(w, 2);
+    assert.equal(byClass(f2, "NLM_AUTH_DEGRADED").length, 1); // alerted
+    // the auth-expired child sys.exit(3)s, the row leaves 'running' → next
+    // tick has zero rows ⇒ zero list calls ⇒ the outage is UNOBSERVABLE
+    w.deps.fetchRunningJobs = async () => [];
+    w.setNow(NOW0 + 2 * 5 * MIN);
+    const r3 = await runStudioCheckerOnce(w.deps, w.cfg);
+    assert.equal(r3.findings.filter((x) => x.kind === "recovered").length, 0);
+    assert.equal(w.meta.value?.global?.["NLM_AUTH_DEGRADED"]?.alerted, true);
+  });
+
+  it("fresh-lens m-3: sightings seconds apart do NOT double-count (spacing ≥ ~0.8×cadence)", async () => {
+    const w = makeWorld({
+      listResult: () => ({
+        ok: true,
+        artifacts: [{ id: "vid-1", title: "t", created_at: iso(NOW0 - 80 * MIN), status_id: 1 }],
+      }),
+    });
+    w.setNow(NOW0);
+    await runStudioCheckerOnce(w.deps, w.cfg);
+    w.setNow(NOW0 + 1_000); // a manual run 1s after the scheduled tick
+    const r2 = await runStudioCheckerOnce(w.deps, w.cfg);
+    assert.equal(byClass(r2.findings, "STALLED_PRODUCT").length, 0);
+    w.setNow(NOW0 + 5 * MIN); // the real next tick confirms
+    const r3 = await runStudioCheckerOnce(w.deps, w.cfg);
+    assert.equal(byClass(r3.findings, "STALLED_PRODUCT").length, 1);
   });
 });
 
