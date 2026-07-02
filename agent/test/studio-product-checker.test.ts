@@ -110,6 +110,9 @@ interface WorldOpts {
   listResult?: (notebookId: string, nlmType: string) => DetailedListResult;
   meta?: CheckerMeta | null;
   latches?: Record<string, JobLatch>;
+  /** Codex M-1: tracked-id close-out read. undefined → every stale id reports
+   * "completed" (close-out proceeds); null → simulated read failure. */
+  trackedStatuses?: Map<string, string> | null;
 }
 
 function makeWorld(opts: WorldOpts = {}): World {
@@ -195,6 +198,10 @@ function makeWorld(opts: WorldOpts = {}): World {
 
   const deps: CheckerDeps = {
     fetchRunningJobs: async () => jobs,
+    fetchTrackedJobStatuses: async (ids) =>
+      opts.trackedStatuses === undefined
+        ? new Map(ids.map((id) => [id, "completed"]))
+        : opts.trackedStatuses,
     findState: async () => (stateJson === null ? null : statePath),
     readTextFile: async (p) => {
       if (p === statePath) return stateJson;
@@ -466,6 +473,44 @@ describe("freshness gates (fresh-Claude C-1 / M-1)", () => {
     assert.equal(w.listCalls.length, 0);
   });
 
+  it("Codex C-1: stale floor + fresh mtime is REJECTED (AND-gate; no floor-0 fallback masking)", async () => {
+    const claimedMs = NOW0 - 90 * MIN;
+    const w = makeWorld({
+      claimedMs,
+      stateJson: JSON.stringify({ notebook_id: NB, phase: "5.5", artifacts: {} }),
+      // floor predates the claim (prior attempt) but the file was touched fresh
+      markerJson: JSON.stringify({
+        run_floor_ms: claimedMs - 60 * MIN,
+        before: { video: [] },
+      }),
+      markerMtimeMs: claimedMs + 10 * MIN,
+      listResult: () => ({
+        ok: true,
+        // a PRIOR-run artifact that a 0/stale floor would wrongly resolve as ours
+        artifacts: [
+          { id: "prior-run", title: "t", created_at: iso(claimedMs - 30 * MIN), status_id: 3 },
+        ],
+      }),
+    });
+    const f = await runN(w, 3);
+    // marker rejected ⇒ no launch evidence ⇒ no list call, no wedge, no masking
+    assert.equal(w.listCalls.length, 0);
+    assert.equal(f.length, 0);
+    assert.ok(w.logs.some((l) => l.includes("fails freshness")));
+  });
+
+  it("Codex C-1: missing run_floor_ms disqualifies the marker even with fresh mtime", async () => {
+    const w = makeWorld({
+      stateJson: JSON.stringify({ notebook_id: NB, phase: "5.5", artifacts: {} }),
+      markerJson: JSON.stringify({ before: { video: [] } }), // no floor at all
+      markerMtimeMs: NOW0 - 5 * MIN,
+      listResult: () => ({ ok: true, artifacts: [] }),
+    });
+    const f = await runN(w, 3);
+    assert.equal(w.listCalls.length, 0);
+    assert.equal(byClass(f, "NO_ARTIFACT_AFTER_LAUNCH").length, 0);
+  });
+
   it("stale breadcrumb (spawnedAt < claimed_at) never fires CHILD_DEAD in the re-claim pre-spawn window", async () => {
     const claimedMs = NOW0 - 90 * MIN;
     const w = makeWorld({
@@ -596,6 +641,100 @@ describe("latch: dedup, recovered, grace, close-out", () => {
     w.setNow(NOW0 + 5 * MIN);
     const r2 = await runStudioCheckerOnce(w.deps, w.cfg);
     assert.equal(byClass(r2.findings, "STALLED_PRODUCT").length, 1);
+  });
+
+  it("Codex M-1: a FAILED tracked-id read keeps every stale latch (dedup state survives the blip)", async () => {
+    const w = makeWorld({
+      trackedStatuses: null, // simulated SELECT failure
+      latches: {
+        [OTHER_ID]: {
+          slug: "gone-job",
+          conditions: {
+            STALLED_PRODUCT: {
+              consecutive: 3,
+              firstSeenMs: NOW0 - 30 * MIN,
+              lastSeenMs: NOW0 - 5 * MIN,
+              alerted: true,
+              escalated: false,
+            },
+          },
+        },
+      },
+    });
+    w.setNow(NOW0);
+    await runStudioCheckerOnce(w.deps, w.cfg);
+    assert.equal(w.latches.has(OTHER_ID), true);
+    assert.equal(w.deletedLatches.includes(OTHER_ID), false);
+  });
+
+  it("Codex M-1: a running-page MISS does not close a latch whose row is still 'running'", async () => {
+    const w = makeWorld({
+      trackedStatuses: new Map([[OTHER_ID, "running"]]),
+      latches: {
+        [OTHER_ID]: { slug: "paged-out", conditions: {} },
+      },
+    });
+    w.setNow(NOW0);
+    await runStudioCheckerOnce(w.deps, w.cfg);
+    assert.equal(w.latches.has(OTHER_ID), true);
+  });
+
+  it("Codex M-2: an auth-blip invocation FREEZES a previously-alerted product latch (no false RECOVERED)", async () => {
+    const stalledLatch: JobLatch = {
+      slug: SLUG,
+      conditions: {
+        "STALLED_PRODUCT:video": {
+          consecutive: 2,
+          firstSeenMs: NOW0 - 10 * MIN,
+          lastSeenMs: NOW0 - 5 * MIN,
+          alerted: true,
+          escalated: false,
+        },
+      },
+    };
+    const w = makeWorld({
+      latches: { [JOB_ID]: stalledLatch },
+      listResult: () => ({ ok: false, reason: "auth", detail: "Authentication expired" }),
+    });
+    w.setNow(NOW0);
+    const r = await runStudioCheckerOnce(w.deps, w.cfg);
+    assert.equal(r.findings.filter((x) => x.kind === "recovered").length, 0);
+    assert.equal(
+      w.latches.get(JOB_ID)?.conditions["STALLED_PRODUCT:video"]?.alerted,
+      true,
+    );
+    // and a later HEALTHY sighting is what emits the real RECOVERED
+    const w2 = makeWorld({ latches: { [JOB_ID]: stalledLatch } }); // default healthy list
+    w2.setNow(NOW0 + 5 * MIN);
+    const r2 = await runStudioCheckerOnce(w2.deps, w2.cfg);
+    assert.equal(r2.findings.filter((x) => x.kind === "recovered").length, 1);
+  });
+
+  it("Codex M-2 + M-4: probe failures freeze liveness latches AND raise PROCESS_PROBE_BLIND after 3 sightings", async () => {
+    const w = makeWorld({
+      latches: {
+        [JOB_ID]: {
+          slug: SLUG,
+          conditions: {
+            CHILD_DEAD_JOB_RUNNING: {
+              consecutive: 2,
+              firstSeenMs: NOW0 - 10 * MIN,
+              lastSeenMs: NOW0 - 5 * MIN,
+              alerted: true,
+              escalated: false,
+            },
+          },
+        },
+      },
+      probePid: (pid) =>
+        pid === WORKER_PID
+          ? { ok: true, exists: true, commandLine: "node worker.ts" }
+          : { ok: false, exists: false }, // child probe fails every time
+    });
+    const f = await runN(w, 3);
+    assert.equal(f.filter((x) => x.kind === "recovered").length, 0);
+    assert.equal(w.latches.get(JOB_ID)?.conditions["CHILD_DEAD_JOB_RUNNING"]?.alerted, true);
+    assert.equal(byClass(f, "PROCESS_PROBE_BLIND").length, 1);
   });
 
   it("close-out: a latch for a job that left status='running' is deleted with no recovered email", async () => {

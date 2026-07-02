@@ -68,7 +68,8 @@ export type AlertClass =
   | "WORKER_LOCATION_MISMATCH"
   | "NLM_AUTH_DEGRADED"
   | "NLM_CLI_BLIND"
-  | "CHILD_WEDGED_POST_STUDIO";
+  | "CHILD_WEDGED_POST_STUDIO"
+  | "PROCESS_PROBE_BLIND";
 
 /** Consecutive ≥5-min-apart sightings before a condition alerts (§5.2). */
 export const CONFIRM_SIGHTINGS: Record<AlertClass, number> = {
@@ -82,6 +83,10 @@ export const CONFIRM_SIGHTINGS: Record<AlertClass, number> = {
   NLM_AUTH_DEGRADED: 2,
   NLM_CLI_BLIND: 3,
   CHILD_WEDGED_POST_STUDIO: 2,
+  // S197 MERGE-gate addition (Codex MAJOR-4, mirrors row 9's philosophy): a
+  // checker whose PID probes persistently fail must say "I am blind on
+  // process liveness", not silently lose rows #6/#7.
+  PROCESS_PROBE_BLIND: 3,
 };
 
 /** FYI classes alert with kind:'fyi' (informational, not actionable-critical). */
@@ -215,6 +220,11 @@ export interface Observation {
 
 export interface CheckerDeps {
   fetchRunningJobs: () => Promise<CheckerJobRow[]>;
+  /** §5.1's second bounded read (Codex MERGE M-1): status per tracked job id,
+   * used ONLY to confirm a latch's row really left 'running' before closing
+   * it. NULL on read error — the caller must then keep every latch untouched
+   * (dedup state must never be wiped on a transient SELECT failure). */
+  fetchTrackedJobStatuses: (ids: string[]) => Promise<Map<string, string> | null>;
   /** findStateFile mirror — absolute path of the newest state file, or null. */
   findState: (workDir: string) => Promise<string | null>;
   /** File content, or null on ANY error (absent/unreadable). */
@@ -349,17 +359,35 @@ export async function runStudioCheckerOnce(
   // 2. Latch close-out: jobs that left status='running' (the sweep/gate own
   // them now — §7). Log the transition; no RECOVERED email (the job's own
   // terminal path already notifies).
+  // Codex MERGE M-1: never close dedup state on the say-so of the running-page
+  // read alone — a transient SELECT failure (fetchRunningJobs → []) or a page
+  // miss would wipe alerted latches and re-arm alert spam on the next real
+  // sighting. §5.1's second bounded tracked-id read confirms each candidate's
+  // row really left 'running' (or is gone); a failed read keeps every latch.
   const runningIds = new Set(jobs.map((j) => j.id));
-  for (const latchId of await deps.listLatchJobIds()) {
-    if (!runningIds.has(latchId)) {
-      deps.log(`[checker] ${latchId}: left status='running' — closing latch`);
-      await deps.deleteLatch(latchId);
+  const staleLatchIds = (await deps.listLatchJobIds()).filter((id) => !runningIds.has(id));
+  if (staleLatchIds.length > 0) {
+    const statuses = await deps.fetchTrackedJobStatuses(staleLatchIds);
+    if (statuses === null) {
+      deps.log(
+        `[checker] tracked-id close-out read failed — keeping ${staleLatchIds.length} latch(es) this invocation`,
+      );
+    } else {
+      for (const latchId of staleLatchIds) {
+        const st = statuses.get(latchId);
+        if (st === "running") continue; // running-page miss — the row IS still live
+        deps.log(
+          `[checker] ${latchId}: left status='running' (${st ?? "row-gone"}) — closing latch`,
+        );
+        await deps.deleteLatch(latchId);
+      }
     }
   }
 
   // 3. Worker liveness — probed ONCE per invocation (§5.2 #7 + §4.3 belt).
   let workerCondition: "alive" | "dead" | "elsewhere" | "indeterminate" = "alive";
   let workerDetail = "";
+  let workerProbeFailed = false;
   if (jobs.length > 0) {
     const workerPid = await deps.readWorkerPidFile();
     if (workerPid === null) {
@@ -371,6 +399,7 @@ export async function runStudioCheckerOnce(
       const probe = await deps.probePid(workerPid);
       if (!probe.ok) {
         workerCondition = "indeterminate";
+        workerProbeFailed = true;
         workerDetail = `worker PID probe failed — skipping worker-liveness conditions this invocation`;
       } else if (probe.exists && /worker/i.test(probe.commandLine ?? "")) {
         workerCondition = "alive";
@@ -403,13 +432,33 @@ export async function runStudioCheckerOnce(
   let listCalls = 0;
   let authFailures = 0;
   let nonAuthFailures = 0;
+  let probeFailures = workerProbeFailed ? 1 : 0;
+  // Codex MERGE M-2: keys whose check was SKIPPED this invocation (list
+  // failure, missing state/notebook, probe failure, per-job throw). A frozen
+  // key is neither incremented nor RECOVERED — "unobservable" must never
+  // masquerade as "absent", or a one-tick auth blip clears a real stall's
+  // dedup state and re-arms alert spam. "*" freezes the whole job.
+  const unobservable = new Map<string, Set<string>>();
+  const productKeys = (p: string) => [
+    `STALLED_PRODUCT:${p}`,
+    `RENDER_FAILED_STATUS:${p}`,
+    `NO_ARTIFACT_AFTER_LAUNCH:${p}`,
+    `AMBIGUOUS_ARTIFACT:${p}`,
+  ];
 
   for (const job of jobs) {
+    const unobs = new Set<string>();
+    unobservable.set(job.id, unobs);
     try {
       const claimedMs = parseMs(job.claimed_at) ?? parseMs(job.created_at);
       if (claimedMs === null) {
         deps.log(`[checker] ${job.id}: no parseable claimed_at/created_at — skipped`);
+        unobs.add("*");
         continue;
+      }
+      if (workerCondition === "indeterminate") {
+        unobs.add("WORKER_DEAD_JOB_RUNNING");
+        unobs.add("WORKER_LOCATION_MISMATCH");
       }
 
       // Worker-level conditions attach to every running row.
@@ -463,14 +512,21 @@ export async function runStudioCheckerOnce(
         const mtimeMs = await deps.statMtimeMs(markerPath);
         const parsed = parseStudioMarker(markerRaw, mtimeMs);
         if (parsed) {
-          const fresh =
-            (parsed.runFloorMs !== null && parsed.runFloorMs >= claimedMs) ||
-            (mtimeMs !== null && mtimeMs >= claimedMs);
-          if (fresh) {
+          // Codex MERGE C-1: the spec (§3) disqualifies a marker when ANY
+          // present freshness anchor predates claimed_at, and the embedded
+          // floor must EXIST to be usable — the prior OR-gate accepted a
+          // stale-floor/fresh-mtime marker and then fell back to floor=0 in
+          // matching, which resolves PRIOR-RUN artifacts as "ours" and masks
+          // an attempt-2 stall. AND-gate: floor required + fresh; mtime, when
+          // present, must corroborate.
+          const floorOk = parsed.runFloorMs !== null && parsed.runFloorMs >= claimedMs;
+          const mtimeOk = mtimeMs === null || mtimeMs >= claimedMs;
+          if (floorOk && mtimeOk) {
             marker = parsed;
           } else {
             deps.log(
-              `[checker] ${job.id}: stale ${STUDIO_BEFORE_IDS_NAME} (predates claimed_at) — ignored as launch evidence`,
+              `[checker] ${job.id}: ${STUDIO_BEFORE_IDS_NAME} fails freshness vs claimed_at ` +
+                `(floorOk=${floorOk} mtimeOk=${mtimeOk}) — ignored as launch evidence, floor unused`,
             );
           }
         }
@@ -489,6 +545,9 @@ export async function runStudioCheckerOnce(
       if (crumbFresh && crumb) {
         const probe = await deps.probePid(crumb.pid);
         if (!probe.ok) {
+          probeFailures++;
+          unobs.add("CHILD_DEAD_JOB_RUNNING");
+          unobs.add("CHILD_WEDGED_POST_STUDIO");
           deps.log(
             `[checker] ${job.id}: child PID probe failed — child-liveness indeterminate this invocation`,
           );
@@ -531,15 +590,25 @@ export async function runStudioCheckerOnce(
         if (!nlmType) continue; // unknown product name — parity test pins the map
         const exactId = expectedArtifactId(artifacts, product);
         const launchEvidence = exactId !== null || marker !== null;
-        if (!launchEvidence || !notebookId) continue; // pre-studio — healthy silence
+        if (!launchEvidence || !notebookId) {
+          // Pre-studio — healthy silence. Also freeze the product's latch keys
+          // (Codex M-2): a mid-run state/marker read blip must not "recover" a
+          // previously-alerted product condition.
+          for (const k of productKeys(product)) unobs.add(k);
+          continue;
+        }
 
         const res = deps.listArtifactsDetailed(notebookId, nlmType);
         listCalls++;
         if (!res.ok) {
           // Construction-level suppression (§5.2 notes): a failed list produces
           // NO per-product observation — rows 2–5/10 evaluate only on ok:true.
+          // Codex M-2: the product's latch keys are frozen, not "absent" — a
+          // one-tick auth/CLI blip must not emit RECOVERED for a real stall.
           if (res.reason === "auth") authFailures++;
           else nonAuthFailures++;
+          for (const k of productKeys(product)) unobs.add(k);
+          unobs.add("CHILD_WEDGED_POST_STUDIO"); // wedge needs ALL products' status
           deps.log(
             `[checker] ${job.id}/${product}: list failed (${res.reason}): ${res.detail.slice(0, 160)}`,
           );
@@ -552,7 +621,10 @@ export async function runStudioCheckerOnce(
         let matches = res.artifacts.filter((a) => a.id === exactId);
         if (exactId === null && marker) {
           const beforeSet = marker.before[product] ?? new Set<string>();
-          const floor = marker.runFloorMs ?? 0;
+          // Non-null by the C-1 freshness gate above; the Infinity belt means
+          // "if that invariant is ever violated, resolve NOTHING as ours"
+          // (fail toward NO_ARTIFACT, never toward masking via a 0 floor).
+          const floor = marker.runFloorMs ?? Number.POSITIVE_INFINITY;
           matches = res.artifacts.filter((a) => {
             if (beforeSet.has(a.id)) return false;
             const cms = artifactCreatedAtMs(a);
@@ -661,6 +733,9 @@ export async function runStudioCheckerOnce(
         }
       }
     } catch (err) {
+      // Codex M-2: an errored job is UNOBSERVED, not condition-free — freeze
+      // its entire latch so a transient throw can't emit RECOVERED storms.
+      unobs.add("*");
       deps.log(`[checker] ${job.id}: per-job pass errored (contained): ${(err as Error).message}`);
     }
   }
@@ -686,6 +761,20 @@ export async function runStudioCheckerOnce(
         `${nonAuthFailures}/${listCalls} artifact-list calls failed with non-auth errors (cli-crash/timeout/parse). ` +
         `The observability layer itself is failing — per-product conditions for the affected products are suppressed ` +
         `by construction. Next move: run the list manually (cp1252/emoji crash is the known class).`,
+    });
+  }
+  if (probeFailures > 0) {
+    // S197 MERGE-gate matrix addition (Codex MAJOR-4): persistent PID-probe
+    // failure (PowerShell error/timeout/CIM access-denied under the task
+    // principal) silently blinds rows #6/#7 — say so instead.
+    observations.push({
+      cls: "PROCESS_PROBE_BLIND",
+      jobId: "",
+      slug: "(global)",
+      detail:
+        `${probeFailures} Get-CimInstance PID probe(s) failed this invocation — process-liveness ` +
+        `rows (#6 child-dead / #7 worker-dead) are BLIND while this persists. Next move: run the ` +
+        `probe manually under the checker task's principal (CIM access / PowerShell health).`,
     });
   }
 
@@ -766,9 +855,13 @@ export async function runStudioCheckerOnce(
       }
     }
 
-    // Not-seen keys: recovered (if previously alerted) or plain reset.
+    // Not-seen keys: recovered (if previously alerted) or plain reset — but a
+    // key that was UNOBSERVABLE this invocation (Codex M-2) is FROZEN: neither
+    // incremented nor recovered. Blind ≠ absent.
+    const unobsSet = unobservable.get(jobId);
     for (const key of Object.keys(latch.conditions)) {
       if (seenKeys.has(key)) continue;
+      if (unobsSet && (unobsSet.has("*") || unobsSet.has(key))) continue;
       const c = latch.conditions[key];
       if (c.alerted) {
         const [cls, product] = key.split(":");
@@ -911,19 +1004,36 @@ export function buildDefaultDeps(log: (msg: string) => void): CheckerDeps | null
   });
   return {
     fetchRunningJobs: async () => {
-      // Read-only by construction (§9): research_queue SELECTs only.
+      // Read-only by construction (§9): research_queue SELECTs only. On error
+      // this returns [] — safe ONLY because latch close-out no longer trusts
+      // this page (Codex M-1: it re-confirms via fetchTrackedJobStatuses).
       const { data, error } = await sb
         .from("research_queue")
         .select(
           "id, topic_slug, organization_id, selected_products, pipeline_mode, claimed_at, updated_at, created_at",
         )
         .eq("status", "running")
-        .limit(25);
+        .limit(100);
       if (error) {
         log(`[checker] running-rows query failed (non-fatal): ${error.message}`);
         return [];
       }
-      return (data ?? []) as CheckerJobRow[];
+      const rows = (data ?? []) as CheckerJobRow[];
+      if (rows.length === 100) {
+        // No silent caps: the single-worker system should never approach this.
+        log(`[checker] WARNING: running-rows page hit the 100-row cap — coverage may be partial`);
+      }
+      return rows;
+    },
+    fetchTrackedJobStatuses: async (ids) => {
+      const { data, error } = await sb.from("research_queue").select("id, status").in("id", ids);
+      if (error) {
+        log(`[checker] tracked-id status query failed (non-fatal): ${error.message}`);
+        return null; // caller keeps every latch — dedup state survives the blip
+      }
+      return new Map(
+        ((data ?? []) as Array<{ id: string; status: string }>).map((r) => [r.id, r.status]),
+      );
     },
     findState: (workDir) => findStateFile(workDir),
     readTextFile: async (p) => {
@@ -1035,7 +1145,11 @@ function makeLogger(): (msg: string) => void {
   try {
     const st = fsSync.statSync(logPath);
     if (st.size > LOG_MAX_BYTES) {
-      fsSync.renameSync(logPath, `${logPath}.1`); // replaces prior .1 (Windows: best-effort)
+      // libuv rename replaces an existing destination on Windows
+      // (MOVEFILE_REPLACE_EXISTING — the S161 doctrine), but pre-clearing the
+      // old .1 costs nothing (Codex MINOR belt).
+      fsSync.rmSync(`${logPath}.1`, { force: true });
+      fsSync.renameSync(logPath, `${logPath}.1`);
     }
   } catch {
     // absent / rotation failed — keep appending
@@ -1062,22 +1176,42 @@ export async function acquireLock(
   pid: number = process.pid,
 ): Promise<boolean> {
   const lockPath = path.join(dir, LOCK_NAME);
+  const payload = JSON.stringify({ pid, startedAtMs: nowMs });
   try {
     await fs.mkdir(dir, { recursive: true });
-    try {
-      const j = JSON.parse(await fs.readFile(lockPath, "utf-8")) as {
-        pid?: number;
-        startedAtMs?: number;
-      };
-      if (typeof j?.startedAtMs === "number" && nowMs - j.startedAtMs < ttlMs) {
-        log(`[checker] prior invocation (pid ${j.pid}) still within lock TTL — exiting 0`);
-        return false;
+    // Codex MERGE M-3: exclusive-create ('wx') makes acquisition ATOMIC — the
+    // prior read-then-write raced (two simultaneous starts both entered). On
+    // EEXIST: a fresh lock yields; a stale one is removed and the atomic
+    // create retried ONCE (the rm→create window is itself settled by 'wx' —
+    // the loser of the second create yields).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fh = await fs.open(lockPath, "wx");
+        try {
+          await fh.writeFile(payload);
+        } finally {
+          await fh.close();
+        }
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
       }
-    } catch {
-      // absent/unreadable — take it
+      try {
+        const j = JSON.parse(await fs.readFile(lockPath, "utf-8")) as {
+          pid?: number;
+          startedAtMs?: number;
+        };
+        if (typeof j?.startedAtMs === "number" && nowMs - j.startedAtMs < ttlMs) {
+          log(`[checker] prior invocation (pid ${j.pid}) still within lock TTL — exiting 0`);
+          return false;
+        }
+      } catch {
+        // vanished/corrupt lock — treat as stale
+      }
+      await fs.rm(lockPath, { force: true });
     }
-    await fs.writeFile(lockPath, JSON.stringify({ pid, startedAtMs: nowMs }));
-    return true;
+    log("[checker] lock contention persisted after stale takeover attempt — exiting 0");
+    return false;
   } catch (err) {
     log(`[checker] lock handling failed (${(err as Error).message}) — proceeding without lock`);
     return true;
